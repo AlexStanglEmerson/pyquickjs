@@ -9,23 +9,15 @@ A mostly pure-Python implementation of the [QuickJS](https://bellard.org/quickjs
 - QuickJS-compatible error messages and stack traces
 - Built-in support for `JSON`, `Math`, `Date`, `RegExp`, `Map`, `Set`, `WeakMap`, `WeakRef`, `FinalizationRegistry`, `TypedArray`, `Symbol`, and more
 
+## Notice
+
+This library was created by porting QuickJS to Python with Claude Opus 4.6 and Claude Sonnet 4.6. I needed a (mostly) pure-Python JavaScript engine for a project, so this has only been tested for my own use cases, and I don't intend on it being used more widely. I will NOT publish this to PyPI or maintain it as a general-purpose library. Use at your own risk, and please don't rely on this for production use.
+
+Note that most of this README is also AI generated.
+
 ## Requirements
 
 - Python 3.10 or later
-
-## Installation
-
-### With Poetry
-
-```bash
-poetry add pyquickjs
-```
-
-### With pip
-
-```bash
-pip install pyquickjs
-```
 
 ## Quick Start
 
@@ -171,4 +163,6 @@ The test suite includes the QuickJS upstream test files (`test_builtin.js`, `tes
 
 ## License
 
-MIT
+This project is released under the Unlicense, but it is derived from QuickJS which is licensed under the MIT license. If you use this library, make sure to comply with the terms of both licenses.
+
+For more details, see [LICENSE.md](LICENSE.md).
