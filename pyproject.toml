@@ -1,21 +1,22 @@
 [build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
 
-[project]
+[tool.poetry]
 name = "pyquickjs"
 version = "0.1.0"
 description = "Pure Python port of the QuickJS JavaScript engine"
-requires-python = ">=3.10"
-dependencies = [
-    "regex>=2026.2.28",
-]
+authors = []
+readme = "README.md"
+license = "MIT"
+packages = [{ include = "pyquickjs" }]
 
-[project.optional-dependencies]
-dev = ["pytest>=7.0"]
+[tool.poetry.dependencies]
+python = ">=3.10"
+regex = ">=2024.0.0"
 
-[tool.setuptools.packages.find]
-include = ["pyquickjs*"]
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
