@@ -215,6 +215,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Testing files
+Sandbox.py
+
 # Extra files used by Claude
 debug_*.py
 *.txt

@@ -172,7 +172,7 @@ class JSContext:
 
         try:
             result = interp.exec(ast, env)
-            return result
+            return self._js_to_py(result)
         except _ThrowSignal as e:
             from pyquickjs.interpreter import js_to_string, JSObject
             val = e.js_value
@@ -184,3 +184,183 @@ class JSContext:
                 else:
                     msg = repr(val)
             raise RuntimeError(msg) from None
+
+    # ---- Python ↔ JavaScript interop ----
+
+    def set_global(self, name: str, value: Any) -> None:
+        """Expose a Python value as a JavaScript global variable.
+
+        Python callables are automatically wrapped as JS functions. The
+        wrapped function receives plain Python arguments and must return a
+        plain Python value (primitives are passed through; ``None`` becomes
+        ``undefined`` in JS).
+
+        Examples::
+
+            ctx.set_global('add', lambda a, b: a + b)
+            ctx.eval('add(1, 2)')  # 3
+
+            ctx.set_global('PI', 3.14159)
+            ctx.eval('PI * 2')  # 6.28318
+        """
+        # Ensure the interpreter and global env are initialised.
+        if not hasattr(self, '_interp'):
+            self.eval('undefined')
+        js_val = self._py_to_js(value)
+        self._global_env._bindings[name] = js_val
+
+    def get_global(self, name: str) -> Any:
+        """Retrieve a JavaScript global variable as a Python value.
+
+        Primitive JS values (number, string, boolean, null, undefined) are
+        returned as their Python equivalents.  JS objects and functions are
+        returned as :class:`JSCallable` (if callable) or a raw internal
+        object otherwise.
+
+        Examples::
+
+            ctx.eval('var x = 42')
+            ctx.get_global('x')  # 42
+
+            ctx.eval('function double(n) { return n * 2; }')
+            dbl = ctx.get_global('double')
+            dbl(7)  # 14
+        """
+        if not hasattr(self, '_interp'):
+            return None
+        from pyquickjs.interpreter import undefined
+        val = self._global_env._bindings.get(name, undefined)
+        return self._js_to_py(val)
+
+    def call(self, fn, /, *args: Any) -> Any:
+        """Call a JavaScript function with Python arguments.
+
+        *fn* can be:
+
+        * A string — the name of a function in the global scope.
+        * A :class:`JSCallable` returned by :meth:`get_global` or :meth:`eval`.
+        * A raw ``JSFunction`` or ``JSObject`` (advanced use).
+
+        Arguments are converted from Python to JavaScript automatically.
+        The return value is converted back to Python.
+
+        Examples::
+
+            ctx.eval('function greet(name) { return "Hello, " + name; }')
+            ctx.call('greet', 'World')  # 'Hello, World'
+
+            add = ctx.get_global('add')
+            ctx.call(add, 3, 4)  # 7
+        """
+        from pyquickjs.interpreter import (
+            _ThrowSignal, _call_value, js_to_string, undefined, JSObject,
+        )
+        if not hasattr(self, '_interp'):
+            raise RuntimeError('Context not yet initialised — call eval() first')
+
+        # Resolve name → function value
+        if isinstance(fn, str):
+            fn = self._global_env._bindings.get(fn, undefined)
+        if isinstance(fn, JSCallable):
+            fn = fn._js_fn
+
+        js_args = [self._py_to_js(a) for a in args]
+        try:
+            result = _call_value(fn, undefined, js_args)
+        except _ThrowSignal as e:
+            val = e.js_value
+            try:
+                msg = js_to_string(val)
+            except Exception:
+                if isinstance(val, JSObject):
+                    msg = f'{val.props.get("name", "Error")}: {val.props.get("message", "")}'
+                else:
+                    msg = repr(val)
+            raise RuntimeError(msg) from None
+        return self._js_to_py(result)
+
+    # ---- Internal conversion helpers ----
+
+    def _py_to_js(self, value: Any) -> Any:
+        """Convert a Python value to its JS representation."""
+        from pyquickjs.interpreter import (
+            null, undefined, JSFunction, JSObject, _make_native_fn,
+            _ThrowSignal, js_to_string,
+        )
+        if value is None:
+            return null
+        if isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, JSCallable):
+            return value._js_fn
+        if isinstance(value, (JSFunction, JSObject)):
+            return value
+        if callable(value):
+            py_fn = value
+            ctx_ref = self
+
+            def _native_call(this, args):
+                py_args = [ctx_ref._js_to_py(a) for a in args]
+                try:
+                    result = py_fn(*py_args)
+                except _ThrowSignal:
+                    raise
+                except Exception as exc:
+                    from pyquickjs.interpreter import make_error
+                    raise _ThrowSignal(
+                        make_error('Error', str(exc))
+                    ) from None
+                return ctx_ref._py_to_js(result)
+
+            name = getattr(py_fn, '__name__', 'anonymous')
+            return _make_native_fn(name, _native_call)
+        # Fallback: coerce to string
+        return str(value)
+
+    def _js_to_py(self, value: Any) -> Any:
+        """Convert a JS value to a Python value."""
+        from pyquickjs.interpreter import (
+            null, undefined, JSFunction, JSObject,
+        )
+        if value is undefined or value is null:
+            return None
+        if isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, (JSFunction, JSObject)):
+            # Wrap callables so they can be invoked from Python directly
+            fn = value if isinstance(value, JSFunction) else (
+                value if (isinstance(value, JSObject) and value._call is not None) else None
+            )
+            if fn is not None:
+                return JSCallable(fn, self)
+            return value
+        return value
+
+
+class JSCallable:
+    """A JavaScript function that can be called from Python.
+
+    Instances are returned by :meth:`JSContext.get_global` and
+    :meth:`JSContext.eval` when the result is a JS function.  Call the
+    object directly, passing plain Python values::
+
+        ctx.eval('function square(n) { return n * n; }')
+        sq = ctx.get_global('square')   # JSCallable
+        sq(9)    # 81
+        sq(3.5)  # 12.25
+    """
+
+    def __init__(self, js_fn: Any, ctx: 'JSContext') -> None:
+        self._js_fn = js_fn
+        self._ctx = ctx
+
+    def __call__(self, *args: Any) -> Any:
+        return self._ctx.call(self, *args)
+
+    def __repr__(self) -> str:
+        from pyquickjs.interpreter import JSFunction
+        if isinstance(self._js_fn, JSFunction):
+            name = self._js_fn.name or '(anonymous)'
+        else:
+            name = getattr(self._js_fn, 'name', None) or '(anonymous)'
+        return f'<JSCallable: {name}>'
