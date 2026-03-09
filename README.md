@@ -1,11 +1,11 @@
 # pyquickjs
 
-A pure-Python implementation of the [QuickJS](https://bellard.org/quickjs/) JavaScript engine. Run JavaScript from Python without any native extensions or compiled binaries.
+A mostly pure-Python implementation of the [QuickJS](https://bellard.org/quickjs/) JavaScript engine. Run JavaScript from Python with minimal dependencies.
 
 ## Features
 
 - Full ES2020+ JavaScript support (classes, generators, async/await, destructuring, optional chaining, etc.)
-- Pure Python — no C extensions, works on any platform
+- The JS engine itself is pure Python; the only native dependency is the [`regex`](https://github.com/mrabarnett/mrab-regex) package (a C extension) used for full Unicode-aware regular expression support
 - QuickJS-compatible error messages and stack traces
 - Built-in support for `JSON`, `Math`, `Date`, `RegExp`, `Map`, `Set`, `WeakMap`, `WeakRef`, `FinalizationRegistry`, `TypedArray`, `Symbol`, and more
 
