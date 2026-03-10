@@ -1466,7 +1466,7 @@ def make_json_builtin(interp) -> JSObject:
         if isinstance(v, list):
             return make_array([python_to_js_val(item) for item in v])
         if isinstance(v, dict):
-            obj2 = JSObject()
+            obj2 = JSObject(proto=_PROTOS.get('Object'))
             for k, val in v.items():
                 obj2.props[k] = python_to_js_val(val)
             return obj2
@@ -2915,6 +2915,16 @@ def build_global_env(interp) -> Environment:
 
     # DataView
     env._bindings['DataView'] = _make_data_view_builtin()
+
+    # Link all built-in prototype objects to Object.prototype so that
+    # toString, valueOf, hasOwnProperty, etc. are reachable for all types.
+    _obj_proto = _PROTOS.get('Object')
+    if _obj_proto is not None:
+        for _bname, _bval in env._bindings.items():
+            if isinstance(_bval, JSObject) and _bval._call is not None and _bname != 'Object':
+                _proto = _bval.props.get('prototype')
+                if isinstance(_proto, JSObject) and _proto.proto is None and _proto is not _obj_proto:
+                    _proto.proto = _obj_proto
 
     # BigInt
     def bigint_fn(this, args):
