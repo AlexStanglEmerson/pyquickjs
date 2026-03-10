@@ -1296,7 +1296,7 @@ def _make_native_fn(name: str, fn: Callable) -> JSObject:
 def _build_function_prototype(fn: JSFunction) -> JSObject:
     """Build and cache the default prototype object for a function."""
     if fn.prototype is None:
-        proto = JSObject()
+        proto = JSObject(proto=_PROTOS.get('Object'))
         proto.props['constructor'] = fn
         fn.prototype = proto
     return fn.prototype
@@ -3566,7 +3566,7 @@ class Interpreter:
                     methods.append(method)
 
         # Build prototype
-        proto = JSObject(proto=super_proto)
+        proto = JSObject(proto=super_proto if super_proto is not None else _PROTOS.get('Object'))
 
         # Create class environment
         class_env = Environment(parent=env)

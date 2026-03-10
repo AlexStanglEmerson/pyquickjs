@@ -185,6 +185,10 @@ class JSContext:
                     msg = f'{val.props.get("name", "Error")}: {val.props.get("message", "")}'
                 else:
                     msg = repr(val)
+            if isinstance(val, JSObject):
+                stack = val.props.get('stack', '')
+                if stack:
+                    msg = stack
             raise RuntimeError(msg) from None
 
     # ---- Python ↔ JavaScript interop ----
@@ -278,6 +282,10 @@ class JSContext:
                     msg = f'{val.props.get("name", "Error")}: {val.props.get("message", "")}'
                 else:
                     msg = repr(val)
+            if isinstance(val, JSObject):
+                stack = val.props.get('stack', '')
+                if stack:
+                    msg = stack
             raise RuntimeError(msg) from None
         return self._js_to_py(result)
 

@@ -85,18 +85,46 @@ The optional `filename` parameter names the source file in error stack traces:
 
 ```python
 ctx.eval("throw new Error('oops')", filename="my_script.js")
-# RuntimeError: Error: oops
+# RuntimeError: my_script.js:1:7
+# Error: oops
 ```
 
-### Handling errors
+### Handling errors and stack traces
 
-JavaScript exceptions are raised as Python `RuntimeError`:
+JavaScript exceptions are raised as Python `RuntimeError`. When the thrown value is a JS `Error` object, the `RuntimeError` message contains the full JavaScript stack trace (accessed via `str(e)` or `e.args[0]`):
+
+```python
+script = """
+function inner() {
+    throw new Error('something went wrong');
+}
+function outer() {
+    inner();
+}
+outer();
+"""
+
+try:
+    ctx.eval(script, filename="my_script.js")
+except RuntimeError as e:
+    print(e)
+# Output:
+#     at my_script.js:3:11
+#     at my_script.js:6:5
+#     at my_script.js:8:1
+# Error: something went wrong
+```
+
+The stack trace lines have the format `    at <filename>:<line>:<col>` and appear **before** the error type and message on the last line. If the thrown value is not an `Error` object (e.g., `throw "string value"`), the message is just the string form of the thrown value.
+
+To access the stack trace string directly from Python, use `str(e)` or `e.args[0]`:
 
 ```python
 try:
-    ctx.eval("null.x")
+    ctx.eval(script)
 except RuntimeError as e:
-    print(e)  # TypeError: Cannot read properties of null (reading 'x')
+    stack_trace = str(e)   # full JS stack as a string
+    # or equivalently: e.args[0]
 ```
 
 ### Running multi-line scripts

@@ -80,8 +80,15 @@ def main() -> None:
     except Exception as exc:
         err_type = type(exc).__name__
         msg = str(exc)
-        # JS exceptions come through as RuntimeError with message like "TypeError: ..."
-        js_type = msg.split(":")[0].strip() if ":" in msg else err_type
+        # JS exceptions come through as RuntimeError with a message that may contain
+        # a JS stack trace.  Frames have the form "    at <file>:<line>:<col>" and
+        # precede the error type/message line.  Extract the type from the last
+        # non-empty line (which has the form "ErrorType: message").
+        last_line = next(
+            (ln for ln in reversed(msg.splitlines()) if ln.strip()),
+            msg,
+        )
+        js_type = last_line.split(":")[0].strip() if ":" in last_line else err_type
 
         if expected_error:
             if js_type == expected_error or err_type == expected_error:
