@@ -154,6 +154,7 @@ class JSContext:
             interp._current_filename = '<input>'
             interp._current_line = 0
             interp._current_col = 0
+            interp._function_name_stack = []
             interp._module_cache = {}
             interp._current_module_exports = None
             interp._ctx = self

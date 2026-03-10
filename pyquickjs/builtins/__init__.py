@@ -1513,7 +1513,12 @@ def make_error_class(name: str, interp) -> JSObject:
         col = interp._current_col
         fname = interp._current_filename
         if line:
-            err_obj.props['stack'] = f'    at {fname}:{line}:{col}\n{name}: {msg}'
+            func_name = interp._function_name_stack[-1] if interp._function_name_stack else None
+            if func_name:
+                frame = f'    at {func_name} ({fname}:{line}:{col})'
+            else:
+                frame = f'    at {fname}:{line}:{col}'
+            err_obj.props['stack'] = f'{frame}\n{name}: {msg}'
         else:
             err_obj.props['stack'] = f'{name}: {msg}'
         err_obj.proto = proto  # set prototype for instanceof

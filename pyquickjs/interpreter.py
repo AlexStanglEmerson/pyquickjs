@@ -1314,6 +1314,7 @@ class Interpreter:
         self._current_filename = '<input>'
         self._current_line = 0
         self._current_col = 0
+        self._function_name_stack: list[str] = []  # tracks JS function names for stack traces
         self._module_cache: dict = {}       # abs_path -> JSObject (namespace)
         self._current_module_exports = None  # JSObject | None, set when inside a module
 
@@ -1329,7 +1330,11 @@ class Interpreter:
         if not isinstance(err, JSObject):
             return
         fname = filename or self._current_filename
-        frame = f'    at {fname}:{line}:{col}'
+        func_name = self._function_name_stack[-1] if self._function_name_stack else None
+        if func_name:
+            frame = f'    at {func_name} ({fname}:{line}:{col})'
+        else:
+            frame = f'    at {fname}:{line}:{col}'
         stack = err.props.get('stack', '')
         # Check if this exact frame is already present
         if frame in stack:
@@ -3114,6 +3119,7 @@ class Interpreter:
             self._call_stack_depth -= 1
             raise _ThrowSignal(make_error('RangeError',
                 'Maximum call stack size exceeded'))
+        self._function_name_stack.append(fn.name or '<anonymous>')
         try:
             # Determine actual 'this'
             if fn._bound_this is not _SENTINEL:
@@ -3184,6 +3190,7 @@ class Interpreter:
             raise _ThrowSignal(make_error('RangeError',
                 'Maximum call stack size exceeded'))
         finally:
+            self._function_name_stack.pop()
             self._call_stack_depth -= 1
 
     def _call_generator(self, fn: JSFunction, this, args: list) -> JSObject:
