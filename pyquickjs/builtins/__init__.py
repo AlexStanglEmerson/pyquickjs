@@ -1065,6 +1065,12 @@ def make_string_builtin(interp) -> JSObject:
 
     proto = JSObject()
     _def_method(proto, 'constructor', obj)
+    # toString and valueOf must be on String.prototype itself so they shadow
+    # Object.prototype.toString (which would return "[object String]").
+    _def_method(proto, 'toString', _make_native_fn('toString', lambda this, args:
+        js_to_string(this)))
+    _def_method(proto, 'valueOf', _make_native_fn('valueOf', lambda this, args:
+        js_to_string(this)))
     obj.props['prototype'] = proto
 
     # Delegate to interpreter's builtin_string_method
@@ -1133,6 +1139,17 @@ def make_number_builtin(interp) -> JSObject:
 
     proto = JSObject()
     _def_method(proto, 'constructor', obj)
+    # Ensure Number.prototype has its own toString/valueOf so they shadow Object.prototype.toString
+    def _num_toString(this, args):
+        from pyquickjs.interpreter import js_to_number as _jtn
+        radix = int(js_to_number(args[0])) if args and args[0] is not undefined else 10
+        v = _jtn(this) if isinstance(this, JSObject) else this
+        if radix == 10:
+            return js_to_string(v)
+        return _int_to_radix(int(v), radix)
+    _def_method(proto, 'toString', _make_native_fn('toString', _num_toString))
+    _def_method(proto, 'valueOf', _make_native_fn('valueOf', lambda this, args:
+        js_to_number(this) if isinstance(this, JSObject) else this))
     obj.props['prototype'] = proto
 
     # Constants
