@@ -1029,8 +1029,14 @@ def make_function_builtin(interp) -> JSObject:
     def bind_fn(this, args):
         return interp._bind_function(this, args)
     _def_method(proto, 'bind', _make_native_fn('bind', bind_fn))
-    _def_method(proto, 'toString', _make_native_fn('toString', lambda this, args:
-        'function () { [native code] }'))
+
+    def _fn_to_string(this, args):
+        from pyquickjs.interpreter import JSFunction
+        if isinstance(this, JSFunction) and this.source_text:
+            return this.source_text
+        name = getattr(this, 'name', '') or ''
+        return f'function {name}() {{ [native code] }}'
+    _def_method(proto, 'toString', _make_native_fn('toString', _fn_to_string))
 
     obj.props['prototype'] = proto
 
@@ -1494,6 +1500,8 @@ def make_json_builtin(interp) -> JSObject:
 def make_error_class(name: str, interp) -> JSObject:
     obj = JSObject(class_name='Function')
     obj.name = name
+    obj.props['name'] = name
+    obj.props['length'] = 1
 
     def error_ctor(this_val, args):
         err_obj = JSObject(class_name=name)
@@ -2747,9 +2755,13 @@ def build_global_env(interp) -> Environment:
             return undefined
         src = js_to_string(args[0])
         from pyquickjs.parser import Parser, ParseError
-        from pyquickjs.lexer import JSSyntaxError as _JSSyntaxError
+        from pyquickjs.lexer import JSSyntaxError as _JSSyntaxError, JS_MODE_STRICT
         try:
             parser = Parser(interp._ctx, src, '<eval>')
+            # Detect top-level "use strict" directive prologue
+            stripped = src.lstrip()
+            if stripped.startswith('"use strict"') or stripped.startswith("'use strict'"):
+                parser.s.cur_func.js_mode |= JS_MODE_STRICT
             ast = parser.parse_program()
             # Use the current (calling) env — but since we don't have it here,
             # use global env
@@ -2785,6 +2797,11 @@ def build_global_env(interp) -> Environment:
     # print function (QuickJS-specific)
     env._bindings['print'] = _make_native_fn('print', lambda this, args:
         (print(' '.join(_format_for_print(a) for a in args)), undefined)[1])
+
+    # require stub (makes typeof require !== 'undefined', mimicking Node.js environments)
+    def _require_stub(this, args):
+        raise _ThrowSignal(make_error('Error', 'require is not supported in this runtime'))
+    env._bindings['require'] = _make_native_fn('require', _require_stub)
 
     # assert helper (needed by test files before they define their own)
     def assert_fn(this, args):

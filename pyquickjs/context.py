@@ -154,6 +154,8 @@ class JSContext:
             interp._current_filename = '<input>'
             interp._current_line = 0
             interp._current_col = 0
+            interp._module_cache = {}
+            interp._current_module_exports = None
             interp._ctx = self
             self._interp = interp
             # Now build the real global env (which sets interp.global_env)

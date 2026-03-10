@@ -231,6 +231,7 @@ class JSToken:
 
 # JavaScript mode flags (from quickjs.c)
 JS_MODE_STRICT = 0x01
+JS_MODE_KEYWORDS = 0x02  # Treat let/static etc. as keywords without full strict-mode restrictions
 
 
 class JSParseState:
@@ -1007,12 +1008,20 @@ class JSParseState:
 
         if atom <= JS_ATOM.LAST_KEYWORD:
             is_keyword = True
-        elif (atom <= JS_ATOM.LAST_STRICT_KEYWORD and
-              self.cur_func.js_mode & JS_MODE_STRICT):
-            is_keyword = True
+        elif atom < JS_ATOM.yield_:
+            # Strict-mode reserved words (implements..static, atoms 37-44)
+            if self.cur_func.js_mode & JS_MODE_STRICT:
+                is_keyword = True
+            elif (self.cur_func.js_mode & JS_MODE_KEYWORDS and
+                  atom in (JS_ATOM.let, JS_ATOM.static)):
+                # Only let/static are keywords in ES6+ non-strict mode
+                is_keyword = True
         elif atom == JS_ATOM.yield_:
             func = self.cur_func
-            if func.func_kind & _JS_FUNC_GENERATOR:
+            if self.cur_func.js_mode & JS_MODE_STRICT:
+                # yield is always a keyword in strict mode
+                is_keyword = True
+            elif func.func_kind & _JS_FUNC_GENERATOR:
                 is_keyword = True
             elif (func.func_type == _JS_PARSE_FUNC_ARROW and
                   not func.in_function_body and func.parent and
@@ -1049,6 +1058,7 @@ class JSParseState:
         is_bigint = False
         is_float = False
         has_legacy_octal = False
+        allow_sep = True  # numeric separators allowed?
 
         c = self.peek()
 
@@ -1067,6 +1077,7 @@ class JSParseState:
             elif p1 and '0' <= p1 <= '7':
                 # Possible legacy octal
                 has_legacy_octal = True
+                allow_sep = False  # numeric separators not allowed in legacy octals
                 self.advance()
                 radix = 8
                 # Check if it's really octal (no 8 or 9)
@@ -1078,13 +1089,18 @@ class JSParseState:
                         has_legacy_octal = False
                         break
                     temp_pos += 1
+            elif p1 and '8' <= p1 <= '9':
+                # Non-octal decimal starting with 0 (like 08, 09)
+                # Numeric separators not allowed (follows same legacy rules)
+                self.advance()  # skip leading '0'
+                allow_sep = False
             else:
                 self.advance()  # skip the '0'
         elif c != '.':
             pass  # digit 1-9, handled by _scan_digits
 
         # Scan digits
-        digit_str = self._scan_number_body(radix, start)
+        digit_str = self._scan_number_body(radix, start, allow_sep=allow_sep)
 
         # Check for bigint suffix
         if self.peek() == 'n':
@@ -1122,10 +1138,11 @@ class JSParseState:
         except (ValueError, OverflowError):
             self._error("invalid number literal")
 
-    def _scan_number_body(self, radix: int, start: int) -> str:
+    def _scan_number_body(self, radix: int, start: int, allow_sep: bool = True) -> str:
         """Scan digits (with separators) and optional decimal/exponent parts.
 
         Returns the cleaned digit string (separators stripped).
+        allow_sep: if False, reject numeric separators (for legacy octal/non-octal 0-prefix numbers).
         """
         buf: list[str] = []
 
@@ -1145,8 +1162,8 @@ class JSParseState:
                 self.advance()
                 has_digits = True
             elif c == '_':
-                # Separator: must be between digits
-                if not has_digits:
+                # Separator: must be between digits AND separators must be allowed
+                if not allow_sep or not has_digits:
                     break
                 nc = self.peek(1)
                 if nc and _valid_digit(nc):
@@ -1282,7 +1299,7 @@ class _StubFunctionDef:
     """Minimal stand-in for JSFunctionDef during lexing."""
 
     def __init__(self):
-        self.js_mode = JS_MODE_STRICT  # treat let/const/static as keywords
+        self.js_mode = JS_MODE_KEYWORDS  # treat let/static/yield as keywords (not full strict)
         self.func_kind = 0
         self.func_type = 0
         self.in_function_body = True

@@ -17,10 +17,11 @@ from pyquickjs.ast_nodes import (
     ConditionalExpression, ContinueStatement,
     DoWhileStatement, DebuggerStatement,
     EmptyStatement, ExpressionStatement, ExportDefaultDeclaration,
-    ExportNamedDeclaration,
+    ExportNamedDeclaration, ExportSpecifier,
     ForInStatement, ForOfStatement, ForStatement, FunctionDeclaration,
     FunctionExpression,
     Identifier, IfStatement, ImportDeclaration,
+    ImportDefaultSpecifier, ImportNamespaceSpecifier, ImportSpecifier,
     LabeledStatement, Literal, LogicalExpression,
     MemberExpression, MethodDefinition, MetaProperty, NewExpression, Node, Super,
     ObjectExpression, ObjectPattern,
@@ -106,6 +107,22 @@ _ASSIGN_OPS: dict[int, str] = {
 }
 
 
+def _has_simple_params(params: list) -> bool:
+    """Return True if all parameters are plain identifiers (no destructuring, defaults, rest)."""
+    from pyquickjs.ast_nodes import Identifier, RestElement, AssignmentPattern
+    for p in params:
+        if not isinstance(p, Identifier):
+            return False
+    return True
+
+
+# Identifiers that are reserved words in strict mode (cannot be used as param names)
+_STRICT_RESERVED_WORDS = frozenset({
+    'implements', 'interface', 'let', 'package', 'private',
+    'protected', 'public', 'static', 'yield',
+})
+
+
 class Parser:
     """Recursive-descent JavaScript parser producing AST nodes."""
 
@@ -188,12 +205,50 @@ class Parser:
         except ValueError:
             return f"token({t})"
 
+    def _is_let_decl(self) -> bool:
+        """Check if current Tok.LET starts a let-declaration (rather than an identifier expression).
+        Peeks at the next token to decide. Must be called when cur token is Tok.LET.
+        Returns True if this looks like 'let x = ...' / 'let {x} = ...' etc."""
+        save_pos = self.s.pos
+        save_tok = self.s.token
+        save_got_lf = self.s.got_lf
+        self._next()  # advance past 'let'
+        t = self._tok()
+        got_lf = self.s.got_lf
+        # Restore
+        self.s.pos = save_pos
+        self.s.token = save_tok
+        self.s.got_lf = save_got_lf
+        # let [ is always a declaration regardless of line breaks
+        if t == ord('['):
+            return True
+        # Other binding starts: {, identifier, 'let', 'yield', 'await'
+        if t in (ord('{'), Tok.IDENT, Tok.LET, Tok.YIELD, Tok.AWAIT, Tok.STATIC):
+            # If there's a line break before the next token, it's ASI → not a decl
+            return not got_lf
+        return False
+
+
     def _eat(self, tok: int) -> bool:
         """If current token matches, consume and return True."""
         if self._tok() == tok:
             self._next()
             return True
         return False
+
+    def _contextual_kw_as_ident(self) -> str | None:
+        """Return name if current token is a contextual keyword usable as identifier in non-strict mode.
+        Returns None if the token cannot be used as an identifier.
+        In strict mode, Tok.LET and Tok.STATIC are proper keywords and cannot be identifiers."""
+        t = self._tok()
+        if t == Tok.IDENT:
+            return self._get_ident_name()
+        if not (self.s.cur_func.js_mode & JS_MODE_STRICT):
+            if t == Tok.LET:
+                return 'let'
+            if t == Tok.STATIC:
+                return 'static'
+        return None
 
     def _ident_name(self) -> str:
         """Return the identifier name from current token (for IDENT and keywords used as property names)."""
@@ -238,6 +293,10 @@ class Parser:
             return self._parse_var_statement("var")
 
         if t == Tok.LET:
+            # In non-strict mode, 'let' is a contextual keyword: use lookahead to decide
+            # if it starts a let-declaration or is just an identifier expression.
+            if not (self.s.cur_func.js_mode & JS_MODE_STRICT) and not self._is_let_decl():
+                return self._parse_expression_statement()
             return self._parse_var_statement("let")
 
         if t == Tok.CONST:
@@ -279,6 +338,12 @@ class Parser:
         if t == Tok.CLASS and declaration:
             return self._parse_class_declaration()
 
+        if t == Tok.IMPORT:
+            return self._parse_import_declaration()
+
+        if t == Tok.EXPORT:
+            return self._parse_export_declaration()
+
         if t == Tok.DEBUGGER:
             self._next()
             self._expect_semi()
@@ -313,13 +378,196 @@ class Parser:
                 return LabeledStatement(label=label, body=body)
             # async function declaration
             if name == "async" and declaration and not self.s.got_lf and self._tok() == Tok.FUNCTION:
-                return self._parse_function_declaration(is_async=True)
+                return self._parse_function_declaration(is_async=True, fn_start=save_token.pos)
             # Not a label — restore and parse as expression
             self.s.pos = save_pos
             self.s.token = save_token
             # Fall through to expression statement
 
         return self._parse_expression_statement()
+
+    # ---- Import / Export declarations ----
+
+    def _parse_import_declaration(self) -> Node:
+        """Parse: import {x, y as z} from "..." | import * as ns from "..." | import def from "..."."""
+        self._next()  # consume 'import'
+
+        # import "..." — side-effect only import (no specifiers)
+        if self._tok() == Tok.STRING:
+            source_str = self.s.token.str_val.string
+            self._next()
+            self._expect_semi()
+            return ImportDeclaration(specifiers=[], source=Literal(value=source_str))
+
+        specifiers: list = []
+
+        if self._tok() == ord('*'):
+            # import * as ns from "..."
+            self._next()
+            self._expect_contextual('as')
+            local_name = self._ident_name()
+            self._next()
+            specifiers.append(ImportNamespaceSpecifier(local=Identifier(name=local_name)))
+        elif self._tok() == ord('{'):
+            # import { x, y as z, "string-name" as w, ... } from "..."
+            self._next()  # consume '{'
+            while self._tok() != ord('}') and self._tok() != Tok.EOF:
+                if self._tok() == Tok.STRING:
+                    imported_name = self.s.token.str_val.string
+                    self._next()
+                else:
+                    imported_name = self._ident_name()
+                    self._next()
+                if self._tok() == Tok.IDENT and self._get_ident_name() == 'as':
+                    self._next()  # consume 'as'
+                    local_name = self._ident_name()
+                    self._next()
+                else:
+                    local_name = imported_name
+                specifiers.append(ImportSpecifier(
+                    imported=Identifier(name=imported_name),
+                    local=Identifier(name=local_name)))
+                if not self._eat(ord(',')):
+                    break
+            self._expect(ord('}'))
+            # Optionally followed by 'from "..."'
+            if not (self._tok() == Tok.IDENT and self._get_ident_name() == 'from'):
+                self._expect_semi()
+                return ImportDeclaration(specifiers=specifiers, source=None)
+        else:
+            # import defaultExport from "..."  OR  import defaultExport, { x } from "..."
+            default_name = self._ident_name()
+            self._next()
+            specifiers.append(ImportDefaultSpecifier(local=Identifier(name=default_name)))
+            if self._eat(ord(',')):
+                if self._tok() == ord('*'):
+                    self._next()
+                    self._expect_contextual('as')
+                    ns_name = self._ident_name()
+                    self._next()
+                    specifiers.append(ImportNamespaceSpecifier(local=Identifier(name=ns_name)))
+                elif self._tok() == ord('{'):
+                    self._next()
+                    while self._tok() != ord('}') and self._tok() != Tok.EOF:
+                        if self._tok() == Tok.STRING:
+                            imported_name = self.s.token.str_val.string
+                            self._next()
+                        else:
+                            imported_name = self._ident_name()
+                            self._next()
+                        if self._tok() == Tok.IDENT and self._get_ident_name() == 'as':
+                            self._next()
+                            local_name = self._ident_name()
+                            self._next()
+                        else:
+                            local_name = imported_name
+                        specifiers.append(ImportSpecifier(
+                            imported=Identifier(name=imported_name),
+                            local=Identifier(name=local_name)))
+                        if not self._eat(ord(',')):
+                            break
+                    self._expect(ord('}'))
+
+        self._expect_contextual('from')
+        source_str = self.s.token.str_val.string
+        self._expect(Tok.STRING)
+        self._expect_semi()
+        return ImportDeclaration(specifiers=specifiers, source=Literal(value=source_str))
+
+    def _expect_contextual(self, name: str) -> None:
+        """Expect the current token to be the contextual keyword with the given name."""
+        if self._tok() == Tok.IDENT and self._get_ident_name() == name:
+            self._next()
+            return
+        raise self._error(f"expected '{name}', got {self._tok_name()}")
+
+    def _parse_export_declaration(self) -> Node:
+        """Parse: export default ... | export { x, y as z } | export function/class/const/let/var ..."""
+        self._next()  # consume 'export'
+
+        if self._tok() == Tok.DEFAULT:
+            # export default expr | export default function | export default class
+            self._next()
+            if self._tok() == Tok.FUNCTION:
+                decl = self._parse_function_declaration()
+            elif self._tok() == Tok.CLASS:
+                decl = self._parse_class_declaration()
+            else:
+                decl = self._parse_assignment_expr()
+                self._expect_semi()
+            return ExportDefaultDeclaration(declaration=decl)
+
+        if self._tok() == ord('{'):
+            # export { x, y as z, x as "string-name" } [from "..."]
+            self._next()
+            specifiers = []
+            while self._tok() != ord('}') and self._tok() != Tok.EOF:
+                local_name = self._ident_name()
+                self._next()
+                if self._tok() == Tok.IDENT and self._get_ident_name() == 'as':
+                    self._next()
+                    if self._tok() == Tok.STRING:
+                        exported_name = self.s.token.str_val.string
+                        self._next()
+                    else:
+                        exported_name = self._ident_name()
+                        self._next()
+                else:
+                    exported_name = local_name
+                specifiers.append(ExportSpecifier(
+                    local=Identifier(name=local_name),
+                    exported=Identifier(name=exported_name)))
+                if not self._eat(ord(',')):
+                    break
+            self._expect(ord('}'))
+            source = None
+            if self._tok() == Tok.IDENT and self._get_ident_name() == 'from':
+                self._next()
+                source_str = self.s.token.str_val.string
+                self._expect(Tok.STRING)
+                source = Literal(value=source_str)
+            self._expect_semi()
+            return ExportNamedDeclaration(specifiers=specifiers, source=source)
+
+        if self._tok() == ord('*'):
+            # export * from "..." or export * as ns from "..."
+            self._next()
+            specifiers = []
+            if self._tok() == Tok.IDENT and self._get_ident_name() == 'as':
+                self._next()
+                exported_name = self._ident_name()
+                self._next()
+                specifiers.append(ExportSpecifier(
+                    local=Identifier(name='*'),
+                    exported=Identifier(name=exported_name)))
+            self._expect_contextual('from')
+            source_str = self.s.token.str_val.string
+            self._expect(Tok.STRING)
+            self._expect_semi()
+            return ExportNamedDeclaration(specifiers=specifiers, source=Literal(value=source_str))
+
+        # export var/let/const/function/class declaration
+        decl = None
+        if self._tok() == Tok.VAR:
+            decl = self._parse_var_statement('var')
+        elif self._tok() == Tok.LET:
+            decl = self._parse_var_statement('let')
+        elif self._tok() == Tok.CONST:
+            decl = self._parse_var_statement('const')
+        elif self._tok() == Tok.FUNCTION:
+            decl = self._parse_function_declaration()
+        elif self._tok() == Tok.CLASS:
+            decl = self._parse_class_declaration()
+        elif self._tok() == Tok.IDENT and self._get_ident_name() == 'async':
+            async_start = self.s.token.pos
+            self._next()
+            if self._tok() == Tok.FUNCTION:
+                decl = self._parse_function_declaration(is_async=True, fn_start=async_start)
+            else:
+                raise self._error('expected function after async export')
+        else:
+            raise self._error(f"unexpected token in export: {self._tok_name()}")
+        return ExportNamedDeclaration(declaration=decl)
 
     def _parse_block(self) -> BlockStatement:
         self._expect(ord('{'))
@@ -348,6 +596,10 @@ class Parser:
 
     def _parse_var_declarator(self, kind: str, no_in: bool = False) -> VariableDeclarator:
         target = self._parse_binding_pattern()
+        # 'let' is not a valid lexical identifier name (even in non-strict sloppy mode)
+        if (kind in ('let', 'const') and isinstance(target, Identifier)
+                and target.name == 'let'):
+            raise self._error("'let' is not a valid lexical identifier")
         init = None
         if self._eat(ord('=')):
             init = self._parse_assignment_no_in() if no_in else self._parse_assignment_expr()
@@ -360,6 +612,11 @@ class Parser:
             name = self._get_ident_name()
             self._next()
             return Identifier(name=name)
+        # In non-strict mode, contextual keywords 'let' and 'static' can be binding identifiers
+        n = self._contextual_kw_as_ident()
+        if n is not None and t != Tok.IDENT:
+            self._next()
+            return Identifier(name=n)
         if t == ord('['):
             return self._parse_array_pattern()
         if t == ord('{'):
@@ -422,7 +679,13 @@ class Parser:
             key = Literal(value=self.s.token.str_val.string)
             self._next()
         else:
-            raise self._error(f"expected property name, got {self._tok_name()}")
+            # Allow contextual keywords (let, static) as property keys in non-strict mode
+            kw_name = self._contextual_kw_as_ident()
+            if kw_name is not None and self._tok() != Tok.IDENT:
+                key = Identifier(name=kw_name)
+                self._next()
+            else:
+                raise self._error(f"expected property name, got {self._tok_name()}")
 
         if self._eat(ord(':')):
             value = self._parse_binding_pattern()
@@ -621,16 +884,19 @@ class Parser:
         self._expect_semi()
         return ReturnStatement(argument=argument)
 
-    def _parse_function_declaration(self, is_async: bool = False) -> FunctionDeclaration:
+    def _parse_function_declaration(self, is_async: bool = False, fn_start: int = -1) -> FunctionDeclaration:
+        fn_start = self.s.token.pos if fn_start < 0 else fn_start
         ln, cl = self._lc(); self._next()  # consume 'function'
         generator = self._eat(ord('*'))
         name = None
-        if self._tok() == Tok.IDENT:
-            name = Identifier(name=self._get_ident_name())
+        _fn_name = self._contextual_kw_as_ident()
+        if _fn_name is not None:
+            name = Identifier(name=_fn_name)
             self._next()
         params = self._parse_formal_params()
-        body = self._parse_function_body(is_async=is_async, is_generator=generator)
-        return FunctionDeclaration(id=name, params=params, body=body, generator=generator, async_=is_async, line=ln, col=cl)
+        body = self._parse_function_body(is_async=is_async, is_generator=generator, params=params, fn_name=name)
+        src = self.s.source[fn_start:self.s.last_pos]
+        return FunctionDeclaration(id=name, params=params, body=body, generator=generator, async_=is_async, line=ln, col=cl, source_text=src)
 
     def _parse_class_declaration(self) -> ClassDeclaration:
         self._next()  # class
@@ -685,7 +951,7 @@ class Parser:
                     save_pos = self.s.pos
                     save_tok = self.s.token
                     self._next()
-                    if self._tok() != ord('(') and not self.s.got_lf:
+                    if self._tok() not in (ord('('), ord(';'), ord('='), ord('}')) and not self.s.got_lf:
                         is_async = True
                     else:
                         self.s.pos = save_pos
@@ -858,6 +1124,9 @@ class Parser:
 
     def _parse_yield_expr(self) -> YieldExpression:
         """Parse: yield [*] [expr]"""
+        # yield is only valid in a generator function (or strict mode in a generator)
+        if not (self.s.cur_func.func_kind & _JS_FUNC_GENERATOR):
+            raise self._error("yield is only valid inside generator functions")
         self._next()  # consume 'yield'
         delegate = False
         if self._tok() == ord('*'):
@@ -1104,12 +1373,21 @@ class Parser:
         if t == Tok.IDENT:
             ln, cl = self._lc()
             name = self._get_ident_name()
+            fn_start = self.s.token.pos
             self._next()
             # async function expression
             if name == 'async' and not self.s.got_lf:
                 if self._tok() == Tok.FUNCTION:
-                    return self._parse_function_expression(is_async=True)
+                    return self._parse_function_expression(is_async=True, fn_start=fn_start)
             return Identifier(name=name, line=ln, col=cl)
+
+        # In non-strict mode, 'let' and 'static' can be used as identifier expressions
+        if t in (Tok.LET, Tok.STATIC):
+            kw_name = self._contextual_kw_as_ident()
+            if kw_name is not None:
+                ln, cl = self._lc()
+                self._next()
+                return Identifier(name=kw_name, line=ln, col=cl)
 
         if t == Tok.NUMBER:
             return self._parse_number_literal()
@@ -1380,16 +1658,19 @@ class Parser:
             return Identifier(name=name), False
         raise self._error(f"expected property key, got {self._tok_name()}")
 
-    def _parse_function_expression(self, is_async: bool = False) -> FunctionExpression:
+    def _parse_function_expression(self, is_async: bool = False, fn_start: int = -1) -> FunctionExpression:
+        fn_start = self.s.token.pos if fn_start < 0 else fn_start
         ln, cl = self._lc(); self._next()  # consume 'function'
         generator = self._eat(ord('*'))
         name = None
-        if self._tok() == Tok.IDENT:
-            name = Identifier(name=self._get_ident_name())
+        _fn_name = self._contextual_kw_as_ident()
+        if _fn_name is not None:
+            name = Identifier(name=_fn_name)
             self._next()
         params = self._parse_formal_params()
-        body = self._parse_function_body(is_async=is_async, is_generator=generator)
-        return FunctionExpression(id=name, params=params, body=body, generator=generator, async_=is_async, line=ln, col=cl)
+        body = self._parse_function_body(is_async=is_async, is_generator=generator, params=params, fn_name=name)
+        src = self.s.source[fn_start:self.s.last_pos]
+        return FunctionExpression(id=name, params=params, body=body, generator=generator, async_=is_async, line=ln, col=cl, source_text=src)
 
     def _parse_class_expression(self) -> ClassExpression:
         self._next()  # class
@@ -1425,7 +1706,8 @@ class Parser:
         self._expect(ord(')'))
         return params
 
-    def _parse_function_body(self, is_async: bool = False, is_generator: bool = False) -> BlockStatement:
+    def _parse_function_body(self, is_async: bool = False, is_generator: bool = False,
+                             params: list | None = None, fn_name=None) -> BlockStatement:
         func_def = _StubFunctionDef()
         func_def.parent = self.s.cur_func
         func_def.js_mode = self.s.cur_func.js_mode
@@ -1436,6 +1718,25 @@ class Parser:
         old_func = self.s.cur_func
         self.s.cur_func = func_def
         self._expect(ord('{'))
+        # Detect "use strict" directive prologue
+        if (self._tok() == Tok.STRING and
+                self.s.token.str_val.string == 'use strict'):
+            # Non-simple params (destructuring, defaults, rest) + "use strict" is illegal
+            if params and not _has_simple_params(params):
+                raise self._error(
+                    "Illegal 'use strict' directive in function with non-simple parameter list")
+            func_def.js_mode |= JS_MODE_STRICT
+            # Retroactively check function name and params for strict-mode reserved words
+            # (yield, implements, interface, let, package, private, protected, public, static)
+            if fn_name is not None and fn_name.name in _STRICT_RESERVED_WORDS:
+                raise self._error(
+                    f"'{fn_name.name}' is not a valid identifier in strict mode")
+            if params:
+                for p in params:
+                    n = p.name if hasattr(p, 'name') else None
+                    if n in _STRICT_RESERVED_WORDS:
+                        raise self._error(
+                            f"'{n}' is not a valid identifier in strict mode")
         body: list[Node] = []
         while self._tok() != ord('}') and self._tok() != Tok.EOF:
             stmt = self._parse_statement(declaration=True)

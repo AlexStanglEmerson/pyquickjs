@@ -61,6 +61,7 @@ class FunctionDeclaration(Node):
     body: BlockStatement = None  # type: ignore
     generator: bool = False
     async_: bool = False
+    source_text: str = ""
 
 
 @dataclass
@@ -213,6 +214,7 @@ class FunctionExpression(Node):
     body: BlockStatement = None  # type: ignore
     generator: bool = False
     async_: bool = False
+    source_text: str = ""
 
 
 @dataclass
@@ -390,6 +392,32 @@ class RestElement(Node):
 class ImportDeclaration(Node):
     specifiers: list[Node] = field(default_factory=list)
     source: Literal = None  # type: ignore
+
+
+@dataclass
+class ImportSpecifier(Node):
+    """import { imported as local } from "..."."""
+    imported: Node = None  # type: ignore  # Identifier (the name in the module)
+    local: Node = None  # type: ignore     # Identifier (the local binding name)
+
+
+@dataclass
+class ImportDefaultSpecifier(Node):
+    """import local from "..."."""
+    local: Node = None  # type: ignore
+
+
+@dataclass
+class ImportNamespaceSpecifier(Node):
+    """import * as local from "..."."""
+    local: Node = None  # type: ignore
+
+
+@dataclass
+class ExportSpecifier(Node):
+    """export { local as exported }."""
+    local: Node = None  # type: ignore
+    exported: Node = None  # type: ignore
 
 
 @dataclass

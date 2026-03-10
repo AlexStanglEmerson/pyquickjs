@@ -29,6 +29,8 @@ from pyquickjs.ast_nodes import (
     ThrowStatement, TryStatement, CatchClause, WithStatement,
     DebuggerStatement, ClassDeclaration,
     ImportDeclaration, ExportNamedDeclaration, ExportDefaultDeclaration,
+    ImportSpecifier, ImportDefaultSpecifier, ImportNamespaceSpecifier,
+    ExportSpecifier,
     # Expressions
     Identifier, Literal, ThisExpression, ArrayExpression,
     ObjectExpression, Property, SpreadElement, FunctionExpression,
@@ -527,7 +529,8 @@ class JSFunction:
     __slots__ = ('name', 'params', 'body', 'env', 'is_arrow', 'is_generator',
                  'is_async', 'this_mode', 'home_obj', '_bound_this',
                  '_bound_args', '_bound_target', 'prototype', 'length', 'interp',
-                 '_static_props', '_descriptors', '_instance_fields', '_super_ctor')
+                 '_static_props', '_descriptors', '_instance_fields', '_super_ctor',
+                 'source_text')
 
     def __init__(self, name: str, params: list, body, env: Environment,
                  is_arrow: bool = False, is_generator: bool = False,
@@ -551,6 +554,7 @@ class JSFunction:
         self._descriptors = None
         self._instance_fields = []
         self._super_ctor = None
+        self.source_text = ''
 
     def __repr__(self):
         return f'[Function: {self.name or "(anonymous)"}]'
@@ -1310,6 +1314,8 @@ class Interpreter:
         self._current_filename = '<input>'
         self._current_line = 0
         self._current_col = 0
+        self._module_cache: dict = {}       # abs_path -> JSObject (namespace)
+        self._current_module_exports = None  # JSObject | None, set when inside a module
 
     def _annotate_error(self, err, line: int, col: int, filename: str | None = None) -> None:
         """Add line:col frame to an error's stack.
@@ -1394,13 +1400,11 @@ class Interpreter:
         if t == 'WithStatement':
             return self._exec_with(node, env)
         if t == 'ImportDeclaration':
-            return undefined  # handled by module system
+            return self._exec_import_decl(node, env)
         if t == 'ExportNamedDeclaration':
-            if node.declaration:
-                return self.exec(node.declaration, env)
-            return undefined
+            return self._exec_export_named(node, env)
         if t == 'ExportDefaultDeclaration':
-            return undefined
+            return self._exec_export_default(node, env)
 
         raise NotImplementedError(f'Unhandled statement type: {t}')
 
@@ -2091,6 +2095,210 @@ class Interpreter:
         with_env = Environment(parent=env, with_obj=obj)
         return self.exec(node.body, with_env)
 
+    # ---- Module system ----
+
+    # Built-in module specifiers that the engine provides. Unknown built-ins
+    # return an empty namespace rather than trying to load a file.
+    _BUILTIN_MODULE_PREFIXES = ('qjs:', 'node:')
+
+    def _load_module(self, module_spec: str, importer_path: str) -> 'JSObject':
+        """Load a module and return its exports namespace object."""
+        import os as _os
+
+        # Resolve to an absolute path (or leave as-is for built-ins)
+        is_relative = module_spec.startswith('./') or module_spec.startswith('../')
+        is_absolute = _os.path.isabs(module_spec)
+
+        if is_relative or is_absolute:
+            if is_relative:
+                base_dir = _os.path.dirname(_os.path.abspath(importer_path))
+                abs_path = _os.path.normpath(_os.path.join(base_dir, module_spec))
+            else:
+                abs_path = _os.path.normpath(module_spec)
+
+            if abs_path in self._module_cache:
+                return self._module_cache[abs_path]
+
+            # Placeholder to handle circular imports
+            placeholder = JSObject(class_name='Module')
+            placeholder.props = {}
+            self._module_cache[abs_path] = placeholder
+
+            try:
+                source = open(abs_path, encoding='utf-8').read()
+            except OSError:
+                # File not found — return empty namespace
+                return placeholder
+
+            return self._eval_module_source(source, abs_path, placeholder)
+        else:
+            # Built-in module specifier (qjs:std, qjs:os, etc.)
+            if module_spec in self._module_cache:
+                return self._module_cache[module_spec]
+            ns = self._get_builtin_module(module_spec)
+            self._module_cache[module_spec] = ns
+            return ns
+
+    def _eval_module_source(self, source: str, abs_path: str,
+                             namespace: 'JSObject') -> 'JSObject':
+        """Parse and execute a module file; populate and return its namespace."""
+        from pyquickjs.parser import Parser, ParseError
+
+        # Save interpreter state
+        saved_filename = self._current_filename
+        saved_exports = self._current_module_exports
+
+        self._current_filename = abs_path
+        self._current_module_exports = namespace
+
+        module_env = Environment(parent=self.global_env, is_function=True)
+        # Module scope is always strict
+        module_env._bindings['@@strict'] = True
+
+        try:
+            parser = Parser(self._ctx, source, abs_path)
+            ast = parser.parse_program()
+            self._exec_program(ast, module_env)
+        except Exception:
+            pass  # partial exports still available
+        finally:
+            self._current_filename = saved_filename
+            self._current_module_exports = saved_exports
+
+        return namespace
+
+    def _get_builtin_module(self, spec: str) -> 'JSObject':
+        """Return an already-registered built-in module or empty namespace."""
+        # Built-in modules (e.g. qjs:os, qjs:std) are registered in global_env
+        # Look them up via the builtins layer
+        ns = JSObject(class_name='Module')
+        ns.props = {}
+        try:
+            existing = self.global_env.get(spec)
+            if isinstance(existing, JSObject):
+                return existing
+        except Exception:
+            pass
+        return ns
+
+    def _exec_import_decl(self, node, env: Environment) -> Any:
+        """Execute an import declaration, binding names from the loaded module."""
+        source = node.source
+        if source is None:
+            return undefined
+        module_spec = source.value
+        module_ns = self._load_module(module_spec, self._current_filename)
+
+        for spec in node.specifiers:
+            t = type(spec).__name__
+            if t == 'ImportSpecifier':
+                imported_name = spec.imported.name
+                local_name = spec.local.name
+                val = module_ns.props.get(imported_name, undefined)
+                env.define_let(local_name, val)
+            elif t == 'ImportNamespaceSpecifier':
+                env.define_let(spec.local.name, module_ns)
+            elif t == 'ImportDefaultSpecifier':
+                val = module_ns.props.get('default', undefined)
+                env.define_let(spec.local.name, val)
+        return undefined
+
+    def _exec_export_named(self, node, env: Environment) -> Any:
+        """Execute an export named declaration, updating the module namespace."""
+        exports = self._current_module_exports
+
+        if node.declaration:
+            # execute the declaration first (defines the name in env)
+            self.exec(node.declaration, env)
+            if exports is not None:
+                self._collect_decl_exports(node.declaration, env, exports)
+            return undefined
+
+        # export { x, y as z }
+        if node.specifiers and exports is not None:
+            for spec in node.specifiers:
+                local_name = spec.local.name
+                exported_name = spec.exported.name
+                if local_name == '*':
+                    # export * as ns — copy from re-exported module
+                    if node.source:
+                        sub_ns = self._load_module(node.source.value, self._current_filename)
+                        ns_obj = JSObject(class_name='Module')
+                        ns_obj.props = dict(sub_ns.props)
+                        exports.props[exported_name] = ns_obj
+                else:
+                    try:
+                        val = env.get(local_name)
+                    except Exception:
+                        val = undefined
+                    exports.props[exported_name] = val
+
+        # re-export: export { x } from "..."
+        if node.source and exports is not None:
+            sub_ns = self._load_module(node.source.value, self._current_filename)
+            for spec in node.specifiers:
+                exports.props[spec.exported.name] = sub_ns.props.get(spec.local.name, undefined)
+
+        return undefined
+
+    def _exec_export_default(self, node, env: Environment) -> Any:
+        """Execute an export default declaration."""
+        decl = node.declaration
+        t = type(decl).__name__
+        if t in ('FunctionDeclaration', 'ClassDeclaration'):
+            self.exec(decl, env)
+            if decl.id:
+                val = env.get(decl.id.name)
+            else:
+                # Anonymous function/class — evaluate as expression
+                val = self.eval(decl, env)
+        else:
+            val = self.eval(decl, env)
+        if self._current_module_exports is not None:
+            self._current_module_exports.props['default'] = val
+        return undefined
+
+    def _collect_decl_exports(self, decl, env: Environment,
+                               exports: 'JSObject') -> None:
+        """After executing decl, copy its declared names into exports."""
+        t = type(decl).__name__
+        if t == 'FunctionDeclaration':
+            if decl.id:
+                try:
+                    exports.props[decl.id.name] = env.get(decl.id.name)
+                except Exception:
+                    pass
+        elif t == 'ClassDeclaration':
+            if decl.id:
+                try:
+                    exports.props[decl.id.name] = env.get(decl.id.name)
+                except Exception:
+                    pass
+        elif t == 'VariableDeclaration':
+            for declarator in decl.declarations:
+                self._collect_pattern_exports(declarator.id, env, exports)
+
+    def _collect_pattern_exports(self, pattern, env: Environment,
+                                  exports: 'JSObject') -> None:
+        """Recursively collect identifier names from a binding pattern."""
+        t = type(pattern).__name__
+        if t == 'Identifier':
+            try:
+                exports.props[pattern.name] = env.get(pattern.name)
+            except Exception:
+                pass
+        elif t == 'ObjectPattern':
+            for prop in pattern.properties:
+                self._collect_pattern_exports(prop.value if hasattr(prop, 'value') else prop, env, exports)
+        elif t == 'ArrayPattern':
+            for elem in pattern.elements:
+                if elem is not None:
+                    self._collect_pattern_exports(elem, env, exports)
+        elif t == 'AssignmentPattern':
+            self._collect_pattern_exports(pattern.left, env, exports)
+        elif t == 'RestElement':
+            self._collect_pattern_exports(pattern.argument, env, exports)
+
     # ---- Expressions ----
 
     def _eval_literal(self, node: Literal) -> Any:
@@ -2274,8 +2482,12 @@ class Interpreter:
                 # If the chain contained ?., it short-circuits to true
                 if self._has_optional_in_chain(node.object):
                     return True
+                if node.computed:
+                    _dkey = js_to_string(self.eval(node.property, env))
+                else:
+                    _dkey = node.property.name
                 raise _ThrowSignal(make_error('TypeError',
-                    f"Cannot read properties of {js_typeof(obj)}"))
+                    f"cannot read property '{_dkey}' of {'null' if obj is null else 'undefined'}"))
             if node.computed:
                 key = js_to_string(self.eval(node.property, env))
             else:
@@ -2461,6 +2673,15 @@ class Interpreter:
                     break
                 else:
                     break
+            # Fall back to Function.prototype (call/apply/bind already handled above,
+            # but toString, Symbol.hasInstance, etc. live there)
+            fn_ctor = self.global_env._bindings.get('Function')
+            if fn_ctor is not None:
+                fn_proto = getattr(fn_ctor, 'props', {}).get('prototype')
+                if fn_proto is not None:
+                    result = _obj_get_property(fn_proto, key, obj)
+                    if result is not undefined:
+                        return result
             return undefined
         if isinstance(obj, JSObject):
             if obj._is_array and key == 'length':
@@ -2491,7 +2712,7 @@ class Interpreter:
             return result
         if obj is null or obj is undefined:
             raise _ThrowSignal(make_error('TypeError',
-                f"Cannot read properties of {js_typeof(obj)} (reading '{key}')"))
+                f"cannot read property '{key}' of {'null' if obj is null else 'undefined'}"))
         return undefined
 
     def _bind_function(self, fn, args: list):
@@ -2791,15 +3012,21 @@ class Interpreter:
             return undefined
         src = js_to_string(args[0])
         from pyquickjs.parser import Parser, ParseError
-        from pyquickjs.lexer import JSSyntaxError as _JSSyntaxError
+        from pyquickjs.lexer import JSSyntaxError as _JSSyntaxError, JS_MODE_STRICT
         # Save and restore filename context
         _saved_filename = self._current_filename
         self._current_filename = '<eval>'
         try:
             parser = Parser(self._ctx, src, '<eval>')
+            # Detect top-level "use strict" directive prologue BEFORE parsing
+            # so that strict-mode reserved words (yield, etc.) are rejected as keywords
+            stripped = src.lstrip()
+            if (stripped.startswith('"use strict"') or stripped.startswith("'use strict'")
+                    or env._is_strict()):
+                parser.s.cur_func.js_mode |= JS_MODE_STRICT
             ast = parser.parse_program()
             result = undefined
-            # Detect 'use strict' in eval code itself
+            # Detect 'use strict' in eval code itself (for runtime strict mode)
             eval_code_strict = (ast.body and
                 type(ast.body[0]).__name__ == 'ExpressionStatement' and
                 type(ast.body[0].expression).__name__ == 'Literal' and
@@ -2953,6 +3180,9 @@ class Interpreter:
             else:
                 # Concise arrow body
                 return self.eval(fn.body, call_env)
+        except RecursionError:
+            raise _ThrowSignal(make_error('RangeError',
+                'Maximum call stack size exceeded'))
         finally:
             self._call_stack_depth -= 1
 
@@ -3262,6 +3492,7 @@ class Interpreter:
             is_async=getattr(node, 'async_', False),
             interp=self,
         )
+        fn.source_text = getattr(node, 'source_text', '')
         if getattr(node, 'line', None):
             fn._static_props = {'lineNumber': node.line, 'columnNumber': node.col}
         return fn
@@ -3766,6 +3997,8 @@ class Interpreter:
                 if math.isnan(n) or math.isinf(n) or n <= len(s2):
                     return s2
                 length = int(n)
+                if length > (1 << 28):
+                    raise _ThrowSignal(make_error('RangeError', 'Invalid string length'))
                 fill = js_to_string(args[1]) if len(args) > 1 and args[1] is not undefined else ' '
                 if not fill:
                     return s2
@@ -3780,6 +4013,8 @@ class Interpreter:
                 if math.isnan(n) or math.isinf(n) or n <= len(s2):
                     return s2
                 length = int(n)
+                if length > (1 << 28):
+                    raise _ThrowSignal(make_error('RangeError', 'Invalid string length'))
                 fill = js_to_string(args[1]) if len(args) > 1 and args[1] is not undefined else ' '
                 if not fill:
                     return s2
