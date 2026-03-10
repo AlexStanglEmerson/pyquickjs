@@ -298,6 +298,6 @@ The test suite includes the QuickJS upstream test files (`test_builtin.js`, `tes
 
 ## License
 
-This project is released under the Unlicense, but it is derived from QuickJS which is licensed under the MIT license. If you use this library, make sure to comply with the terms of both licenses.
+This project is released under the Unlicense, but it is derived from QuickJS which is licensed under the MIT license. Some of the tests from [QuickJS-NG](https://github.com/quickjs-ng/quickjs) were also used. If you use this library, make sure to comply with the terms of the QuickJS and QuickJS-NG licenses.
 
 For more details, see [LICENSE.md](LICENSE.md).

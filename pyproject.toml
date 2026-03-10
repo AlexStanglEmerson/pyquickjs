@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Pure Python port of the QuickJS JavaScript engine"
 authors = []
 readme = "README.md"
-license = "MIT"
+license = "Unlicense"
 packages = [{ include = "pyquickjs" }]
 
 [tool.poetry.dependencies]
