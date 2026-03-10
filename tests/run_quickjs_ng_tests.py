@@ -37,6 +37,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 NG_TESTS_DIR = Path(__file__).parent.parent / "third_party" / "quickjs-ng" / "tests"
+LOCAL_JS_DIR = Path(__file__).parent / "js"
 _RUNNER = Path(__file__).parent / "_ng_runner.py"
 
 # Per-test timeout in seconds.  Generous enough for slow machines but short
@@ -122,7 +123,7 @@ def _run_js_file(filepath: Path, test_id: str = "") -> None:
 
     # Skip tests that rely on unimplemented features detectable from source.
     if 'maxByteLength' in source:
-        pytest.skip("requires resizable ArrayBuffer (not implemented)")
+        pytest.skip("requires resizable ArrayBuffer (maxByteLength/resize not implemented)")
     if 'Iterator.concat' in source:
         pytest.skip("requires Iterator.concat (not implemented)")
     if 'Error.stackTraceLimit' in source:
@@ -162,11 +163,13 @@ def _run_js_file(filepath: Path, test_id: str = "") -> None:
 # ---------------------------------------------------------------------------
 
 def _collect_ng_tests() -> list[tuple[Path, str]]:
-    """Collect all runnable JS test files from the NG test directory."""
+    """Collect all runnable JS test files from the NG test directory and the
+    local tests/js/ directory."""
     tests = []
+
+    # --- upstream quickjs-ng tests ---
     for js_file in sorted(NG_TESTS_DIR.rglob("*.js")):
         rel = js_file.relative_to(NG_TESTS_DIR)
-        # Top-level file names only (directories are counted as their parent name)
         parts = rel.parts
         filename = parts[-1]
 
@@ -180,6 +183,16 @@ def _collect_ng_tests() -> list[tuple[Path, str]]:
             test_id = "/".join(list(parts[:-1]) + [filename.replace(".js", "")])
 
         tests.append((js_file, test_id))
+
+    # --- local tests (tests/js/*.js) ---
+    _LOCAL_EXCLUDE = {"assert.js"}  # helpers, not standalone tests
+    if LOCAL_JS_DIR.is_dir():
+        for js_file in sorted(LOCAL_JS_DIR.glob("*.js")):
+            if js_file.name in _LOCAL_EXCLUDE:
+                continue
+            test_id = "local/" + js_file.stem
+            tests.append((js_file, test_id))
+
     return tests
 
 

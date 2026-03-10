@@ -2913,6 +2913,9 @@ def build_global_env(interp) -> Environment:
     # ArrayBuffer
     env._bindings['ArrayBuffer'] = _make_array_buffer_builtin()
 
+    # DataView
+    env._bindings['DataView'] = _make_data_view_builtin()
+
     # BigInt
     def bigint_fn(this, args):
         if not args:
@@ -3392,6 +3395,128 @@ def _make_typed_array_builtin(name: str) -> JSObject:  # noqa: C901
     obj.props['BYTES_PER_ELEMENT'] = bpe
     obj._call = ta_construct
     obj._construct = ta_construct
+    return obj
+
+
+def _make_data_view_builtin() -> JSObject:  # noqa: C901
+    """Build the DataView constructor and prototype."""
+    import struct as _struct
+
+    # (struct_fmt, byte_size, is_bigint, is_signed)
+    _DV_INFO = {
+        'Int8':    ('b', 1, False, True),
+        'Uint8':   ('B', 1, False, False),
+        'Int16':   ('h', 2, False, True),
+        'Uint16':  ('H', 2, False, False),
+        'Int32':   ('i', 4, False, True),
+        'Uint32':  ('I', 4, False, False),
+        'Float32': ('f', 4, False, False),
+        'Float64': ('d', 8, False, False),
+        'BigInt64':  ('q', 8, True, True),
+        'BigUint64': ('Q', 8, True, False),
+    }
+
+    def _get_ab_data(dv):
+        buf = dv.props.get('buffer')
+        if buf is None:
+            raise _ThrowSignal(make_error('TypeError', 'DataView has no buffer'))
+        data = getattr(buf, '_ab_data', None)
+        if data is None:
+            raise _ThrowSignal(make_error('TypeError', 'DataView attached to detached ArrayBuffer'))
+        return data
+
+    def _make_getter(type_name):
+        fmt, size, is_bigint, _ = _DV_INFO[type_name]
+        def getter(this, args):
+            byte_offset = int(js_to_number(args[0])) if args else 0
+            little_endian = bool(args[1]) if len(args) > 1 and args[1] is not undefined and args[1] is not False else False
+            # 1-byte types have no endianness
+            endian = '<' if (little_endian or size == 1) else '>'
+            data = _get_ab_data(this)
+            dv_offset = this.props.get('@@dv_byte_offset', 0)
+            dv_length = this.props.get('@@dv_byte_length', len(data) - dv_offset)
+            abs_offset = dv_offset + byte_offset
+            if byte_offset < 0 or byte_offset + size > dv_length:
+                raise _ThrowSignal(make_error('RangeError',
+                    f'Offset {byte_offset} is outside the bounds of the buffer'))
+            val = _struct.unpack_from(endian + fmt, data, abs_offset)[0]
+            return JSBigInt(val) if is_bigint else val
+        getter.__name__ = f'get{type_name}'
+        return getter
+
+    def _make_setter(type_name):
+        fmt, size, is_bigint, _ = _DV_INFO[type_name]
+        def setter(this, args):
+            byte_offset = int(js_to_number(args[0])) if args else 0
+            raw_val = args[1] if len(args) > 1 else undefined
+            little_endian = bool(args[2]) if len(args) > 2 and args[2] is not undefined and args[2] is not False else False
+            endian = '<' if (little_endian or size == 1) else '>'
+            data = _get_ab_data(this)
+            dv_offset = this.props.get('@@dv_byte_offset', 0)
+            dv_length = this.props.get('@@dv_byte_length', len(data) - dv_offset)
+            abs_offset = dv_offset + byte_offset
+            if byte_offset < 0 or byte_offset + size > dv_length:
+                raise _ThrowSignal(make_error('RangeError',
+                    f'Offset {byte_offset} is outside the bounds of the buffer'))
+            if is_bigint:
+                if isinstance(raw_val, JSBigInt):
+                    v = raw_val.value
+                else:
+                    v = int(js_to_number(raw_val)) if raw_val is not undefined else 0
+                # Clamp to type range before packing
+                bits = size * 8
+                v = v & ((1 << bits) - 1)
+                if fmt == 'q' and v >= (1 << (bits - 1)):
+                    v -= (1 << bits)
+            elif fmt in ('f', 'd'):
+                v = js_to_number(raw_val) if raw_val is not undefined else 0.0
+            else:
+                v = int(js_to_number(raw_val)) if raw_val is not undefined else 0
+                bits = size * 8
+                v = v & ((1 << bits) - 1)
+                if fmt in ('b', 'h', 'i') and v >= (1 << (bits - 1)):
+                    v -= (1 << bits)
+            _struct.pack_into(endian + fmt, data, abs_offset, v)
+            return undefined
+        setter.__name__ = f'set{type_name}'
+        return setter
+
+    def dv_construct(this, args):
+        buf = args[0] if args else undefined
+        if not isinstance(buf, JSObject) or getattr(buf, '_ab_data', None) is None:
+            raise _ThrowSignal(make_error('TypeError',
+                'DataView constructor: first argument must be an ArrayBuffer'))
+        ab_data = buf._ab_data
+        ab_len = len(ab_data)
+        byte_offset = int(js_to_number(args[1])) if len(args) > 1 and args[1] is not undefined else 0
+        if byte_offset < 0 or byte_offset > ab_len:
+            raise _ThrowSignal(make_error('RangeError',
+                f'DataView constructor: byteOffset {byte_offset} is out of bounds'))
+        if len(args) > 2 and args[2] is not undefined:
+            byte_length = int(js_to_number(args[2]))
+            if byte_length < 0 or byte_offset + byte_length > ab_len:
+                raise _ThrowSignal(make_error('RangeError',
+                    f'DataView constructor: byteLength {byte_length} is out of bounds'))
+        else:
+            byte_length = ab_len - byte_offset
+
+        dv = JSObject(class_name='DataView')
+        dv.props['buffer'] = buf
+        dv.props['byteOffset'] = byte_offset
+        dv.props['byteLength'] = byte_length
+        dv.props['@@dv_byte_offset'] = byte_offset
+        dv.props['@@dv_byte_length'] = byte_length
+
+        for type_name in _DV_INFO:
+            dv.props[f'get{type_name}'] = _make_native_fn(f'get{type_name}', _make_getter(type_name))
+            dv.props[f'set{type_name}'] = _make_native_fn(f'set{type_name}', _make_setter(type_name))
+
+        return dv
+
+    obj = JSObject(class_name='Function')
+    obj.name = 'DataView'
+    obj._call = dv_construct
+    obj._construct = dv_construct
     return obj
 
 
