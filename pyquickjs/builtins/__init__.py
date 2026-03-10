@@ -1366,9 +1366,20 @@ def _js_sign(n):
 def make_json_builtin(interp) -> JSObject:
     obj = JSObject(class_name='JSON')
 
+    # Sentinel: value should be omitted from objects / return undefined at top level.
+    # Distinct from None (which represents JSON null).
+    _SKIP = object()
+
     def js_val_to_python(v):
-        """Convert JS value to Python object for json.dumps."""
-        if v is null or v is undefined:
+        """Convert JS value to Python object for json.dumps.
+
+        Returns _SKIP for values that must be omitted (undefined, symbols,
+        functions).  Returns None for values that serialize as JSON null
+        (null, Infinity, NaN, -Infinity).
+        """
+        if v is undefined:
+            return _SKIP
+        if v is null:
             return None
         if isinstance(v, bool):
             return v
@@ -1376,15 +1387,26 @@ def make_json_builtin(interp) -> JSObject:
             return v
         if isinstance(v, float):
             if math.isnan(v) or math.isinf(v):
-                return None
+                return None   # Infinity / NaN → JSON null (not omitted)
             return v
         if isinstance(v, str):
             return v
         if isinstance(v, JSBigInt):
             raise _ThrowSignal(make_error('TypeError', 'BigInt cannot be serialized in JSON'))
+        if isinstance(v, JSSymbol):
+            return _SKIP
+        from pyquickjs.interpreter import JSFunction as _JSFn  # local import to avoid circularity
+        if isinstance(v, _JSFn):
+            return _SKIP
         if isinstance(v, JSObject):
+            if v._call is not None:
+                return _SKIP  # function-like object
             if v._is_array:
-                return [js_val_to_python(item) for item in _array_to_list(v)]
+                # In arrays, undefined/function/symbol elements become null (§ 24.5.2.5)
+                def _arr_elem(item):
+                    py = js_val_to_python(item)
+                    return None if py is _SKIP else py
+                return [_arr_elem(item) for item in _array_to_list(v)]
             d = {}
             for k, val in v.props.items():
                 if k.startswith('@@'):
@@ -1394,7 +1416,7 @@ def make_json_builtin(interp) -> JSObject:
                     if not desc.get('enumerable', True):
                         continue
                 py_val = js_val_to_python(val)
-                if py_val is not None or val is null:
+                if py_val is not _SKIP:
                     d[k] = py_val
             # Include enumerable descriptor-only properties (getters)
             if v._descriptors:
@@ -1407,7 +1429,6 @@ def make_json_builtin(interp) -> JSObject:
                     if 'get' in desc:
                         getter = desc['get']
                         try:
-                            from pyquickjs.interpreter import JSFunction as _JSFn
                             if isinstance(getter, _JSFn):
                                 val = getter.interp.call_function(getter, v, [])
                             elif callable(getter):
@@ -1423,10 +1444,10 @@ def make_json_builtin(interp) -> JSObject:
                     else:
                         continue
                     py_val = js_val_to_python(val)
-                    if py_val is not None or val is null:
+                    if py_val is not _SKIP:
                         d[k] = py_val
             return d
-        return None
+        return _SKIP   # anything else (e.g. unhandled host objects) is omitted
 
     def json_stringify(this, args):
         if not args:
@@ -1441,7 +1462,7 @@ def make_json_builtin(interp) -> JSObject:
             elif isinstance(space, str):
                 indent = space  # type: ignore
         py_val = js_val_to_python(val)
-        if py_val is None and val is not null and not isinstance(val, JSObject):
+        if py_val is _SKIP:
             return undefined
         try:
             if indent is None:
