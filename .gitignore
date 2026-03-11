@@ -221,3 +221,4 @@ Sandbox.py
 # Extra files used by Claude
 debug_*.py
 *.txt
+debug/

@@ -17,8 +17,10 @@ regex = ">=2024.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"
+pyyaml = ">=6.0"
+pytest-xdist = ">=3.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-python_files = ["test_*.py"]
+python_files = ["test_*.py", "run_*.py"]
 python_functions = ["test_*"]
