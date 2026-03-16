@@ -379,8 +379,10 @@ def _run_t262_test(filepath: Path, test_id: str, meta: dict[str, Any], is_strict
     expected_error = (neg["type"] if neg else "None") or "None"
     expected_phase = (neg["phase"] if neg else "None") or "None"
 
-    # sta.js must always come first; append any test-specific harness files.
-    includes = ["sta.js"] + [f for f in meta.get("includes", []) if f != "sta.js"]
+    # sta.js and assert.js are always loaded by the test262 harness convention;
+    # append any test-specific files listed in the test metadata.
+    _default = ["sta.js", "assert.js"]
+    includes = _default + [f for f in meta.get("includes", []) if f not in _default]
     includes_csv = ",".join(includes)
 
     try:

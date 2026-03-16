@@ -35,6 +35,14 @@ MEMORY_LIMIT_MB = 150
 
 def _error_type_from_exc(exc: Exception) -> str:
     """Return the JS error type name from an exception message, best-effort."""
+    # JSSyntaxError is the engine's parse-time exception; treat it as SyntaxError.
+    try:
+        from pyquickjs.lexer import JSSyntaxError as _JSSyntaxError
+        if isinstance(exc, _JSSyntaxError):
+            return "SyntaxError"
+    except ImportError:
+        pass
+
     msg = str(exc)
     # Our interpreter surfaces JS errors as RuntimeError with the JS error
     # type name at the start of the message, e.g. "TypeError: ..."

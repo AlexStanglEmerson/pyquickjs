@@ -15,6 +15,7 @@ from typing import Any
 class Node:
     line: int = 0
     col: int = 0
+    parenthesized: bool = False  # True if wrapped in parens; used for early-error checks
 
 
 # ---- Program ----
@@ -319,6 +320,7 @@ class TemplateLiteral(Node):
 @dataclass
 class TemplateElement(Node):
     value: str = ""  # cooked value
+    raw: str = ""    # raw value (preserves escape sequences)
     tail: bool = False
 
 
@@ -337,6 +339,13 @@ class YieldExpression(Node):
 @dataclass
 class AwaitExpression(Node):
     argument: Node = None  # type: ignore
+
+
+@dataclass
+class ChainExpression(Node):
+    """Wraps an optional chain (a?.b.c(++x).d) so the interpreter can
+    short-circuit the entire tail when ?. encounters null/undefined."""
+    expression: Node = None  # type: ignore
 
 
 @dataclass

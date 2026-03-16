@@ -168,7 +168,13 @@ class JSContext:
         interp._current_filename = filename or '<input>'
 
         try:
+            from pyquickjs.lexer import JS_MODE_STRICT
             parser = Parser(self, source, filename)
+            # Detect top-level "use strict" directive BEFORE parsing so that
+            # parse-time strict checks (e.g. forbidden if-body declarations) fire.
+            stripped = source.lstrip()
+            if stripped.startswith('"use strict"') or stripped.startswith("'use strict'"):
+                parser.s.cur_func.js_mode |= JS_MODE_STRICT
             ast = parser.parse_program()
         except ParseError as e:
             raise SyntaxError(str(e)) from e

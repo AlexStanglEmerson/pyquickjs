@@ -204,6 +204,7 @@ class TokenIdent:
 class TokenStr:
     string: str = ""
     sep: str = ""  # The separator character: ' " or `
+    raw: str = ""  # Raw text for template literals
 
 
 @dataclass
@@ -659,7 +660,9 @@ class JSParseState:
     def _parse_template_part(self) -> None:
         """Parse a template literal part. self.pos is past the opening ` or }."""
         buf: list[str] = []
+        raw_buf: list[str] = []
         sep = ''
+        raw_start = self.pos
 
         while True:
             if self.at_end():
@@ -679,9 +682,12 @@ class JSParseState:
                 break
 
             if c == '\\':
-                # In template raw mode, we keep the backslash
-                # For cooked strings, we parse the escape
+                # Capture raw text: the backslash + the escape sequence chars
+                raw_pos_before = self.pos
                 parsed = self._parse_escape('`')
+                # Raw: backslash + the characters consumed by _parse_escape
+                raw_buf.append('\\')
+                raw_buf.append(self.source[raw_pos_before:self.pos])
                 if parsed is not None:
                     buf.append(parsed)
                 continue
@@ -691,6 +697,7 @@ class JSParseState:
                 if self.peek() == '\n':
                     self.advance()
                 buf.append('\n')
+                raw_buf.append('\n')
                 continue
 
             # Encode non-BMP chars as UTF-16 surrogate pairs (JS string semantics)
@@ -699,11 +706,14 @@ class JSParseState:
                 cp -= 0x10000
                 buf.append(chr(0xD800 + (cp >> 10)))
                 buf.append(chr(0xDC00 + (cp & 0x3FF)))
+                raw_buf.append(c)
             else:
                 buf.append(c)
+                raw_buf.append(c)
 
         self.token.val = Tok.TEMPLATE
         self.token.str_val.string = ''.join(buf)
+        self.token.str_val.raw = ''.join(raw_buf)
         self.token.str_val.sep = sep
 
     def _parse_escape(self, sep: str) -> str | None:
@@ -737,6 +747,7 @@ class JSParseState:
                     if self.cur_func.js_mode & JS_MODE_STRICT or sep == '`':
                         self._error("octal escape sequences are not allowed in strict mode")
                         return ''
+                    self.cur_func.has_legacy_octal_escape = True
                     return self._parse_legacy_octal(ord(c))
                 return '\0'
             case _ if '1' <= c <= '9':
@@ -746,6 +757,8 @@ class JSParseState:
                     else:
                         self._error("octal escape sequences are not allowed in strict mode")
                     return ''
+                # Track legacy octal/non-octal decimal for retroactive strict-mode checking
+                self.cur_func.has_legacy_octal_escape = True
                 if '1' <= c <= '7':
                     return self._parse_legacy_octal(ord(c))
                 return c
@@ -1179,6 +1192,9 @@ class JSParseState:
             # (like property access — but in number context it's always decimal)
             buf.append('.')
             self.advance()
+            # Numeric separator cannot be adjacent to '.'
+            if not self.at_end() and self.source[self.pos] == '_':
+                self._error("Numeric separator not allowed after decimal point")
             while not self.at_end():
                 c = self.source[self.pos]
                 if '0' <= c <= '9':
@@ -1203,9 +1219,21 @@ class JSParseState:
                 if not self.at_end() and self.source[self.pos] in ('+', '-'):
                     buf.append(self.source[self.pos])
                     self.advance()
-                while not self.at_end() and self.source[self.pos].isdigit():
-                    buf.append(self.source[self.pos])
-                    self.advance()
+                has_exp_digit = False
+                while not self.at_end():
+                    ec = self.source[self.pos]
+                    if ec.isdigit():
+                        buf.append(ec)
+                        self.advance()
+                        has_exp_digit = True
+                    elif ec == '_' and allow_sep and has_exp_digit:
+                        nc = self.peek(1)
+                        if nc and nc.isdigit():
+                            self.advance()  # skip separator
+                        else:
+                            break
+                    else:
+                        break
 
         result = ''.join(buf)
         if not result or result == '.':
@@ -1304,6 +1332,12 @@ class _StubFunctionDef:
         self.func_type = 0
         self.in_function_body = True
         self.parent: _StubFunctionDef | None = None
+        self.in_iteration: int = 0  # depth counter for iteration statements
+        self.in_switch: int = 0  # depth counter for switch statements
+        self.has_legacy_octal_escape: bool = False  # tracks \1-\9 in non-strict mode
+        self.label_set: dict[str, bool] = {}  # label name → is_iteration
+        self.super_call_allowed: bool = False  # True only in derived class constructors
+        self.super_prop_allowed: bool = False  # True in methods (super.x)
 
 
 class JSSyntaxError(Exception):
