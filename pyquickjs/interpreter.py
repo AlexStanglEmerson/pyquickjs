@@ -386,6 +386,10 @@ class JSObject:
                  '_ab_data',
                  # [[ErrorData]] slot marker (for Error.isError)
                  '_error_data',
+                 # for Iterator internal slots
+                 '_iter_source', '_iter_idx', '_iter_kind', '_iter_done',
+                 # for WeakMap/WeakSet
+                 '_weakmap_data', '_weakset_data', '_weakset_keys',
                  )
 
     def __init__(self, proto=None, class_name='Object'):
@@ -419,6 +423,13 @@ class JSObject:
         self._ab_data = None
         self._weak_target = None
         self._error_data = False
+        self._iter_source = None
+        self._iter_idx = None
+        self._iter_kind = None
+        self._iter_done = False
+        self._weakmap_data = None
+        self._weakset_data = None
+        self._weakset_keys = None
 
     def has_own(self, key: str) -> bool:
         return key in self.props or (
@@ -1200,6 +1211,36 @@ def js_strict_equal(a, b) -> bool:
     return a is b
 
 
+def js_same_value_zero(a, b) -> bool:
+    """SameValueZero comparison (used by Map/Set for key equality).
+
+    Like strict equality except NaN === NaN is true."""
+    if type(a) != type(b):
+        if isinstance(a, (int, float)) and not isinstance(a, bool) and \
+           isinstance(b, (int, float)) and not isinstance(b, bool):
+            if math.isnan(a) and math.isnan(b):
+                return True
+            return a == b
+        return False
+    if a is undefined and b is undefined:
+        return True
+    if a is null and b is null:
+        return True
+    if isinstance(a, bool):
+        return a == b
+    if isinstance(a, (int, float)) and not isinstance(a, bool):
+        if math.isnan(a) and math.isnan(b):
+            return True
+        return a == b
+    if isinstance(a, str):
+        return a == b
+    if isinstance(a, JSBigInt):
+        return a.value == b.value
+    if isinstance(a, JSSymbol):
+        return a is b
+    return a is b
+
+
 def js_abstract_equal(a, b) -> bool:
     """Abstract equality (==)."""
     # Same type
@@ -1487,6 +1528,14 @@ def _get_iterator(val, interpreter: 'Interpreter'):
 
 def _array_iterator(arr: JSObject, interp: 'Interpreter'):
     """Create an array iterator object."""
+    proto = _PROTOS.get('ArrayIterator')
+    if proto is not None:
+        obj = JSObject(proto=proto, class_name='Array Iterator')
+        obj._iter_source = arr
+        obj._iter_idx = [0]
+        obj._iter_kind = 'value'
+        return obj
+    # Fallback (before builtins registered)
     obj = JSObject(class_name='Array Iterator')
     items = _array_to_list(arr)
     idx = [0]
@@ -1510,8 +1559,16 @@ def _make_iter_result(value, done: bool) -> JSObject:
 
 
 def _string_iterator(s: str):
+    proto = _PROTOS.get('StringIterator')
+    if proto is not None:
+        obj = JSObject(proto=proto, class_name='String Iterator')
+        obj._iter_source = list(s)
+        obj._iter_idx = [0]
+        obj._iter_kind = 'value'
+        return obj
+    # Fallback (before builtins registered)
     obj = JSObject(class_name='String Iterator')
-    chars = list(s)  # handles surrogate pairs as single chars in Python 3
+    chars = list(s)
     idx = [0]
     def next_fn(this, args):
         if idx[0] < len(chars):
@@ -1526,6 +1583,14 @@ def _string_iterator(s: str):
 
 
 def _map_values_iterator(map_obj: JSObject):
+    proto = _PROTOS.get('MapIterator')
+    if proto is not None and map_obj._map_list is not None:
+        obj = JSObject(proto=proto, class_name='Map Iterator')
+        obj._iter_source = map_obj._map_list
+        obj._iter_idx = [0]
+        obj._iter_kind = 'key+value'
+        return obj
+    # Fallback for old-style _map_data
     obj = JSObject(class_name='Map Iterator')
     items = list(map_obj._map_data.items()) if map_obj._map_data else []
     idx = [0]
@@ -1541,6 +1606,14 @@ def _map_values_iterator(map_obj: JSObject):
 
 
 def _set_values_iterator(set_obj: JSObject):
+    proto = _PROTOS.get('SetIterator')
+    if proto is not None and set_obj._set_list is not None:
+        obj = JSObject(proto=proto, class_name='Set Iterator')
+        obj._iter_source = set_obj._set_list
+        obj._iter_idx = [0]
+        obj._iter_kind = 'value'
+        return obj
+    # Fallback for old-style _set_data
     obj = JSObject(class_name='Set Iterator')
     items = list(set_obj._set_data) if set_obj._set_data else []
     idx = [0]

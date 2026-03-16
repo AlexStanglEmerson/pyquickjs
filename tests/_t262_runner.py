@@ -28,6 +28,13 @@ from __future__ import annotations
 import gc
 import sys
 import tracemalloc
+from pathlib import Path
+
+# Ensure project root is on sys.path so pyquickjs is importable when the
+# runner is invoked as a subprocess from any working directory.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 # Maximum peak Python-allocation allowed for a single test (megabytes).
 MEMORY_LIMIT_MB = 150
@@ -83,7 +90,6 @@ def main() -> None:
 
     tracemalloc.start()
 
-    from pathlib import Path
     from pyquickjs.runtime import JSRuntime
     from pyquickjs.context import JSContext
 

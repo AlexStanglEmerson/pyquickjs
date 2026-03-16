@@ -23,11 +23,23 @@ from pyquickjs.interpreter import (
     _obj_set_property, _obj_has_property, _obj_define_property, _obj_delete_property,
     _make_iter_result, _build_function_prototype, _call_value,
     js_to_string, js_to_number, js_to_integer, js_to_int32, js_to_uint32,
-    js_to_primitive, js_is_truthy, js_typeof, js_strict_equal,
+    js_to_primitive, js_is_truthy, js_typeof, js_strict_equal, js_same_value_zero,
     js_add, _ThrowSignal, _ReturnSignal,
     _int_to_radix, _SENTINEL, register_proto, _def_method, _PROTOS,
     _symbol_to_key, register_well_known_symbol, _to_property_key,
+    _get_iterator, _iterate_to_next, _iterator_close,
 )
+
+
+def _is_callable(val) -> bool:
+    """Check if a JS value is callable (Function, JSObject with _call, etc.)."""
+    if isinstance(val, JSFunction):
+        return True
+    if isinstance(val, JSObject) and val._call is not None:
+        return True
+    if callable(val) and val is not undefined and val is not null:
+        return True
+    return False
 
 
 def _set_ctor_prototype(obj: JSObject, proto: JSObject) -> None:
@@ -36,6 +48,164 @@ def _set_ctor_prototype(obj: JSObject, proto: JSObject) -> None:
     _obj_define_property(obj, 'prototype', {
         'value': proto, 'writable': False, 'enumerable': False, 'configurable': False
     })
+
+
+# ---------------------------------------------------------------------------
+# %IteratorPrototype% and derived iterator prototypes (ES2015 §25.1)
+# ---------------------------------------------------------------------------
+
+# %IteratorPrototype% — hidden base; has @@iterator -> return this
+_ITERATOR_PROTO = JSObject(class_name='Object')
+_ITERATOR_PROTO.props['@@iterator'] = _make_native_fn('[Symbol.iterator]',
+    lambda this, args: this, 0)
+if _ITERATOR_PROTO._non_enum is None:
+    _ITERATOR_PROTO._non_enum = set()
+_ITERATOR_PROTO._non_enum.add('@@iterator')
+
+
+def _make_typed_iter_proto(tag: str, next_fn) -> JSObject:
+    """Create a %FooIteratorPrototype% that inherits from %IteratorPrototype%."""
+    proto = JSObject(proto=_ITERATOR_PROTO, class_name='Object')
+    fn_obj = _make_native_fn('next', next_fn, 0)
+    _def_method(proto, 'next', fn_obj)
+    # @@toStringTag  {writable: false, enumerable: false, configurable: true}
+    _obj_define_property(proto, '@@toStringTag', {
+        'value': tag, 'writable': False, 'enumerable': False, 'configurable': True,
+    })
+    return proto
+
+
+def _map_iter_next(this, args):
+    """%MapIteratorPrototype%.next()"""
+    if not isinstance(this, JSObject) or this._iter_source is None or this._iter_kind is None or this.class_name != 'Map Iterator':
+        raise _ThrowSignal(make_error('TypeError', '%MapIteratorPrototype%.next requires a Map Iterator'))
+    if this._iter_done:
+        return _make_iter_result(undefined, True)
+    source = this._iter_source      # the map's _map_list
+    idx = this._iter_idx
+    if idx[0] >= len(source):
+        this._iter_done = True
+        return _make_iter_result(undefined, True)
+    pair = source[idx[0]]
+    idx[0] += 1
+    kind = this._iter_kind
+    if kind == 'key':
+        return _make_iter_result(pair[0], False)
+    if kind == 'value':
+        return _make_iter_result(pair[1], False)
+    # 'key+value'
+    return _make_iter_result(make_array([pair[0], pair[1]]), False)
+
+
+def _set_iter_next(this, args):
+    """%SetIteratorPrototype%.next()"""
+    if not isinstance(this, JSObject) or this._iter_source is None or this._iter_kind is None or this.class_name != 'Set Iterator':
+        raise _ThrowSignal(make_error('TypeError', '%SetIteratorPrototype%.next requires a Set Iterator'))
+    if this._iter_done:
+        return _make_iter_result(undefined, True)
+    source = this._iter_source      # the set's _set_list
+    idx = this._iter_idx
+    if idx[0] >= len(source):
+        this._iter_done = True
+        return _make_iter_result(undefined, True)
+    val = source[idx[0]]
+    idx[0] += 1
+    kind = this._iter_kind
+    if kind == 'key+value':
+        return _make_iter_result(make_array([val, val]), False)
+    return _make_iter_result(val, False)
+
+
+def _array_iter_next(this, args):
+    """%ArrayIteratorPrototype%.next()"""
+    from pyquickjs.interpreter import js_to_number as _jtn
+    if not isinstance(this, JSObject) or this._iter_source is None or this._iter_kind is None or this.class_name != 'Array Iterator':
+        raise _ThrowSignal(make_error('TypeError', '%ArrayIteratorPrototype%.next requires an Array Iterator'))
+    if this._iter_done:
+        return _make_iter_result(undefined, True)
+    obj = this._iter_source
+    idx = this._iter_idx
+    # Lazy: read length each time (per spec §22.1.5.2.1)
+    length_val = _obj_get_property(obj, 'length') if isinstance(obj, JSObject) else 0
+    length = int(_jtn(length_val)) if length_val is not undefined else 0
+    if idx[0] >= length:
+        this._iter_done = True
+        return _make_iter_result(undefined, True)
+    i = idx[0]
+    idx[0] += 1
+    kind = this._iter_kind
+    if kind == 'key':
+        return _make_iter_result(i, False)
+    val = _obj_get_property(obj, str(i))
+    if kind == 'value':
+        return _make_iter_result(val, False)
+    # 'key+value'
+    return _make_iter_result(make_array([i, val]), False)
+
+
+def _string_iter_next(this, args):
+    """%StringIteratorPrototype%.next()"""
+    if not isinstance(this, JSObject) or this._iter_source is None or this.class_name != 'String Iterator':
+        raise _ThrowSignal(make_error('TypeError', '%StringIteratorPrototype%.next requires a String Iterator'))
+    if this._iter_done:
+        return _make_iter_result(undefined, True)
+    source = this._iter_source  # Python list of characters
+    idx = this._iter_idx
+    if idx[0] >= len(source):
+        this._iter_done = True
+        return _make_iter_result(undefined, True)
+    ch = source[idx[0]]
+    idx[0] += 1
+    return _make_iter_result(ch, False)
+
+
+_MAP_ITER_PROTO = _make_typed_iter_proto('Map Iterator', _map_iter_next)
+_SET_ITER_PROTO = _make_typed_iter_proto('Set Iterator', _set_iter_next)
+_ARRAY_ITER_PROTO = _make_typed_iter_proto('Array Iterator', _array_iter_next)
+_STRING_ITER_PROTO = _make_typed_iter_proto('String Iterator', _string_iter_next)
+
+# Register so interpreter.py can look them up via _PROTOS
+register_proto('MapIterator', _MAP_ITER_PROTO)
+register_proto('SetIterator', _SET_ITER_PROTO)
+register_proto('ArrayIterator', _ARRAY_ITER_PROTO)
+register_proto('StringIterator', _STRING_ITER_PROTO)
+register_proto('Iterator', _ITERATOR_PROTO)
+
+
+def _make_map_iterator(map_obj: JSObject, kind: str) -> JSObject:
+    """Create a Map iterator with proper prototype chain."""
+    it = JSObject(proto=_MAP_ITER_PROTO, class_name='Map Iterator')
+    it._iter_source = map_obj._map_list
+    it._iter_idx = [0]
+    it._iter_kind = kind
+    return it
+
+
+def _make_set_iterator(set_obj: JSObject, kind: str) -> JSObject:
+    """Create a Set iterator with proper prototype chain."""
+    it = JSObject(proto=_SET_ITER_PROTO, class_name='Set Iterator')
+    it._iter_source = set_obj._set_list
+    it._iter_idx = [0]
+    it._iter_kind = kind
+    return it
+
+
+def _make_array_iterator(arr_obj: JSObject, kind: str) -> JSObject:
+    """Create an Array iterator with proper prototype chain."""
+    it = JSObject(proto=_ARRAY_ITER_PROTO, class_name='Array Iterator')
+    it._iter_source = arr_obj
+    it._iter_idx = [0]
+    it._iter_kind = kind
+    return it
+
+
+def _make_string_iterator(s: str) -> JSObject:
+    """Create a String iterator with proper prototype chain."""
+    it = JSObject(proto=_STRING_ITER_PROTO, class_name='String Iterator')
+    it._iter_source = list(s)  # code points
+    it._iter_idx = [0]
+    it._iter_kind = 'value'
+    return it
 
 
 def _js_ordered_keys(obj: JSObject) -> list[str]:
@@ -808,23 +978,10 @@ def _define_properties(target: JSObject, props_obj) -> None:
 
 # ---- Array ----
 
-def _make_lazy_array_iterator(obj):
+def _make_lazy_array_iterator(obj, kind='value'):
     """Create an iterator that lazily reads from an array-like object.
     Per spec, Array Iterator next() reads 'length' and obj[index] each call."""
-    from pyquickjs.interpreter import _make_iter_result, _obj_get_property, js_to_number, undefined
-    it = JSObject(class_name='Array Iterator')
-    idx = [0]
-    def next_fn(this, args):
-        length_val = _obj_get_property(obj, 'length') if isinstance(obj, JSObject) else 0
-        length = int(js_to_number(length_val)) if length_val is not undefined else 0
-        if idx[0] >= length:
-            return _make_iter_result(undefined, True)
-        val = _obj_get_property(obj, str(idx[0]))
-        idx[0] += 1
-        return _make_iter_result(val, False)
-    it.props['next'] = _make_native_fn('next', next_fn)
-    it.props['@@iterator'] = _make_native_fn('[Symbol.iterator]', lambda t, a: it)
-    return it
+    return _make_array_iterator(obj, kind)
 
 def make_array_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
@@ -1339,24 +1496,19 @@ def make_array_builtin(interp) -> JSObject:
     def arr_entries(this, args):
         if not isinstance(this, JSObject):
             return _make_iter_result(undefined, True)
-        data = _array_to_list(this)
-        pairs = [make_array([i, v]) for i, v in enumerate(data)]
-        from pyquickjs.interpreter import _to_iterator_obj
-        return _to_iterator_obj(pairs)
+        return _make_array_iterator(this, 'key+value')
     _def_method(proto, 'entries', _make_native_fn('entries', arr_entries))
 
     def arr_keys(this, args):
         if not isinstance(this, JSObject):
             return undefined
-        data = _array_to_list(this)
-        from pyquickjs.interpreter import _to_iterator_obj
-        return _to_iterator_obj(list(range(len(data))))
+        return _make_array_iterator(this, 'key')
     _def_method(proto, 'keys', _make_native_fn('keys', arr_keys))
 
     def arr_values(this, args):
         if not isinstance(this, JSObject):
             return undefined
-        return _make_lazy_array_iterator(this)
+        return _make_array_iterator(this, 'value')
     _def_method(proto, 'values', _make_native_fn('values', arr_values))
 
     def arr_at(this, args):
@@ -1679,6 +1831,12 @@ def make_string_builtin(interp) -> JSObject:
                 parts.append(js_to_string(subs[i]))
         return ''.join(parts)
     _def_method(obj, 'raw', _make_native_fn('raw', raw))
+
+    # String.prototype[@@iterator]
+    def str_iter(this, args):
+        s = _get_str_val(this) if isinstance(this, JSObject) else (this if isinstance(this, str) else js_to_string(this))
+        return _make_string_iterator(s)
+    _def_method(proto, '@@iterator', _make_native_fn('[Symbol.iterator]', str_iter, 0))
 
     return obj
 
@@ -2690,31 +2848,40 @@ def make_proxy_builtin(interp) -> JSObject:
 # ---- Reflect ----
 
 def make_reflect_builtin(interp) -> JSObject:
-    obj = JSObject(class_name='Reflect')
+    obj = JSObject(proto=_PROTOS.get('Object'), class_name='Reflect')
+
+    def _require_object(target, method_name):
+        """Throw TypeError if target is not an Object."""
+        if not isinstance(target, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError',
+                f'Reflect.{method_name} called on non-object'))
 
     def reflect_apply(this, args):
         if not args:
             raise _ThrowSignal(make_error('TypeError', 'Reflect.apply requires target'))
         fn = args[0]
+        if not _is_callable(fn):
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.apply requires a function'))
         this_arg = args[1] if len(args) > 1 else undefined
         args_list = args[2] if len(args) > 2 else undefined
-        # Reflect.apply requires args_list to be an iterable object (not undefined/null/primitive)
-        if not isinstance(args_list, JSObject):
+        if args_list is undefined or args_list is null or not isinstance(args_list, JSObject):
             raise _ThrowSignal(make_error('TypeError',
                 'Reflect.apply: args must be an array-like object'))
         fn_args = _array_to_list(args_list)
         return _call_value(fn, this_arg, fn_args)
-    _def_method(obj, 'apply', _make_native_fn('apply', reflect_apply))
+    _def_method(obj, 'apply', _make_native_fn('apply', reflect_apply, 3))
 
     def reflect_construct(this, args):
         if not args:
             raise _ThrowSignal(make_error('TypeError', 'Reflect.construct requires target'))
         ctor = args[0]
         ctor_args = _array_to_list(args[1]) if len(args) > 1 and isinstance(args[1], JSObject) else []
+        if len(args) > 1 and not isinstance(args[1], JSObject):
+            raise _ThrowSignal(make_error('TypeError',
+                'Reflect.construct: args must be an array-like object'))
         # Third arg is newTarget; if provided, must be a constructor
         if len(args) > 2 and args[2] is not undefined:
             new_target = args[2]
-            # Check if new_target is a constructor
             if isinstance(new_target, JSFunction):
                 if new_target.is_arrow or new_target.is_generator:
                     raise _ThrowSignal(make_error('TypeError',
@@ -2728,71 +2895,96 @@ def make_reflect_builtin(interp) -> JSObject:
         else:
             new_target = None
         return interp._construct(ctor, ctor_args, new_target=new_target)
-    _def_method(obj, 'construct', _make_native_fn('construct', reflect_construct))
+    _def_method(obj, 'construct', _make_native_fn('construct', reflect_construct, 2))
 
     def reflect_get(this, args):
-        if len(args) < 2:
-            return undefined
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.get requires target'))
         target = args[0]
-        key = js_to_string(args[1])
+        _require_object(target, 'get')
+        key = _to_property_key(args[1]) if len(args) > 1 else 'undefined'
         receiver = args[2] if len(args) > 2 else target
         return interp._get_property(target, key)
-    _def_method(obj, 'get', _make_native_fn('get', reflect_get))
+    _def_method(obj, 'get', _make_native_fn('get', reflect_get, 2))
 
     def reflect_set(this, args):
-        if len(args) < 3:
-            return False
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.set requires target'))
         target = args[0]
-        key = js_to_string(args[1])
-        value = args[2]
-        interp._set_property(target, key, value)
-        return True
-    _def_method(obj, 'set', _make_native_fn('set', reflect_set))
+        _require_object(target, 'set')
+        key = _to_property_key(args[1]) if len(args) > 1 else 'undefined'
+        value = args[2] if len(args) > 2 else undefined
+        try:
+            interp._set_property(target, key, value)
+            return True
+        except _ThrowSignal:
+            return False
+    _def_method(obj, 'set', _make_native_fn('set', reflect_set, 3))
 
     def reflect_has(this, args):
-        if len(args) < 2:
-            return False
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.has requires target'))
         target = args[0]
-        key = js_to_string(args[1])
+        _require_object(target, 'has')
+        key = _to_property_key(args[1]) if len(args) > 1 else 'undefined'
         if isinstance(target, JSObject):
             return _obj_has_property(target, key)
         return False
-    _def_method(obj, 'has', _make_native_fn('has', reflect_has))
+    _def_method(obj, 'has', _make_native_fn('has', reflect_has, 2))
 
     def reflect_deleteProperty(this, args):
-        if len(args) < 2 or not isinstance(args[0], JSObject):
-            return False
-        return _obj_delete_property(args[0], js_to_string(args[1]))
-    _def_method(obj, 'deleteProperty', _make_native_fn('deleteProperty', reflect_deleteProperty))
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.deleteProperty requires target'))
+        target = args[0]
+        _require_object(target, 'deleteProperty')
+        key = _to_property_key(args[1]) if len(args) > 1 else 'undefined'
+        return _obj_delete_property(target, key)
+    _def_method(obj, 'deleteProperty', _make_native_fn('deleteProperty', reflect_deleteProperty, 2))
 
     def reflect_defineProperty(this, args):
-        if len(args) < 3 or not isinstance(args[0], JSObject):
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.defineProperty requires target'))
+        target = args[0]
+        _require_object(target, 'defineProperty')
+        key = _to_property_key(args[1]) if len(args) > 1 else 'undefined'
+        desc_obj = args[2] if len(args) > 2 else undefined
+        if desc_obj is not undefined and not isinstance(desc_obj, JSObject):
+            raise _ThrowSignal(make_error('TypeError', 'descriptor must be an object'))
+        desc = _js_to_descriptor(desc_obj) if isinstance(desc_obj, JSObject) else {}
+        try:
+            _obj_define_property(target, key, desc)
+            return True
+        except _ThrowSignal:
             return False
-        _obj_define_property(args[0], js_to_string(args[1]),
-                              _js_to_descriptor(args[2]) if isinstance(args[2], JSObject) else {})
-        return True
-    _def_method(obj, 'defineProperty', _make_native_fn('defineProperty', reflect_defineProperty))
+    _def_method(obj, 'defineProperty', _make_native_fn('defineProperty', reflect_defineProperty, 3))
 
     def reflect_getOwnPropertyDescriptor(this, args):
-        if len(args) < 2 or not isinstance(args[0], JSObject):
-            return undefined
-        o = args[0]
-        key = js_to_string(args[1])
-        if o._descriptors and key in o._descriptors:
-            return _descriptor_to_js(o._descriptors[key])
-        if key in o.props:
-            desc = JSObject()
-            desc.props['value'] = o.props[key]
-            desc.props['writable'] = True
-            desc.props['enumerable'] = True
-            desc.props['configurable'] = True
-            return desc
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.getOwnPropertyDescriptor requires target'))
+        target = args[0]
+        _require_object(target, 'getOwnPropertyDescriptor')
+        o = target
+        key = _to_property_key(args[1]) if len(args) > 1 else 'undefined'
+        if isinstance(o, JSObject):
+            if o._descriptors and key in o._descriptors:
+                return _descriptor_to_js(o._descriptors[key])
+            if key in o.props:
+                desc = JSObject()
+                desc.props['value'] = o.props[key]
+                desc.props['writable'] = True
+                enumerable = True
+                if o._non_enum and key in o._non_enum:
+                    enumerable = False
+                desc.props['enumerable'] = enumerable
+                desc.props['configurable'] = True
+                return desc
         return undefined
-    _def_method(obj, 'getOwnPropertyDescriptor', _make_native_fn('getOwnPropertyDescriptor', reflect_getOwnPropertyDescriptor))
+    _def_method(obj, 'getOwnPropertyDescriptor', _make_native_fn('getOwnPropertyDescriptor', reflect_getOwnPropertyDescriptor, 2))
 
     def reflect_getPrototypeOf(this, args):
-        if not args or not isinstance(args[0], (JSObject, JSFunction)):
-            raise _ThrowSignal(make_error('TypeError', 'Reflect.getPrototypeOf requires object'))
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.getPrototypeOf requires target'))
+        _require_object(args[0], 'getPrototypeOf')
         a = args[0]
         if isinstance(a, JSObject):
             return a.proto if a.proto else null
@@ -2801,14 +2993,19 @@ def make_reflect_builtin(interp) -> JSObject:
             return a._proto if a._proto is not None else null
         func_proto = _PROTOS.get('Function')
         return func_proto if func_proto is not None else null
-    _def_method(obj, 'getPrototypeOf', _make_native_fn('getPrototypeOf', reflect_getPrototypeOf))
+    _def_method(obj, 'getPrototypeOf', _make_native_fn('getPrototypeOf', reflect_getPrototypeOf, 1))
 
     def reflect_setPrototypeOf(this, args):
-        if len(args) < 2 or not isinstance(args[0], (JSObject, JSFunction)):
-            return False
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.setPrototypeOf requires target'))
+        _require_object(args[0], 'setPrototypeOf')
         o = args[0]
-        proto = args[1]
+        proto = args[1] if len(args) > 1 else undefined
+        if proto is not null and not isinstance(proto, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError', 'Object prototype may only be an Object or null'))
         if isinstance(o, JSObject):
+            if not o.extensible:
+                return False
             o.proto = proto if isinstance(proto, (JSObject, JSFunction)) else None
         elif isinstance(o, JSFunction):
             if proto is null:
@@ -2816,26 +3013,29 @@ def make_reflect_builtin(interp) -> JSObject:
             elif isinstance(proto, (JSObject, JSFunction)):
                 o._proto = proto
         return True
-    _def_method(obj, 'setPrototypeOf', _make_native_fn('setPrototypeOf', reflect_setPrototypeOf))
+    _def_method(obj, 'setPrototypeOf', _make_native_fn('setPrototypeOf', reflect_setPrototypeOf, 2))
 
     def reflect_ownKeys(this, args):
-        if not args or not isinstance(args[0], JSObject):
-            return make_array([])
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.ownKeys requires target'))
+        _require_object(args[0], 'ownKeys')
         return make_array(_get_own_property_names(args[0]))
-    _def_method(obj, 'ownKeys', _make_native_fn('ownKeys', reflect_ownKeys))
+    _def_method(obj, 'ownKeys', _make_native_fn('ownKeys', reflect_ownKeys, 1))
 
     def reflect_isExtensible(this, args):
-        if not args or not isinstance(args[0], JSObject):
-            raise _ThrowSignal(make_error('TypeError', 'Reflect.isExtensible requires object'))
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.isExtensible requires target'))
+        _require_object(args[0], 'isExtensible')
         return args[0].extensible
-    _def_method(obj, 'isExtensible', _make_native_fn('isExtensible', reflect_isExtensible))
+    _def_method(obj, 'isExtensible', _make_native_fn('isExtensible', reflect_isExtensible, 1))
 
     def reflect_preventExtensions(this, args):
-        if not args or not isinstance(args[0], JSObject):
-            raise _ThrowSignal(make_error('TypeError', 'Reflect.preventExtensions requires object'))
+        if not args:
+            raise _ThrowSignal(make_error('TypeError', 'Reflect.preventExtensions requires target'))
+        _require_object(args[0], 'preventExtensions')
         args[0].extensible = False
         return True
-    _def_method(obj, 'preventExtensions', _make_native_fn('preventExtensions', reflect_preventExtensions))
+    _def_method(obj, 'preventExtensions', _make_native_fn('preventExtensions', reflect_preventExtensions, 1))
 
     return obj
 
@@ -2843,96 +3043,154 @@ def make_reflect_builtin(interp) -> JSObject:
 # ---- Map ----
 
 def make_map_builtin(interp) -> JSObject:
+
     obj = JSObject(class_name='Function')
     obj.name = 'Map'
 
+    proto = JSObject()
+    _def_method(proto, 'constructor', obj)
+
+    # --- size accessor (getter on prototype) ---
+    def _map_size_get(this, args):
+        if not isinstance(this, JSObject) or this._map_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Map.prototype.size requires a Map'))
+        return len(this._map_list)
+    size_getter = _make_native_fn('get size', _map_size_get)
+    proto._descriptors = proto._descriptors or {}
+    proto._descriptors['size'] = {'get': size_getter, 'set': undefined,
+                                  'enumerable': False, 'configurable': True}
+    if proto._non_enum is None:
+        proto._non_enum = set()
+    proto._non_enum.add('size')
+
+    # --- prototype methods ---
+    def map_set(this, pargs):
+        if not isinstance(this, JSObject) or this._map_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Map.prototype.set requires a Map'))
+        k = pargs[0] if pargs else undefined
+        v = pargs[1] if len(pargs) > 1 else undefined
+        for pair in this._map_list:
+            if js_same_value_zero(pair[0], k):
+                pair[1] = v
+                return this
+        this._map_list.append([k, v])
+        return this
+    _def_method(proto, 'set', _make_native_fn('set', map_set, 2))
+
+    def map_get(this, pargs):
+        if not isinstance(this, JSObject) or this._map_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Map.prototype.get requires a Map'))
+        k = pargs[0] if pargs else undefined
+        for pair in this._map_list:
+            if js_same_value_zero(pair[0], k):
+                return pair[1]
+        return undefined
+    _def_method(proto, 'get', _make_native_fn('get', map_get, 1))
+
+    def map_has(this, pargs):
+        if not isinstance(this, JSObject) or this._map_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Map.prototype.has requires a Map'))
+        k = pargs[0] if pargs else undefined
+        for pair in this._map_list:
+            if js_same_value_zero(pair[0], k):
+                return True
+        return False
+    _def_method(proto, 'has', _make_native_fn('has', map_has, 1))
+
+    def map_delete(this, pargs):
+        if not isinstance(this, JSObject) or this._map_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Map.prototype.delete requires a Map'))
+        k = pargs[0] if pargs else undefined
+        for i, pair in enumerate(this._map_list):
+            if js_same_value_zero(pair[0], k):
+                this._map_list.pop(i)
+                return True
+        return False
+    _def_method(proto, 'delete', _make_native_fn('delete', map_delete, 1))
+
+    def map_clear(this, pargs):
+        if not isinstance(this, JSObject) or this._map_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Map.prototype.clear requires a Map'))
+        this._map_list.clear()
+        return undefined
+    _def_method(proto, 'clear', _make_native_fn('clear', map_clear, 0))
+
+    def map_forEach(this, pargs):
+        if not isinstance(this, JSObject) or this._map_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Map.prototype.forEach requires a Map'))
+        fn = pargs[0] if pargs else undefined
+        this_arg = pargs[1] if len(pargs) > 1 else undefined
+        if not _is_callable(fn):
+            raise _ThrowSignal(make_error('TypeError', str(fn) + ' is not a function'))
+        for pair in list(this._map_list):
+            _call_value(fn, this_arg, [pair[1], pair[0], this])
+        return undefined
+    _def_method(proto, 'forEach', _make_native_fn('forEach', map_forEach, 1))
+
+    def map_keys(this, pargs):
+        if not isinstance(this, JSObject) or this._map_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Map.prototype.keys requires a Map'))
+        return _make_map_iterator(this, 'key')
+    _def_method(proto, 'keys', _make_native_fn('keys', map_keys, 0))
+
+    def map_values(this, pargs):
+        if not isinstance(this, JSObject) or this._map_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Map.prototype.values requires a Map'))
+        return _make_map_iterator(this, 'value')
+    _def_method(proto, 'values', _make_native_fn('values', map_values, 0))
+
+    def map_entries(this, pargs):
+        if not isinstance(this, JSObject) or this._map_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Map.prototype.entries requires a Map'))
+        return _make_map_iterator(this, 'key+value')
+    _def_method(proto, 'entries', _make_native_fn('entries', map_entries, 0))
+
+    _def_method(proto, '@@iterator', proto.props['entries'])
+
+    # Symbol.toStringTag
+    proto.props['@@toStringTag'] = 'Map'
+    if proto._non_enum is None:
+        proto._non_enum = set()
+    proto._non_enum.add('@@toStringTag')
+
+    # --- constructor ---
     def map_construct(this_val, args):
-        m = JSObject(class_name='Map')
-        m._map_data = {}  # We use a list of (key, value) tuples for ordering and any-key support
-        m._map_list = []  # list of [key, value]
-
-        def map_set(this, pargs):
-            k = pargs[0] if pargs else undefined
-            v = pargs[1] if len(pargs) > 1 else undefined
-            for pair in m._map_list:
-                if js_strict_equal(pair[0], k):
-                    pair[1] = v
-                    return m
-            m._map_list.append([k, v])
-            m._map_data[id(pargs[0]) if pargs else id(undefined)] = v
-            m.props['size'] = len(m._map_list)
-            return m
-        m.props['set'] = _make_native_fn('set', map_set)
-
-        def map_get(this, pargs):
-            k = pargs[0] if pargs else undefined
-            for pair in m._map_list:
-                if js_strict_equal(pair[0], k):
-                    return pair[1]
-            return undefined
-        m.props['get'] = _make_native_fn('get', map_get)
-
-        def map_has(this, pargs):
-            k = pargs[0] if pargs else undefined
-            for pair in m._map_list:
-                if js_strict_equal(pair[0], k):
-                    return True
-            return False
-        m.props['has'] = _make_native_fn('has', map_has)
-
-        def map_delete(this, pargs):
-            k = pargs[0] if pargs else undefined
-            for i, pair in enumerate(m._map_list):
-                if js_strict_equal(pair[0], k):
-                    m._map_list.pop(i)
-                    m.props['size'] = len(m._map_list)
-                    return True
-            return False
-        m.props['delete'] = _make_native_fn('delete', map_delete)
-
-        def map_clear(this, pargs):
-            m._map_list.clear()
-            m.props['size'] = 0
-            return undefined
-        m.props['clear'] = _make_native_fn('clear', map_clear)
-
-        def map_forEach(this, pargs):
-            fn = pargs[0] if pargs else undefined
-            for pair in list(m._map_list):
-                _call_value(fn, undefined, [pair[1], pair[0], m])
-            return undefined
-        m.props['forEach'] = _make_native_fn('forEach', map_forEach)
-
-        from pyquickjs.interpreter import _to_iterator_obj
-        def map_keys(this, pargs):
-            return _to_iterator_obj([pair[0] for pair in m._map_list])
-        m.props['keys'] = _make_native_fn('keys', map_keys)
-
-        def map_values(this, pargs):
-            return _to_iterator_obj([pair[1] for pair in m._map_list])
-        m.props['values'] = _make_native_fn('values', map_values)
-
-        def map_entries(this, pargs):
-            return _to_iterator_obj([make_array([p[0], p[1]]) for p in m._map_list])
-        m.props['entries'] = _make_native_fn('entries', map_entries)
-
-        m.props['@@iterator'] = m.props['entries']
-        m.props['size'] = 0
+        m = JSObject(proto=proto, class_name='Map')
+        m._map_list = []
+        m._map_data = {}  # keep for backward compat with _get_iterator fallback
 
         # Populate from iterable
         if args and args[0] is not undefined and args[0] is not null:
             iterable = args[0]
-            if isinstance(iterable, JSObject) and iterable._is_array:
-                for item in _array_to_list(iterable):
-                    if isinstance(item, JSObject) and item._is_array:
-                        pair = _array_to_list(item)
-                        if len(pair) >= 2:
-                            map_set(m, pair)
+            adder = _obj_get_property(m, 'set')
+            if adder is undefined or not _is_callable(adder):
+                raise _ThrowSignal(make_error('TypeError', 'Map.prototype.set is not a function'))
+            try:
+                iterator = _get_iterator(iterable, interp)
+            except _ThrowSignal:
+                raise
+            try:
+                while True:
+                    value, done = _iterate_to_next(iterator)
+                    if done:
+                        break
+                    # Each item must be an object with [0] and [1]
+                    if not isinstance(value, JSObject):
+                        raise _ThrowSignal(make_error('TypeError',
+                            'Iterator value ' + js_typeof(value) + ' is not an entry object'))
+                    k = _obj_get_property(value, '0')
+                    v = _obj_get_property(value, '1')
+                    _call_value(adder, m, [k, v])
+            except _ThrowSignal:
+                _iterator_close(iterator, suppress_error=True)
+                raise
 
         return m
 
-    obj._call = map_construct
+    obj._call = lambda this_val, args: (_ for _ in ()).throw(
+        _ThrowSignal(make_error('TypeError', 'Constructor Map requires \'new\'')))
     obj._construct = map_construct
+    obj.props['prototype'] = proto
 
     return obj
 
@@ -2940,115 +3198,224 @@ def make_map_builtin(interp) -> JSObject:
 # ---- Set ----
 
 def make_set_builtin(interp) -> JSObject:
+
     obj = JSObject(class_name='Function')
     obj.name = 'Set'
 
+    proto = JSObject()
+    _def_method(proto, 'constructor', obj)
+
+    # --- size accessor (getter on prototype) ---
+    def _set_size_get(this, args):
+        if not isinstance(this, JSObject) or this._set_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Set.prototype.size requires a Set'))
+        return len(this._set_list)
+    size_getter = _make_native_fn('get size', _set_size_get)
+    proto._descriptors = proto._descriptors or {}
+    proto._descriptors['size'] = {'get': size_getter, 'set': undefined,
+                                  'enumerable': False, 'configurable': True}
+    if proto._non_enum is None:
+        proto._non_enum = set()
+    proto._non_enum.add('size')
+
+    # --- prototype methods ---
+    def set_add(this, pargs):
+        if not isinstance(this, JSObject) or this._set_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Set.prototype.add requires a Set'))
+        v = pargs[0] if pargs else undefined
+        for existing in this._set_list:
+            if js_same_value_zero(existing, v):
+                return this
+        this._set_list.append(v)
+        return this
+    _def_method(proto, 'add', _make_native_fn('add', set_add, 1))
+
+    def set_has(this, pargs):
+        if not isinstance(this, JSObject) or this._set_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Set.prototype.has requires a Set'))
+        v = pargs[0] if pargs else undefined
+        return any(js_same_value_zero(e, v) for e in this._set_list)
+    _def_method(proto, 'has', _make_native_fn('has', set_has, 1))
+
+    def set_delete(this, pargs):
+        if not isinstance(this, JSObject) or this._set_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Set.prototype.delete requires a Set'))
+        v = pargs[0] if pargs else undefined
+        for i, e in enumerate(this._set_list):
+            if js_same_value_zero(e, v):
+                this._set_list.pop(i)
+                return True
+        return False
+    _def_method(proto, 'delete', _make_native_fn('delete', set_delete, 1))
+
+    def set_clear(this, pargs):
+        if not isinstance(this, JSObject) or this._set_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Set.prototype.clear requires a Set'))
+        this._set_list.clear()
+        return undefined
+    _def_method(proto, 'clear', _make_native_fn('clear', set_clear, 0))
+
+    def set_forEach(this, pargs):
+        if not isinstance(this, JSObject) or this._set_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Set.prototype.forEach requires a Set'))
+        fn = pargs[0] if pargs else undefined
+        this_arg = pargs[1] if len(pargs) > 1 else undefined
+        if not _is_callable(fn):
+            raise _ThrowSignal(make_error('TypeError', str(fn) + ' is not a function'))
+        for v in list(this._set_list):
+            _call_value(fn, this_arg, [v, v, this])
+        return undefined
+    _def_method(proto, 'forEach', _make_native_fn('forEach', set_forEach, 1))
+
+    def set_values(this, pargs):
+        if not isinstance(this, JSObject) or this._set_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Set.prototype.values requires a Set'))
+        return _make_set_iterator(this, 'value')
+    _def_method(proto, 'values', _make_native_fn('values', set_values, 0))
+    _def_method(proto, 'keys', proto.props['values'])  # keys is alias of values for Set
+
+    def set_entries(this, pargs):
+        if not isinstance(this, JSObject) or this._set_list is None:
+            raise _ThrowSignal(make_error('TypeError', 'Set.prototype.entries requires a Set'))
+        return _make_set_iterator(this, 'key+value')
+    _def_method(proto, 'entries', _make_native_fn('entries', set_entries, 0))
+
+    _def_method(proto, '@@iterator', proto.props['values'])
+
+    # Symbol.toStringTag
+    proto.props['@@toStringTag'] = 'Set'
+    if proto._non_enum is None:
+        proto._non_enum = set()
+    proto._non_enum.add('@@toStringTag')
+
+    # --- constructor ---
     def set_construct(this_val, args):
-        s = JSObject(class_name='Set')
-        s._set_list = []  # ordered list of unique JS values
-
-        def set_add(this, pargs):
-            v = pargs[0] if pargs else undefined
-            for existing in s._set_list:
-                if js_strict_equal(existing, v):
-                    return s
-            s._set_list.append(v)
-            s.props['size'] = len(s._set_list)
-            return s
-        s.props['add'] = _make_native_fn('add', set_add)
-
-        def set_has(this, pargs):
-            v = pargs[0] if pargs else undefined
-            return any(js_strict_equal(e, v) for e in s._set_list)
-        s.props['has'] = _make_native_fn('has', set_has)
-
-        def set_delete(this, pargs):
-            v = pargs[0] if pargs else undefined
-            for i, e in enumerate(s._set_list):
-                if js_strict_equal(e, v):
-                    s._set_list.pop(i)
-                    s.props['size'] = len(s._set_list)
-                    return True
-            return False
-        s.props['delete'] = _make_native_fn('delete', set_delete)
-
-        def set_clear(this, pargs):
-            s._set_list.clear()
-            s.props['size'] = 0
-            return undefined
-        s.props['clear'] = _make_native_fn('clear', set_clear)
-
-        def set_forEach(this, pargs):
-            fn = pargs[0] if pargs else undefined
-            for v in list(s._set_list):
-                _call_value(fn, undefined, [v, v, s])
-            return undefined
-        s.props['forEach'] = _make_native_fn('forEach', set_forEach)
-
-        from pyquickjs.interpreter import _to_iterator_obj
-        s.props['values'] = _make_native_fn('values', lambda this, pargs:
-            _to_iterator_obj(list(s._set_list)))
-        s.props['keys'] = s.props['values']
-        s.props['entries'] = _make_native_fn('entries', lambda this, pargs:
-            _to_iterator_obj([make_array([v, v]) for v in s._set_list]))
-        s.props['@@iterator'] = s.props['values']
-        s.props['size'] = 0
+        s = JSObject(proto=proto, class_name='Set')
+        s._set_list = []
+        s._set_data = {}  # keep for backward compat
 
         # Populate from iterable
         if args and args[0] is not undefined and args[0] is not null:
             iterable = args[0]
-            if isinstance(iterable, JSObject) and iterable._is_array:
-                for v in _array_to_list(iterable):
-                    set_add(s, [v])
-            elif isinstance(iterable, str):
-                for c in iterable:
-                    set_add(s, [c])
+            adder = _obj_get_property(s, 'add')
+            if adder is undefined or not _is_callable(adder):
+                raise _ThrowSignal(make_error('TypeError', 'Set.prototype.add is not a function'))
+            try:
+                iterator = _get_iterator(iterable, interp)
+            except _ThrowSignal:
+                raise
+            try:
+                while True:
+                    value, done = _iterate_to_next(iterator)
+                    if done:
+                        break
+                    _call_value(adder, s, [value])
+            except _ThrowSignal:
+                _iterator_close(iterator, suppress_error=True)
+                raise
 
         return s
 
-    obj._call = set_construct
+    obj._call = lambda this_val, args: (_ for _ in ()).throw(
+        _ThrowSignal(make_error('TypeError', 'Constructor Set requires \'new\'')))
     obj._construct = set_construct
+    obj.props['prototype'] = proto
 
     return obj
 
 
-# ---- WeakMap / WeakSet (simplified) ----
+# ---- WeakMap / WeakSet ----
+
+def _is_valid_weakmap_key(k):
+    """WeakMap keys must be objects or non-registered symbols."""
+    return isinstance(k, (JSObject, JSSymbol))
 
 def make_weakmap_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
     obj.name = 'WeakMap'
 
+    proto = JSObject()
+    _def_method(proto, 'constructor', obj)
+
+    def _require_weakmap(this, method):
+        if not isinstance(this, JSObject) or this._weakmap_data is None:
+            raise _ThrowSignal(make_error('TypeError',
+                f'WeakMap.prototype.{method} called on incompatible receiver'))
+
+    def wm_set(this, pargs):
+        _require_weakmap(this, 'set')
+        k = pargs[0] if pargs else undefined
+        if not _is_valid_weakmap_key(k):
+            raise _ThrowSignal(make_error('TypeError',
+                'Invalid value used as weak map key'))
+        v = pargs[1] if len(pargs) > 1 else undefined
+        this._weakmap_data[id(k)] = (k, v)
+        return this
+    _def_method(proto, 'set', _make_native_fn('set', wm_set, 2))
+
+    def wm_get(this, pargs):
+        _require_weakmap(this, 'get')
+        k = pargs[0] if pargs else undefined
+        pair = this._weakmap_data.get(id(k))
+        return pair[1] if pair else undefined
+    _def_method(proto, 'get', _make_native_fn('get', wm_get, 1))
+
+    def wm_has(this, pargs):
+        _require_weakmap(this, 'has')
+        k = pargs[0] if pargs else undefined
+        return id(k) in this._weakmap_data
+    _def_method(proto, 'has', _make_native_fn('has', wm_has, 1))
+
+    def wm_delete(this, pargs):
+        _require_weakmap(this, 'delete')
+        k = pargs[0] if pargs else undefined
+        if not _is_valid_weakmap_key(k):
+            return False
+        return this._weakmap_data.pop(id(k), None) is not None
+    _def_method(proto, 'delete', _make_native_fn('delete', wm_delete, 1))
+
+    # Symbol.toStringTag
+    _obj_define_property(proto, '@@toStringTag', {
+        'value': 'WeakMap', 'writable': False, 'enumerable': False, 'configurable': True,
+    })
+
     def wm_construct(this_val, args):
-        m = JSObject(class_name='WeakMap')
-        storage = {}  # id(key) -> (key, value)
+        m = JSObject(proto=proto, class_name='WeakMap')
+        m._weakmap_data = {}  # id(key) -> (key, value)
 
-        def wm_set(this, pargs):
-            k = pargs[0] if pargs else undefined
-            v = pargs[1] if len(pargs) > 1 else undefined
-            storage[id(k)] = (k, v)
-            return m
-        m.props['set'] = _make_native_fn('set', wm_set)
-
-        def wm_get(this, pargs):
-            k = pargs[0] if pargs else undefined
-            pair = storage.get(id(k))
-            return pair[1] if pair else undefined
-        m.props['get'] = _make_native_fn('get', wm_get)
-
-        def wm_has(this, pargs):
-            k = pargs[0] if pargs else undefined
-            return id(k) in storage
-        m.props['has'] = _make_native_fn('has', wm_has)
-
-        def wm_delete(this, pargs):
-            k = pargs[0] if pargs else undefined
-            return storage.pop(id(k), None) is not None
-        m.props['delete'] = _make_native_fn('delete', wm_delete)
+        # Populate from iterable
+        if args and args[0] is not undefined and args[0] is not null:
+            iterable = args[0]
+            adder = _obj_get_property(m, 'set')
+            if adder is undefined or not _is_callable(adder):
+                raise _ThrowSignal(make_error('TypeError',
+                    'WeakMap.prototype.set is not a function'))
+            try:
+                iterator = _get_iterator(iterable, interp)
+            except _ThrowSignal:
+                raise
+            try:
+                while True:
+                    value, done = _iterate_to_next(iterator)
+                    if done:
+                        break
+                    if not isinstance(value, JSObject):
+                        raise _ThrowSignal(make_error('TypeError',
+                            'Iterator value ' + js_typeof(value) + ' is not an entry object'))
+                    k = _obj_get_property(value, '0')
+                    v = _obj_get_property(value, '1')
+                    _call_value(adder, m, [k, v])
+            except _ThrowSignal:
+                _iterator_close(iterator, suppress_error=True)
+                raise
 
         return m
 
-    obj._call = wm_construct
+    obj._call = lambda this_val, args: (_ for _ in ()).throw(
+        _ThrowSignal(make_error('TypeError', 'Constructor WeakMap requires \'new\'')))
     obj._construct = wm_construct
+    obj.props['prototype'] = proto
+
     return obj
 
 
@@ -3056,31 +3423,83 @@ def make_weakset_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
     obj.name = 'WeakSet'
 
-    def ws_construct(this_val, args):
-        s = JSObject(class_name='WeakSet')
-        storage = set()
+    proto = JSObject()
+    _def_method(proto, 'constructor', obj)
 
-        def ws_add(this, pargs):
-            k = pargs[0] if pargs else undefined
-            storage.add(id(k))
-            return s
-        s.props['add'] = _make_native_fn('add', ws_add)
+    def _require_weakset(this, method):
+        if not isinstance(this, JSObject) or this._weakset_data is None:
+            raise _ThrowSignal(make_error('TypeError',
+                f'WeakSet.prototype.{method} called on incompatible receiver'))
 
-        def ws_has(this, pargs):
-            k = pargs[0] if pargs else undefined
-            return id(k) in storage
-        s.props['has'] = _make_native_fn('has', ws_has)
+    def ws_add(this, pargs):
+        _require_weakset(this, 'add')
+        k = pargs[0] if pargs else undefined
+        if not _is_valid_weakmap_key(k):
+            raise _ThrowSignal(make_error('TypeError',
+                'Invalid value used in weak set'))
+        kid = id(k)
+        this._weakset_data.add(kid)
+        this._weakset_keys[kid] = k
+        return this
+    _def_method(proto, 'add', _make_native_fn('add', ws_add, 1))
 
-        def ws_delete(this, pargs):
-            k = pargs[0] if pargs else undefined
-            storage.discard(id(k))
+    def ws_has(this, pargs):
+        _require_weakset(this, 'has')
+        k = pargs[0] if pargs else undefined
+        return id(k) in this._weakset_data
+    _def_method(proto, 'has', _make_native_fn('has', ws_has, 1))
+
+    def ws_delete(this, pargs):
+        _require_weakset(this, 'delete')
+        k = pargs[0] if pargs else undefined
+        if not _is_valid_weakmap_key(k):
+            return False
+        kid = id(k)
+        if kid in this._weakset_data:
+            this._weakset_data.discard(kid)
+            this._weakset_keys.pop(kid, None)
             return True
-        s.props['delete'] = _make_native_fn('delete', ws_delete)
+        return False
+    _def_method(proto, 'delete', _make_native_fn('delete', ws_delete, 1))
+
+    # Symbol.toStringTag
+    _obj_define_property(proto, '@@toStringTag', {
+        'value': 'WeakSet', 'writable': False, 'enumerable': False, 'configurable': True,
+    })
+
+    def ws_construct(this_val, args):
+        s = JSObject(proto=proto, class_name='WeakSet')
+        s._weakset_data = set()
+        s._weakset_keys = {}
+
+        # Populate from iterable
+        if args and args[0] is not undefined and args[0] is not null:
+            iterable = args[0]
+            adder = _obj_get_property(s, 'add')
+            if adder is undefined or not _is_callable(adder):
+                raise _ThrowSignal(make_error('TypeError',
+                    'WeakSet.prototype.add is not a function'))
+            try:
+                iterator = _get_iterator(iterable, interp)
+            except _ThrowSignal:
+                raise
+            try:
+                while True:
+                    value, done = _iterate_to_next(iterator)
+                    if done:
+                        break
+                    _call_value(adder, s, [value])
+            except _ThrowSignal:
+                _iterator_close(iterator, suppress_error=True)
+                raise
 
         return s
 
-    obj._call = ws_construct
+    obj._call = lambda this_val, args: (_ for _ in ()).throw(
+        _ThrowSignal(make_error('TypeError', 'Constructor WeakSet requires \'new\'')))
     obj._construct = ws_construct
+    obj.props['prototype'] = proto
+
     return obj
 
 
@@ -4109,25 +4528,6 @@ def build_global_env(interp) -> Environment:
         'value': _is_error_fn, 'writable': True, 'enumerable': False, 'configurable': True
     }
 
-    # Symbol.species getters on built-in constructors
-    _species_sym = env._bindings.get('Symbol')
-    if isinstance(_species_sym, JSObject):
-        _sp = _species_sym.props.get('species')
-        if isinstance(_sp, JSSymbol):
-            _sp_key = _symbol_to_key(_sp)
-            def _species_getter(this, args):
-                return this
-            _getter_fn = _make_native_fn('get [Symbol.species]', _species_getter, 0)
-            for _ctor_name in ('Array', 'Map', 'Promise', 'RegExp', 'Set'):
-                _ctor = env._bindings.get(_ctor_name)
-                if isinstance(_ctor, JSObject):
-                    if _ctor._descriptors is None:
-                        _ctor._descriptors = {}
-                    _ctor._descriptors[_sp_key] = {
-                        'get': _getter_fn, 'set': undefined,
-                        'enumerable': False, 'configurable': True,
-                    }
-
     # TypedArrays (stubs)
     for ta_name in ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
                     'Uint16Array', 'Int32Array', 'Uint32Array', 'Float16Array',
@@ -4139,6 +4539,25 @@ def build_global_env(interp) -> Environment:
 
     # DataView
     env._bindings['DataView'] = _make_data_view_builtin()
+
+    # Symbol.species getters on built-in constructors
+    _species_sym = env._bindings.get('Symbol')
+    if isinstance(_species_sym, JSObject):
+        _sp = _species_sym.props.get('species')
+        if isinstance(_sp, JSSymbol):
+            _sp_key = _symbol_to_key(_sp)
+            def _species_getter(this, args):
+                return this
+            _getter_fn = _make_native_fn('get [Symbol.species]', _species_getter, 0)
+            for _ctor_name in ('Array', 'ArrayBuffer', 'Map', 'Promise', 'RegExp', 'Set'):
+                _ctor = env._bindings.get(_ctor_name)
+                if isinstance(_ctor, JSObject):
+                    if _ctor._descriptors is None:
+                        _ctor._descriptors = {}
+                    _ctor._descriptors[_sp_key] = {
+                        'get': _getter_fn, 'set': undefined,
+                        'enumerable': False, 'configurable': True,
+                    }
 
     # Also set Function.prototype as [[Prototype]] for late-added constructors
     if _fn_proto is not None:
@@ -4512,11 +4931,15 @@ def _make_typed_array_builtin(name: str) -> JSObject:  # noqa: C901
         arr.props['@@ta_type'] = name
         arr.props['BYTES_PER_ELEMENT'] = bpe
 
+        def _new_ab(size):
+            _ab_proto = _PROTOS.get('ArrayBuffer')
+            buf = JSObject(class_name='ArrayBuffer', proto=_ab_proto) if _ab_proto else JSObject(class_name='ArrayBuffer')
+            buf._ab_data = bytearray(size)
+            return buf
+
         if not args:
             # Empty typed array
-            buf = JSObject(class_name='ArrayBuffer')
-            buf._ab_data = bytearray(0)
-            buf.props['byteLength'] = 0
+            buf = _new_ab(0)
             arr.props['@@ab_buf'] = buf
             arr.props['@@byte_offset'] = 0
             arr.props['@@ta_length'] = 0
@@ -4548,9 +4971,7 @@ def _make_typed_array_builtin(name: str) -> JSObject:  # noqa: C901
         elif isinstance(first, (int, float)) and not isinstance(first, bool):
             # new TypedArray(length)
             size = int(js_to_number(first))
-            buf = JSObject(class_name='ArrayBuffer')
-            buf._ab_data = bytearray(size * bpe)
-            buf.props['byteLength'] = size * bpe
+            buf = _new_ab(size * bpe)
             arr.props['@@ab_buf'] = buf
             arr.props['@@byte_offset'] = 0
             arr.props['@@ta_length'] = size
@@ -4562,9 +4983,7 @@ def _make_typed_array_builtin(name: str) -> JSObject:  # noqa: C901
             # new TypedArray([1,2,3,...])
             items = _array_to_list(first)
             size = len(items)
-            buf = JSObject(class_name='ArrayBuffer')
-            buf._ab_data = bytearray(size * bpe)
-            buf.props['byteLength'] = size * bpe
+            buf = _new_ab(size * bpe)
             arr.props['@@ab_buf'] = buf
             arr.props['@@byte_offset'] = 0
             arr.props['@@ta_length'] = size
@@ -4579,9 +4998,7 @@ def _make_typed_array_builtin(name: str) -> JSObject:  # noqa: C901
                     coerced = _coerce(v)
                 _struct.pack_into('<' + fmt, buf._ab_data, i * bpe, coerced)
         else:
-            buf = JSObject(class_name='ArrayBuffer')
-            buf._ab_data = bytearray(0)
-            buf.props['byteLength'] = 0
+            buf = _new_ab(0)
             arr.props['@@ab_buf'] = buf
             arr.props['@@byte_offset'] = 0
             arr.props['@@ta_length'] = 0
@@ -4670,9 +5087,9 @@ def _make_typed_array_builtin(name: str) -> JSObject:  # noqa: C901
             new_arr.props['@@ta_type'] = name
             new_arr.props['BYTES_PER_ELEMENT'] = bpe
             size = len(items)
-            buf2 = JSObject(class_name='ArrayBuffer')
+            _ab_p = _PROTOS.get('ArrayBuffer')
+            buf2 = JSObject(class_name='ArrayBuffer', proto=_ab_p) if _ab_p else JSObject(class_name='ArrayBuffer')
             buf2._ab_data = bytearray(size * bpe)
-            buf2.props['byteLength'] = size * bpe
             new_arr.props['@@ab_buf'] = buf2
             new_arr.props['@@byte_offset'] = 0
             new_arr.props['@@ta_length'] = size
@@ -4830,24 +5247,191 @@ def _make_data_view_builtin() -> JSObject:  # noqa: C901
     return obj
 
 
+def _to_index(val):
+    """ES2017 ToIndex(value) — return non-negative integer or raise RangeError."""
+    if val is undefined:
+        return 0
+    n = js_to_number(val)
+    if math.isnan(n):
+        return 0
+    if math.isinf(n):
+        raise _ThrowSignal(make_error('RangeError', 'Invalid index'))
+    integer_index = int(n)
+    if integer_index < 0:
+        raise _ThrowSignal(make_error('RangeError', 'Invalid index'))
+    return integer_index
+
+
 def _make_array_buffer_builtin() -> JSObject:
+    # --- ArrayBuffer.prototype ---
+    proto = JSObject(class_name='Object')
+
+    # byteLength accessor (getter on prototype)
+    def _ab_byteLength_get(this, args):
+        if not isinstance(this, JSObject) or this.class_name != 'ArrayBuffer':
+            raise _ThrowSignal(make_error('TypeError',
+                'ArrayBuffer.prototype.byteLength requires an ArrayBuffer'))
+        ab = getattr(this, '_ab_data', None)
+        if ab is None:
+            raise _ThrowSignal(make_error('TypeError',
+                'Cannot access byteLength of detached ArrayBuffer'))
+        return len(ab)
+    _bl_getter = _make_native_fn('get byteLength', _ab_byteLength_get, 0)
+    proto._descriptors = proto._descriptors or {}
+    proto._descriptors['byteLength'] = {
+        'get': _bl_getter, 'set': undefined,
+        'enumerable': False, 'configurable': True,
+    }
+    if proto._non_enum is None:
+        proto._non_enum = set()
+    proto._non_enum.add('byteLength')
+
+    # slice(start[, end])
+    def _ab_slice(this, args):
+        if not isinstance(this, JSObject) or this.class_name != 'ArrayBuffer':
+            raise _ThrowSignal(make_error('TypeError',
+                'ArrayBuffer.prototype.slice requires an ArrayBuffer'))
+        ab_data = getattr(this, '_ab_data', None)
+        if ab_data is None:
+            raise _ThrowSignal(make_error('TypeError',
+                'Cannot slice a detached ArrayBuffer'))
+        length = len(ab_data)
+        # Resolve start
+        relative_start = js_to_integer(args[0]) if args else 0
+        if relative_start < 0:
+            first = max(length + relative_start, 0)
+        else:
+            first = min(relative_start, length)
+        # Resolve end
+        if len(args) < 2 or args[1] is undefined:
+            relative_end = length
+        else:
+            relative_end = js_to_integer(args[1])
+        if relative_end < 0:
+            final = max(length + relative_end, 0)
+        else:
+            final = min(relative_end, length)
+        new_len = max(final - first, 0)
+        # SpeciesConstructor(this, ArrayBuffer)
+        C = _obj_get_property(this, 'constructor') if isinstance(this, JSObject) else undefined
+        if C is undefined:
+            species_ctor = None  # use default
+        elif not isinstance(C, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError',
+                '`constructor` value is not an object'))
+        else:
+            # Get @@species from C
+            species = undefined
+            if isinstance(C, JSObject) and C._descriptors:
+                for k, v in C._descriptors.items():
+                    if '@@species' in str(k):
+                        g = v.get('get')
+                        if g:
+                            species = _call_value(g, C, [])
+                        break
+            if species is not undefined:
+                S = species
+            else:
+                S = _obj_get_property(C, '@@species') if isinstance(C, JSObject) else undefined
+            if S is undefined or S is null:
+                species_ctor = None  # use default
+            elif isinstance(S, (JSObject, JSFunction)):
+                if isinstance(S, JSObject) and S._construct is None and not isinstance(S, JSFunction):
+                    raise _ThrowSignal(make_error('TypeError',
+                        '`constructor[Symbol.species]` value is not a constructor'))
+                species_ctor = S
+            else:
+                raise _ThrowSignal(make_error('TypeError',
+                    '`constructor[Symbol.species]` value is not an object'))
+
+        if species_ctor is not None:
+            if isinstance(species_ctor, JSObject) and species_ctor._construct:
+                new_buf = species_ctor._construct(undefined, [new_len])
+            elif isinstance(species_ctor, JSFunction):
+                new_buf = _call_value(species_ctor, undefined, [new_len])
+            else:
+                raise _ThrowSignal(make_error('TypeError',
+                    '`constructor[Symbol.species]` value is not a constructor'))
+        else:
+            new_buf = JSObject(class_name='ArrayBuffer', proto=proto)
+            new_buf._ab_data = bytearray(new_len)
+
+        # Validate result
+        if not isinstance(new_buf, JSObject) or new_buf.class_name != 'ArrayBuffer':
+            raise _ThrowSignal(make_error('TypeError',
+                'Species constructor did not return an ArrayBuffer'))
+        if getattr(new_buf, '_ab_data', None) is None:
+            raise _ThrowSignal(make_error('TypeError',
+                'Species constructor returned a detached ArrayBuffer'))
+        if new_buf is this:
+            raise _ThrowSignal(make_error('TypeError',
+                'Species constructor returned the same ArrayBuffer'))
+        new_ab_data = new_buf._ab_data
+        if len(new_ab_data) < new_len:
+            raise _ThrowSignal(make_error('TypeError',
+                'Species constructor returned an ArrayBuffer that is too small'))
+
+        # Copy bytes
+        if new_len > 0:
+            new_ab_data[:new_len] = ab_data[first:first + new_len]
+        return new_buf
+    _def_method(proto, 'slice', _make_native_fn('slice', _ab_slice, 2))
+
+    # @@toStringTag
+    _obj_define_property(proto, '@@toStringTag', {
+        'value': 'ArrayBuffer', 'writable': False,
+        'enumerable': False, 'configurable': True,
+    })
+
+    # Register prototype for use by TypedArray and DataView code
+    register_proto('ArrayBuffer', proto)
+
+    # --- Constructor ---
     obj = JSObject(class_name='Function')
     obj.name = 'ArrayBuffer'
+
     def ab_construct(this, args):
-        size = int(js_to_number(args[0])) if args else 0
-        buf = JSObject(class_name='ArrayBuffer')
-        buf._ab_data = bytearray(size)
-        buf.props['byteLength'] = size
-
-        def ab_transfer(this2, args2):
-            # Detach this buffer
-            buf._ab_data = None
-            buf.props['byteLength'] = 0
-            return undefined
-
-        buf.props['transfer'] = _make_native_fn('transfer', ab_transfer)
+        byte_length = _to_index(args[0] if args else undefined)
+        buf = JSObject(class_name='ArrayBuffer', proto=proto)
+        try:
+            buf._ab_data = bytearray(byte_length)
+        except (MemoryError, OverflowError, ValueError):
+            raise _ThrowSignal(make_error('RangeError',
+                'Array buffer allocation failed'))
         return buf
-    obj._call = ab_construct
+
+    obj._call = lambda this_val, args: (_ for _ in ()).throw(
+        _ThrowSignal(make_error('TypeError',
+            'Constructor ArrayBuffer requires \'new\'')))
     obj._construct = ab_construct
+
+    # --- ArrayBuffer.isView(arg) ---
+    def ab_isView(this, args):
+        arg = args[0] if args else undefined
+        if not isinstance(arg, JSObject):
+            return False
+        # Has [[ViewedArrayBuffer]] internal slot = TypedArray or DataView
+        if arg.props.get('@@ab_buf') is not None:
+            return True  # TypedArray
+        if arg.class_name == 'DataView':
+            return True
+        return False
+    _def_method(obj, 'isView', _make_native_fn('isView', ab_isView, 1))
+
+    # constructor.prototype
+    _def_method(proto, 'constructor', obj)
+    _set_ctor_prototype(obj, proto)
+
+    # ArrayBuffer.name = "ArrayBuffer"
+    _obj_define_property(obj, 'name', {
+        'value': 'ArrayBuffer', 'writable': False,
+        'enumerable': False, 'configurable': True,
+    })
+    # ArrayBuffer.length = 1
+    _obj_define_property(obj, 'length', {
+        'value': 1, 'writable': False,
+        'enumerable': False, 'configurable': True,
+    })
+
     return obj
 
