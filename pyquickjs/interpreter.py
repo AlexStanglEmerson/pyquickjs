@@ -104,7 +104,7 @@ _SENTINEL = object()  # marks TDZ / not set
 class Environment:
     """A lexical scope environment (activation record)."""
 
-    __slots__ = ('_bindings', '_parent', '_is_function', '_var_scope', '_with_obj', '_consts', '_sloppy_consts')
+    __slots__ = ('_bindings', '_parent', '_is_function', '_var_scope', '_with_obj', '_consts', '_sloppy_consts', '_eval_var_configurable')
 
     def __init__(self, parent: 'Environment | None' = None,
                  is_function: bool = False,
@@ -116,6 +116,7 @@ class Environment:
         self._with_obj = with_obj  # for `with` statement
         self._consts: set | None = None  # const binding names
         self._sloppy_consts: set | None = None  # NFE-style: silently ignore writes in sloppy mode
+        self._eval_var_configurable = False  # True when inside eval: var bindings are configurable
 
         # Walk up to find the function/var scope
         if not is_function and parent is not None:
@@ -145,7 +146,7 @@ class Environment:
                 if name not in global_obj._descriptors:
                     global_obj._descriptors[name] = {
                         'value': value, 'writable': True,
-                        'enumerable': True, 'configurable': False,
+                        'enumerable': True, 'configurable': scope._eval_var_configurable,
                     }
 
     def assign_var(self, name: str, value) -> None:
@@ -1229,7 +1230,7 @@ _symbol_registry: dict[str, 'JSSymbol'] = {}
 class JSSymbol:
     __slots__ = ('description', '_id', '_well_known_key', '__weakref__')
     _counter = 0
-    _id_to_symbol: dict = {}  # reverse lookup: _id -> JSSymbol
+    _id_to_symbol = __import__('weakref').WeakValueDictionary()  # weak reverse lookup: _id -> JSSymbol
 
     def __init__(self, description=None):
         JSSymbol._counter += 1
@@ -4903,8 +4904,9 @@ class Interpreter:
                 key_val = self.eval(left.property, env)
                 # Per spec: RequireObjectCoercible before ToPropertyKey
                 if cached_obj is null or cached_obj is undefined:
+                    _dkey = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else js_to_string(key_val)
                     raise _ThrowSignal(make_error('TypeError',
-                        f"cannot read properties of {'null' if cached_obj is null else 'undefined'}"))
+                        f"cannot read property '{_dkey}' of {'null' if cached_obj is null else 'undefined'}"))
                 cached_key = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else js_to_string(key_val)
             else:
                 cached_key = left.property.name
@@ -5140,12 +5142,18 @@ class Interpreter:
                 var_scope = env
                 while var_scope._parent is not None and not var_scope._is_function:
                     var_scope = var_scope._parent
-                self._hoist_declarations(ast.body, var_scope)
-                eval_env = Environment(parent=env)
-                for stmt in ast.body:
-                    v = self.exec(stmt, eval_env)
-                    if v is not _EMPTY:
-                        result = v
+                # Eval-declared vars are configurable on the global object
+                old_eval_cfg = var_scope._eval_var_configurable
+                var_scope._eval_var_configurable = True
+                try:
+                    self._hoist_declarations(ast.body, var_scope)
+                    eval_env = Environment(parent=env)
+                    for stmt in ast.body:
+                        v = self.exec(stmt, eval_env)
+                        if v is not _EMPTY:
+                            result = v
+                finally:
+                    var_scope._eval_var_configurable = old_eval_cfg
             return result
         except ParseError as e:
             err = make_error('SyntaxError', e.msg)
@@ -5640,8 +5648,9 @@ class Interpreter:
             key = self.eval(node.property, env)
             # Per spec: throw TypeError for null/undefined BEFORE ToPropertyKey
             if obj is null or obj is undefined:
+                _dkey = _symbol_to_key(key) if isinstance(key, JSSymbol) else js_to_string(key)
                 raise _ThrowSignal(make_error('TypeError',
-                    f"cannot read properties of {'null' if obj is null else 'undefined'}"))
+                    f"cannot read property '{_dkey}' of {'null' if obj is null else 'undefined'}"))
             if isinstance(key, JSSymbol):
                 key_str = _symbol_to_key(key)
             elif isinstance(key, (int, float)) and not isinstance(key, bool):

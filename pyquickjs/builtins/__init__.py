@@ -4564,12 +4564,17 @@ def build_global_env(interp) -> Environment:
             if stripped.startswith('"use strict"') or stripped.startswith("'use strict'"):
                 parser.s.cur_func.js_mode |= JS_MODE_STRICT
             ast = parser.parse_program()
-            # Use the current (calling) env — but since we don't have it here,
-            # use global env
-            result = undefined
-            for stmt in ast.body:
-                result = interp.exec(stmt, env)
-            return result
+            # Indirect eval: var declarations are configurable on the global object
+            var_scope = env._var_scope
+            old_eval_cfg = var_scope._eval_var_configurable
+            var_scope._eval_var_configurable = True
+            try:
+                result = undefined
+                for stmt in ast.body:
+                    result = interp.exec(stmt, env)
+                return result
+            finally:
+                var_scope._eval_var_configurable = old_eval_cfg
         except ParseError as e:
             err = make_error('SyntaxError', e.msg)
             err.props['stack'] = f'    at <eval>:{e.line}:{e.col}\nSyntaxError: {e.msg}'
@@ -6217,6 +6222,46 @@ def _make_array_buffer_builtin() -> JSObject:
             new_ab_data[:new_len] = ab_data[first:first + new_len]
         return new_buf
     _def_method(proto, 'slice', _make_native_fn('slice', _ab_slice, 2))
+
+    # transfer([newByteLength]) — ES2024
+    def _ab_transfer(this, args):
+        if not isinstance(this, JSObject) or this.class_name != 'ArrayBuffer':
+            raise _ThrowSignal(make_error('TypeError',
+                'ArrayBuffer.prototype.transfer requires an ArrayBuffer'))
+        ab_data = getattr(this, '_ab_data', None)
+        if ab_data is None:
+            raise _ThrowSignal(make_error('TypeError',
+                'Cannot transfer a detached ArrayBuffer'))
+        old_len = len(ab_data)
+        if args and args[0] is not undefined:
+            new_len = _to_index(args[0])
+        else:
+            new_len = old_len
+        new_buf = JSObject(class_name='ArrayBuffer', proto=proto)
+        new_buf._ab_data = bytearray(new_len)
+        copy_len = min(old_len, new_len)
+        if copy_len > 0:
+            new_buf._ab_data[:copy_len] = ab_data[:copy_len]
+        # Detach the original buffer
+        this._ab_data = None
+        return new_buf
+    _def_method(proto, 'transfer', _make_native_fn('transfer', _ab_transfer, 0))
+
+    # transferToFixedLength([newByteLength]) — ES2024
+    _def_method(proto, 'transferToFixedLength', _make_native_fn('transferToFixedLength', _ab_transfer, 0))
+
+    # detached getter — ES2024
+    def _ab_detached_get(this, args):
+        if not isinstance(this, JSObject) or this.class_name != 'ArrayBuffer':
+            raise _ThrowSignal(make_error('TypeError',
+                'ArrayBuffer.prototype.detached requires an ArrayBuffer'))
+        return getattr(this, '_ab_data', None) is None
+    _dg = _make_native_fn('get detached', _ab_detached_get, 0)
+    proto._descriptors['detached'] = {
+        'get': _dg, 'set': undefined,
+        'enumerable': False, 'configurable': True,
+    }
+    proto._non_enum.add('detached')
 
     # @@toStringTag
     _obj_define_property(proto, '@@toStringTag', {
