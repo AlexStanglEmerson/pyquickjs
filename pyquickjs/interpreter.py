@@ -457,10 +457,457 @@ class JSObject:
         return f'[object {self.class_name}]'
 
 
+# --- Proxy trap dispatch helpers ---
+
+def _is_proxy(obj) -> bool:
+    """Check if obj is a Proxy (including revoked proxies)."""
+    return isinstance(obj, JSObject) and obj.class_name == 'Proxy'
+
+
+def _proxy_key_to_js(key: str):
+    """Convert an internal property key to the JS value for trap arguments.
+    Converts @@sym_N back to Symbol objects, returns string keys as-is."""
+    if key.startswith('@@sym_') or (key.startswith('@@') and not key.startswith('@@array_data') and not key.startswith('@@ta_') and not key.startswith('@@iter')):
+        sym = _key_to_symbol(key)
+        if sym is not None:
+            return sym
+    return key
+
+
+def _proxy_get_trap(proxy: JSObject, key: str, receiver=None):
+    """Invoke the 'get' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'get\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'get') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key), receiver if receiver is not None else proxy])
+        # Invariant checks against target descriptor
+        if isinstance(target, JSObject) and target._descriptors and key in target._descriptors:
+            target_desc = target._descriptors[key]
+            if target_desc.get('configurable') is False:
+                if 'value' in target_desc and target_desc.get('writable') is False:
+                    if not js_strict_equal(result, target_desc['value']):
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'get' on proxy: property '{key}' is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value"))
+                if 'get' in target_desc and target_desc['get'] is undefined:
+                    if result is not undefined:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'get' on proxy: property '{key}' is a non-configurable accessor property on the proxy target and does not have a getter function, but the trap did not return 'undefined'"))
+        return result
+    # No trap — forward to target.[[Get]](P, Receiver)
+    actual_receiver = receiver if receiver is not None else proxy
+    if _is_proxy(target):
+        return _proxy_get_trap(target, key, actual_receiver)
+    if isinstance(target, JSFunction):
+        return target.interp._get_property(target, key)
+    return _obj_get_property(target, key, actual_receiver) if isinstance(target, JSObject) else undefined
+
+
+def _proxy_set_trap(proxy: JSObject, key: str, value, receiver=None) -> bool:
+    """Invoke the 'set' trap on a Proxy. Returns True if set was successful."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'set\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'set') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key), value, receiver if receiver is not None else proxy])
+        bool_result = js_is_truthy(result)
+        if not bool_result:
+            return False
+        # Invariant checks
+        if isinstance(target, JSObject) and target._descriptors and key in target._descriptors:
+            target_desc = target._descriptors[key]
+            if target_desc.get('configurable') is False:
+                if 'value' in target_desc and target_desc.get('writable') is False:
+                    if not js_strict_equal(value, target_desc['value']):
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"))
+                if 'set' in target_desc and target_desc['set'] is undefined:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable accessor property without a setter"))
+        return True
+    # No trap — forward to target.[[Set]](P, V, Receiver)
+    actual_receiver = receiver if receiver is not None else proxy
+    if _is_proxy(target):
+        return _proxy_set_trap(target, key, value, actual_receiver)
+    if isinstance(target, JSFunction):
+        target.interp._set_property(target, key, value)
+    elif isinstance(target, JSObject):
+        _obj_set_property(target, key, value, receiver=actual_receiver)
+    return True
+
+
+def _proxy_has_trap(proxy: JSObject, key: str) -> bool:
+    """Invoke the 'has' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'has\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'has') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key)])
+        bool_result = bool(result) if not isinstance(result, bool) else result
+        # Invariant checks
+        if not bool_result and isinstance(target, JSObject):
+            if target._descriptors and key in target._descriptors:
+                target_desc = target._descriptors[key]
+                if target_desc.get('configurable') is False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'has' on proxy: property '{key}' is a non-configurable own property of the proxy target but the proxy did not return true"))
+            if not target.extensible and (key in target.props or (target._descriptors and key in target._descriptors)):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"'has' on proxy: property '{key}' is an own property of a non-extensible proxy target but the proxy did not return true"))
+        return bool_result
+    # No trap — forward to target.[[HasProperty]](P)
+    if _is_proxy(target):
+        return _proxy_has_trap(target, key)
+    if isinstance(target, JSFunction):
+        sp = getattr(target, '_static_props', None)
+        if sp and key in sp:
+            return True
+        if key in ('length', 'name', 'prototype', 'call', 'apply', 'bind', 'caller', 'arguments'):
+            return True
+        return False
+    return _obj_has_property(target, key) if isinstance(target, JSObject) else False
+
+
+def _proxy_delete_trap(proxy: JSObject, key: str) -> bool:
+    """Invoke the 'deleteProperty' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'deleteProperty\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'deleteProperty') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key)])
+        bool_result = bool(result) if not isinstance(result, bool) else result
+        # Invariant checks
+        if bool_result and isinstance(target, JSObject):
+            if target._descriptors and key in target._descriptors:
+                target_desc = target._descriptors[key]
+                if target_desc.get('configurable') is False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'deleteProperty' on proxy: property '{key}' is a non-configurable own property of the proxy target"))
+            if not target.extensible and (key in target.props or (target._descriptors and key in target._descriptors)):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"'deleteProperty' on proxy: property '{key}' is an own property of a non-extensible proxy target"))
+        return bool_result
+    # No trap — forward to target.[[Delete]](P)
+    if _is_proxy(target):
+        return _proxy_delete_trap(target, key)
+    return _obj_delete_property(target, key) if isinstance(target, JSObject) else True
+
+
+def _proxy_ownkeys_trap(proxy: JSObject) -> list:
+    """Invoke the 'ownKeys' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'ownKeys\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'ownKeys') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        from pyquickjs.builtins import _array_to_list as _atl
+        result = _call_value(trap, handler, [target])
+        # Result must be an Object (array-like)
+        if not isinstance(result, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError',
+                "'ownKeys' on proxy: trap returned a non-object"))
+        if isinstance(result, JSObject) and result._is_array:
+            keys = _atl(result)
+        elif isinstance(result, JSObject):
+            # Iterate using length property
+            length = result.props.get('length', 0)
+            if isinstance(length, (int, float)):
+                keys = [result.props.get(str(i), undefined) for i in range(int(length))]
+            else:
+                keys = []
+        else:
+            keys = []
+        # Each key must be String or Symbol
+        for k in keys:
+            if not isinstance(k, str) and not isinstance(k, JSSymbol):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"'ownKeys' on proxy: trap returned non-string/symbol key '{k}'"))
+        # Check for duplicates
+        seen = set()
+        for k in keys:
+            k_str = _symbol_to_key(k) if isinstance(k, JSSymbol) else k
+            if k_str in seen:
+                raise _ThrowSignal(make_error('TypeError',
+                    "'ownKeys' on proxy: trap returned duplicate key"))
+            seen.add(k_str)
+        # Invariant: non-extensible target must have all keys reported
+        if isinstance(target, JSObject) and not target.extensible:
+            target_keys = set(k for k in target.props.keys() if not k.startswith('@@'))
+            if target._descriptors:
+                target_keys.update(target._descriptors.keys())
+            for tk in target_keys:
+                if tk not in seen:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'ownKeys' on proxy: trap result did not include '{tk}'"))
+        # Invariant: all non-configurable keys must be in result
+        if isinstance(target, JSObject) and target._descriptors:
+            for dk, dv in target._descriptors.items():
+                if dv.get('configurable') is False:
+                    if dk not in seen:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'ownKeys' on proxy: trap result did not include non-configurable key '{dk}'"))
+        return [str(k) if not isinstance(k, JSSymbol) else _symbol_to_key(k) for k in keys]
+    # No trap — forward to target.[[OwnPropertyKeys]]()
+    if _is_proxy(target):
+        return _proxy_ownkeys_trap(target)
+    if isinstance(target, JSFunction):
+        keys = ['length', 'name', 'prototype']
+        sp = getattr(target, '_static_props', None)
+        if sp:
+            keys.extend(k for k in sp if k not in keys)
+        return keys
+    if isinstance(target, JSObject):
+        return [k for k in target.props.keys() if not k.startswith('@@')]
+    return []
+
+
+def _proxy_get_own_prop_desc_trap(proxy: JSObject, key: str):
+    """Invoke the 'getOwnPropertyDescriptor' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'getOwnPropertyDescriptor\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'getOwnPropertyDescriptor') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key)])
+        # result must be Object or undefined
+        if result is not undefined and not isinstance(result, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError',
+                f"'getOwnPropertyDescriptor' on proxy: trap returned neither object nor undefined for property '{key}'"))
+        if isinstance(target, JSObject):
+            target_desc = None
+            if target._descriptors and key in target._descriptors:
+                target_desc = target._descriptors[key]
+            elif key in target.props:
+                target_desc = {'value': target.props[key], 'writable': True, 'enumerable': True, 'configurable': True}
+            if result is undefined:
+                if target_desc is not None and target_desc.get('configurable') is False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'getOwnPropertyDescriptor' on proxy: property '{key}' is a non-configurable own property of the proxy target but the proxy returned undefined"))
+                if not target.extensible and target_desc is not None:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'getOwnPropertyDescriptor' on proxy: property '{key}' is an own property of a non-extensible proxy target but the proxy returned undefined"))
+            elif isinstance(result, JSObject) and target_desc is not None:
+                # Check configurable mismatch
+                result_configurable = result.props.get('configurable', undefined)
+                if result_configurable is False and target_desc.get('configurable') is not False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'getOwnPropertyDescriptor' on proxy: property '{key}' is reported non-configurable but the property on the proxy target is configurable"))
+                if target_desc.get('configurable') is False:
+                    if result_configurable is not False:
+                        pass  # configurable mismatch already checked above
+                    result_writable = result.props.get('writable', undefined)
+                    if result_writable is False and target_desc.get('writable') is True:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'getOwnPropertyDescriptor' on proxy: property '{key}' is reported non-configurable and non-writable but the property on the proxy target is writable"))
+            elif isinstance(result, JSObject) and target_desc is None:
+                result_configurable = result.props.get('configurable', undefined)
+                if result_configurable is False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'getOwnPropertyDescriptor' on proxy: property '{key}' is reported as non-configurable but does not exist on the proxy target"))
+                if not target.extensible:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'getOwnPropertyDescriptor' on proxy: property '{key}' does not exist on a non-extensible proxy target"))
+        return result
+    # No trap — forward to target.[[GetOwnProperty]](P)
+    if _is_proxy(target):
+        return _proxy_get_own_prop_desc_trap(target, key)
+    if isinstance(target, JSObject):
+        if target._descriptors and key in target._descriptors:
+            return _descriptor_to_js_inline(target._descriptors[key])
+        if key in target.props:
+            desc = JSObject()
+            desc.props['value'] = target.props[key]
+            desc.props['writable'] = True
+            desc.props['enumerable'] = True
+            desc.props['configurable'] = True
+            return desc
+    return undefined
+
+
+def _descriptor_to_js_inline(desc_dict):
+    """Convert an internal descriptor dict to a JS descriptor object."""
+    result = JSObject()
+    for k in ('value', 'writable', 'enumerable', 'configurable', 'get', 'set'):
+        if k in desc_dict:
+            result.props[k] = desc_dict[k]
+    return result
+
+
+def _proxy_define_property_trap(proxy: JSObject, key: str, desc) -> bool:
+    """Invoke the 'defineProperty' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'defineProperty\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'defineProperty') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key), desc])
+        bool_result = bool(result) if not isinstance(result, bool) else result
+        if bool_result and isinstance(target, JSObject):
+            # Get descriptor info from the desc argument
+            if isinstance(desc, JSObject):
+                desc_configurable = desc.props.get('configurable', undefined)
+            elif isinstance(desc, dict):
+                desc_configurable = desc.get('configurable', undefined)
+            else:
+                desc_configurable = undefined
+            # Get target's existing descriptor
+            target_desc = None
+            if target._descriptors and key in target._descriptors:
+                target_desc = target._descriptors[key]
+            elif key in target.props:
+                target_desc = {'value': target.props[key], 'writable': True, 'enumerable': True, 'configurable': True}
+            # Invariant: cannot define non-configurable on missing/configurable target prop
+            if desc_configurable is False:
+                if target_desc is None:
+                    if not target.extensible:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'defineProperty' on proxy: trap returned truish for adding property '{key}' that is non-configurable to a non-extensible target"))
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' which is either non-existent or configurable in the proxy target"))
+                elif target_desc.get('configurable') is not False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' which is either non-existent or configurable in the proxy target"))
+                # Non-configurable writable -> non-writable check
+                if isinstance(desc, JSObject) and desc.props.get('writable') is False:
+                    if target_desc.get('writable') is True:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' which cannot be non-writable, unless there is a corresponding non-configurable, non-writable own property on the proxy target"))
+            # Invariant: cannot add property to non-extensible target
+            if target_desc is None and not target.extensible:
+                raise _ThrowSignal(make_error('TypeError',
+                    f"'defineProperty' on proxy: trap returned truish for adding property '{key}' to a non-extensible target"))
+        return bool_result
+    # No trap — forward to target.[[DefineOwnProperty]](P, Desc)
+    if _is_proxy(target):
+        return _proxy_define_property_trap(target, key, desc)
+    if isinstance(target, JSObject):
+        if isinstance(desc, JSObject):
+            # Convert JS descriptor object to Python dict
+            py_desc = {}
+            for k in ('value', 'writable', 'enumerable', 'configurable', 'get', 'set'):
+                if k in desc.props:
+                    py_desc[k] = desc.props[k]
+            _obj_define_property(target, key, py_desc)
+        elif isinstance(desc, dict):
+            _obj_define_property(target, key, desc)
+    return True
+
+
+def _proxy_get_prototype_trap(proxy: JSObject):
+    """Invoke the 'getPrototypeOf' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'getPrototypeOf\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'getPrototypeOf') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target])
+        # Invariant: result must be Object or null
+        if not isinstance(result, (JSObject, JSFunction, _Null)) and result is not null:
+            raise _ThrowSignal(make_error('TypeError',
+                "'getPrototypeOf' on proxy: trap returned neither object nor null"))
+        # Invariant: if target is not extensible, result must match target's prototype
+        if isinstance(target, JSObject) and not target.extensible:
+            target_proto = target.proto
+            if result is not target_proto:
+                raise _ThrowSignal(make_error('TypeError',
+                    "'getPrototypeOf' on proxy: proxy target is non-extensible but the trap did not return its actual prototype"))
+        return result
+    # No trap — forward to target.[[GetPrototypeOf]]()
+    if _is_proxy(target):
+        return _proxy_get_prototype_trap(target)
+    if isinstance(target, JSFunction):
+        proto = getattr(target, '_proto', _SENTINEL)
+        if proto is not _SENTINEL:
+            return proto
+        return None  # Function.prototype (will be looked up later)
+    return target.proto if isinstance(target, JSObject) else null
+
+
+def _proxy_set_prototype_trap(proxy: JSObject, proto) -> bool:
+    """Invoke the 'setPrototypeOf' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'setPrototypeOf\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'setPrototypeOf') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, proto if proto is not None else null])
+        return bool(result)
+    # No trap — forward to target.[[SetPrototypeOf]](V)
+    if _is_proxy(target):
+        return _proxy_set_prototype_trap(target, proto)
+    if isinstance(target, JSObject):
+        target.proto = proto
+    return True
+
+
+def _proxy_is_extensible_trap(proxy: JSObject) -> bool:
+    """Invoke the 'isExtensible' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'isExtensible\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'isExtensible') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target])
+        bool_result = bool(result)
+        # Invariant: result must match target.[[IsExtensible]]()
+        target_extensible = target.extensible if isinstance(target, JSObject) else True
+        if bool_result != target_extensible:
+            raise _ThrowSignal(make_error('TypeError',
+                "'isExtensible' on proxy: proxy and target extensibility mismatch"))
+        return bool_result
+    # No trap — forward to target.[[IsExtensible]]()
+    if _is_proxy(target):
+        return _proxy_is_extensible_trap(target)
+    return target.extensible if isinstance(target, JSObject) else True
+
+
+def _proxy_prevent_extensions_trap(proxy: JSObject) -> bool:
+    """Invoke the 'preventExtensions' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'preventExtensions\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'preventExtensions') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target])
+        bool_result = bool(result)
+        # Invariant: if trap returns true, target must actually be non-extensible
+        if bool_result:
+            target_extensible = target.extensible if isinstance(target, JSObject) else True
+            if target_extensible:
+                raise _ThrowSignal(make_error('TypeError',
+                    "'preventExtensions' on proxy: trap returned truish but the proxy target is extensible"))
+        return bool_result
+    # No trap — forward to target.[[PreventExtensions]]()
+    if _is_proxy(target):
+        return _proxy_prevent_extensions_trap(target)
+    if isinstance(target, JSObject):
+        target.extensible = False
+    return True
+
+
 def _obj_has_property(obj: JSObject, key: str) -> bool:
     """Check if obj (or its prototype chain) has key."""
+    if _is_proxy(obj):
+        return _proxy_has_trap(obj, key)
     o = obj
     while o is not None:
+        if _is_proxy(o) and o is not obj:
+            return _proxy_has_trap(o, key)
         if o.has_own(key):
             return True
         o = o.proto
@@ -469,6 +916,8 @@ def _obj_has_property(obj: JSObject, key: str) -> bool:
 
 def _obj_get_property(obj: JSObject, key: str, this=None):
     """Get a property from the prototype chain."""
+    if _is_proxy(obj):
+        return _proxy_get_trap(obj, key, this)
     if key == '__proto__':
         # Check if there is an own data property '__proto__' (e.g. from JSON.parse)
         # If not, fall through to standard getter (returns proto)
@@ -476,6 +925,8 @@ def _obj_get_property(obj: JSObject, key: str, this=None):
             return obj.proto
     o = obj
     while o is not None:
+        if _is_proxy(o) and o is not obj:
+            return _proxy_get_trap(o, key, this if this is not None else obj)
         if key in o.props:
             return o.props[key]
         if o._descriptors and key in o._descriptors:
@@ -494,8 +945,14 @@ def _obj_get_property(obj: JSObject, key: str, this=None):
     return undefined
 
 
-def _obj_set_property(obj: JSObject, key: str, value, strict: bool = False) -> None:
+def _obj_set_property(obj: JSObject, key: str, value, strict: bool = False, receiver=None) -> None:
     """Set a property, respecting non-writable descriptors."""
+    actual_this = receiver if receiver is not None else obj
+    if _is_proxy(obj):
+        result = _proxy_set_trap(obj, key, value)
+        if not result and strict:
+            raise _ThrowSignal(make_error('TypeError', f"'set' on proxy: trap returned falsish for property '{key}'"))
+        return
     if key == '__proto__':
         # __proto__ setter: mutate the actual prototype chain
         # Per spec (B.2.2.1.2): if not extensible, silently fail
@@ -509,13 +966,13 @@ def _obj_set_property(obj: JSObject, key: str, value, strict: bool = False) -> N
         if 'set' in desc:
             s = desc['set']
             if isinstance(s, JSFunction):
-                s.interp.call_function(s, obj, [value])
+                s.interp.call_function(s, actual_this, [value])
                 return
             if callable(s):
-                s(obj, value)
+                s(actual_this, value)
                 return
             if isinstance(s, JSObject) and s._call:
-                s._call(obj, [value])
+                s._call(actual_this, [value])
                 return
             # No setter in accessor descriptor — throw in strict, silently fail in sloppy
             if strict:
@@ -539,6 +996,12 @@ def _obj_set_property(obj: JSObject, key: str, value, strict: bool = False) -> N
         proto = obj.proto
         while proto is not None:
             if isinstance(proto, JSObject):
+                if _is_proxy(proto):
+                    # Proxy on prototype chain: forward [[Set]] with receiver = obj
+                    result = _proxy_set_trap(proto, key, value, obj)
+                    if not result and strict:
+                        raise _ThrowSignal(make_error('TypeError', f"'set' on proxy: trap returned falsish for property '{key}'"))
+                    return
                 if proto._descriptors and key in proto._descriptors:
                     pdesc = proto._descriptors[key]
                     if 'set' in pdesc or 'get' in pdesc:
@@ -583,25 +1046,30 @@ def _obj_set_property(obj: JSObject, key: str, value, strict: bool = False) -> N
     # Array exotic [[Set]]: update length and @@array_data
     if obj._is_array:
         if key == 'length':
-            try:
-                new_len = int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
-            except (ValueError, OverflowError):
-                new_len = None
-            if new_len is not None and new_len >= 0:
-                data = obj.props.get('@@array_data')
-                if data is not None:
-                    old_len = len(data)
-                    if new_len < old_len:
-                        del data[new_len:]
-                        for i in range(new_len, old_len):
-                            obj.props.pop(str(i), None)
-                    elif new_len > old_len:
+            raw = js_to_uint32(value)
+            num = js_to_number(value)
+            if raw != num:
+                raise _ThrowSignal(make_error('RangeError', 'Invalid array length'))
+            new_len = raw
+            data = obj.props.get('@@array_data')
+            if data is not None:
+                old_len = len(data)
+                if new_len < old_len:
+                    del data[new_len:]
+                    for i in range(new_len, old_len):
+                        obj.props.pop(str(i), None)
+                elif new_len > old_len:
+                    if new_len <= _MAX_DENSE_ARRAY_LEN:
                         data.extend([undefined] * (new_len - old_len))
-                obj.props['length'] = new_len
+                    else:
+                        # Switch to sparse
+                        del obj.props['@@array_data']
+            obj.props['length'] = new_len
         else:
             try:
                 idx = int(key)
-                if str(idx) == key and idx >= 0:
+                # Valid array index: 0 <= idx < 2^32-1 (indices at 2^32-1 are regular props)
+                if str(idx) == key and 0 <= idx < 0xFFFFFFFF:
                     cur_len = obj.props.get('length', 0)
                     if isinstance(cur_len, (int, float)):
                         cur_len = int(cur_len)
@@ -611,15 +1079,25 @@ def _obj_set_property(obj: JSObject, key: str, value, strict: bool = False) -> N
                         obj.props['length'] = idx + 1
                     data = obj.props.get('@@array_data')
                     if data is not None:
-                        if idx >= len(data):
-                            data.extend([undefined] * (idx - len(data) + 1))
-                        data[idx] = value
+                        new_data_len = idx + 1
+                        if new_data_len <= _MAX_DENSE_ARRAY_LEN:
+                            if idx >= len(data):
+                                data.extend([undefined] * (idx - len(data) + 1))
+                            data[idx] = value
+                        else:
+                            # Switch to sparse
+                            del obj.props['@@array_data']
+                            obj.props[key] = value
+                    else:
+                        obj.props[key] = value
             except (ValueError, TypeError):
                 pass
 
 
 def _obj_delete_property(obj: JSObject, key: str) -> bool:
     """Delete an own property. Returns True if deleted."""
+    if _is_proxy(obj):
+        return _proxy_delete_trap(obj, key)
     # Array 'length' is non-configurable per spec
     if key == 'length' and obj._is_array:
         return False
@@ -638,13 +1116,16 @@ def _obj_delete_property(obj: JSObject, key: str) -> bool:
 
 
 def _obj_define_property(obj: JSObject, key: str, desc: dict) -> None:
-    """Define a property with a descriptor."""
+    """Define a property with a descriptor, implementing [[DefineOwnProperty]] validation."""
     if obj._descriptors is None:
         obj._descriptors = {}
     existing = obj._descriptors.get(key, None)
     if existing is None:
-        # New property: ECMAScript defaults are all False when using defineProperty
-        # (configurable: false, writable: false, enumerable: false)
+        # New property: check extensibility
+        if not obj.extensible:
+            raise _ThrowSignal(make_error('TypeError',
+                f"Cannot define property {key}, object is not extensible"))
+        # ECMAScript defaults are all False when using defineProperty
         is_accessor = 'get' in desc or 'set' in desc
         if is_accessor:
             defaults = {'configurable': False, 'enumerable': False}
@@ -652,6 +1133,51 @@ def _obj_define_property(obj: JSObject, key: str, desc: dict) -> None:
             defaults = {'configurable': False, 'writable': False, 'enumerable': False}
         obj._descriptors[key] = {**defaults, **desc}
     else:
+        # Existing property: validate changes against configurable/writable
+        is_configurable = existing.get('configurable', False)
+        if not is_configurable:
+            # Non-configurable: reject configurable change to true
+            if desc.get('configurable', False):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot redefine property: {key}"))
+            # Non-configurable: reject enumerable change
+            if 'enumerable' in desc and desc['enumerable'] != existing.get('enumerable', False):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot redefine property: {key}"))
+            is_accessor_existing = 'get' in existing or 'set' in existing
+            is_accessor_new = 'get' in desc or 'set' in desc
+            is_data_existing = 'value' in existing or 'writable' in existing
+            # Reject accessor-to-data or data-to-accessor change on non-configurable
+            if is_accessor_existing and not is_accessor_new and ('value' in desc or 'writable' in desc):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot redefine property: {key}"))
+            if is_data_existing and not is_accessor_existing and is_accessor_new:
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot redefine property: {key}"))
+            if is_accessor_existing:
+                # Non-configurable accessor: reject getter/setter change
+                if 'get' in desc and desc['get'] is not existing.get('get'):
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"Cannot redefine property: {key}"))
+                if 'set' in desc and desc['set'] is not existing.get('set'):
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"Cannot redefine property: {key}"))
+            else:
+                # Non-configurable data property
+                if not existing.get('writable', False):
+                    # Non-writable + non-configurable: reject value and writable changes
+                    if 'writable' in desc and desc['writable']:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"Cannot redefine property: {key}"))
+                    if 'value' in desc:
+                        # Only reject if value is actually different
+                        old_val = existing.get('value', undefined)
+                        new_val = desc['value']
+                        # SameValue check
+                        if old_val is not new_val:
+                            if not (isinstance(old_val, float) and isinstance(new_val, float) and old_val != old_val and new_val != new_val):
+                                raise _ThrowSignal(make_error('TypeError',
+                                    f"Cannot redefine property: {key}"))
         obj._descriptors[key] = {**existing, **desc}
     # Also update props for simple value descriptors
     if 'value' in desc and 'get' not in desc and 'set' not in desc:
@@ -703,12 +1229,14 @@ _symbol_registry: dict[str, 'JSSymbol'] = {}
 class JSSymbol:
     __slots__ = ('description', '_id', '_well_known_key', '__weakref__')
     _counter = 0
+    _id_to_symbol: dict = {}  # reverse lookup: _id -> JSSymbol
 
     def __init__(self, description=None):
         JSSymbol._counter += 1
         self._id = JSSymbol._counter
         self.description = description
         self._well_known_key = None
+        JSSymbol._id_to_symbol[self._id] = self
 
     def __repr__(self):
         if self.description is not None:
@@ -731,6 +1259,21 @@ def _symbol_to_key(sym: 'JSSymbol') -> str:
     if sym._well_known_key is not None:
         return sym._well_known_key
     return f'@@sym_{sym._id}'
+
+
+def _key_to_symbol(key: str):
+    """Convert an internal @@sym_{id} key back to its JSSymbol, or None."""
+    if key.startswith('@@sym_'):
+        try:
+            sym_id = int(key[6:])
+            return JSSymbol._id_to_symbol.get(sym_id)
+        except ValueError:
+            pass
+    # Well-known symbols
+    for desc, sym in _WELL_KNOWN_SYMBOLS.items():
+        if sym._well_known_key == key:
+            return sym
+    return None
 
 
 def _to_property_key(key) -> str:
@@ -856,7 +1399,10 @@ class JSFunction:
 
 
 def _fn_is_strict(fn: 'JSFunction') -> bool:
-    """Return True if fn is a strict mode function."""
+    """Return True if fn is a strict mode function.
+    Generators and async functions are always strict for caller/arguments."""
+    if fn.is_generator:
+        return True
     if fn.env is not None and fn.env._is_strict():
         return True
     body = fn.body
@@ -865,6 +1411,14 @@ def _fn_is_strict(fn: 'JSFunction') -> bool:
             type(body.body[0].expression).__name__ == 'Literal' and
             body.body[0].expression.value == 'use strict'):
         return True
+    return False
+
+
+def _fn_has_non_simple_params(fn: 'JSFunction') -> bool:
+    """Return True if fn has non-simple parameters (defaults, rest, destructuring)."""
+    for p in fn.params:
+        if isinstance(p, (AssignmentPattern, RestElement, ArrayPattern, ObjectPattern)):
+            return True
     return False
 
 
@@ -1472,7 +2026,21 @@ def js_instanceof(val, constructor) -> bool:
                 js_typeof(proto))))
 
     if isinstance(val, JSFunction):
-        # JSFunction's virtual prototype chain is Function.prototype → Object.prototype
+        # Walk the JSFunction's actual prototype chain
+        # Generator functions: _proto = GeneratorFunction.prototype → Function.prototype → Object.prototype
+        fn_obj = val
+        fn_proto_chain = getattr(fn_obj, '_proto', _SENTINEL)
+        if fn_proto_chain is not _SENTINEL and fn_proto_chain is not None:
+            # Walk _proto chain
+            cur = fn_proto_chain
+            while cur is not None:
+                if cur is proto:
+                    return True
+                if isinstance(cur, JSObject):
+                    cur = cur.proto
+                else:
+                    break
+        # Also check Function.prototype and Object.prototype
         fn_proto = _PROTOS.get('Function')
         obj_proto = _PROTOS.get('Object')
         if proto is fn_proto or proto is obj_proto:
@@ -1483,6 +2051,13 @@ def js_instanceof(val, constructor) -> bool:
 
     obj = val
     while obj is not None:
+        if _is_proxy(obj):
+            obj = _proxy_get_prototype_trap(obj)
+            if isinstance(obj, _Null) or obj is null:
+                return False
+            if obj is proto:
+                return True
+            continue
         if obj is proto:
             return True
         obj = obj.proto
@@ -1552,7 +2127,7 @@ def _array_iterator(arr: JSObject, interp: 'Interpreter'):
 
 
 def _make_iter_result(value, done: bool) -> JSObject:
-    obj = JSObject()
+    obj = JSObject(proto=_PROTOS.get('Object'))
     obj.props['value'] = value
     obj.props['done'] = done
     return obj
@@ -1667,35 +2242,63 @@ def _iterator_close(iterator, suppress_error=False) -> None:
                     'Iterator result is not an object'))
 
 
-def _array_to_list(arr: JSObject) -> list:
-    """Convert array object to Python list."""
-    arr_list = arr.props.get('@@array_data')
-    if arr_list is not None:
-        return arr_list
-    length = arr.props.get('length', 0)
-    if isinstance(length, int):
+def _array_to_list(arr) -> list:
+    """Convert array-like object to Python list (CreateListFromArrayLike)."""
+    if isinstance(arr, JSObject):
+        arr_list = arr.props.get('@@array_data')
+        if arr_list is not None:
+            return arr_list
+        # Read length through property chain to trigger getters
+        length = _obj_get_property(arr, 'length')
+        length = js_to_number(length) if length is not undefined else 0
+        if length != length:  # NaN
+            length = 0
+        length = int(length)
+        if length < 0:
+            length = 0
         result = []
         for i in range(length):
-            result.append(arr.props.get(str(i), undefined))
+            result.append(_obj_get_property(arr, str(i)))
+        return result
+    if isinstance(arr, JSFunction):
+        # JSFunction as array-like: read length through interpreter property chain
+        length = arr.interp._get_property(arr, 'length')
+        length = js_to_number(length) if length is not undefined else 0
+        if length != length:  # NaN
+            length = 0
+        length = int(length)
+        if length < 0:
+            length = 0
+        result = []
+        for i in range(length):
+            result.append(arr.interp._get_property(arr, str(i)))
         return result
     return []
 
+
+# Arrays above this length use sparse representation (no @@array_data list).
+_MAX_DENSE_ARRAY_LEN = 1_000_000
 
 def make_array(items: list) -> JSObject:
     """Create a JS array from a Python list."""
     proto = _PROTOS.get('Array')
     obj = JSObject(proto=proto, class_name='Array')
     obj._is_array = True
-    data = list(items)
-    obj.props['@@array_data'] = data
-    obj.props['length'] = len(data)
-    # length is non-enumerable on arrays
+    n = len(items)
+    if n <= _MAX_DENSE_ARRAY_LEN:
+        data = list(items)
+        obj.props['@@array_data'] = data
+        for i, v in enumerate(data):
+            obj.props[str(i)] = v
+    else:
+        # Sparse: only store non-undefined elements as string keys
+        for i, v in enumerate(items):
+            if v is not undefined:
+                obj.props[str(i)] = v
+    obj.props['length'] = n
     if obj._non_enum is None:
         obj._non_enum = set()
     obj._non_enum.add('length')
-    # Also set indexed props for compatibility
-    for i, v in enumerate(data):
-        obj.props[str(i)] = v
     return obj
 
 
@@ -1712,7 +2315,19 @@ def _array_set_item(arr: JSObject, idx: int, value) -> None:
     data = arr.props.get('@@array_data')
     if data is not None:
         if idx >= len(data):
-            data.extend([undefined] * (idx - len(data) + 1))
+            new_len = idx + 1
+            if new_len <= _MAX_DENSE_ARRAY_LEN:
+                data.extend([undefined] * (idx - len(data) + 1))
+                data[idx] = value
+                arr.props[str(idx)] = value
+                arr.props['length'] = len(data)
+                return
+            else:
+                # Switch to sparse
+                del arr.props['@@array_data']
+                arr.props[str(idx)] = value
+                arr.props['length'] = new_len
+                return
         data[idx] = value
         arr.props[str(idx)] = value
         arr.props['length'] = len(data)
@@ -1817,6 +2432,17 @@ def _typed_array_set(arr: JSObject, idx: int, value) -> None:
     _struct.pack_into('<' + fmt, ab_data, offset, coerced)
 
 
+def _invoke_callable(fn, this_val, args):
+    """Call fn (JSFunction or JSObject with _call) with the given this and args."""
+    if isinstance(fn, JSFunction):
+        if fn.interp is not None:
+            return fn.interp.call_function(fn, this_val, args)
+        raise _ThrowSignal(make_error('TypeError', 'Cannot call function without interpreter'))
+    if isinstance(fn, JSObject) and fn._call is not None:
+        return fn._call(this_val, args)
+    raise _ThrowSignal(make_error('TypeError', 'Not a callable'))
+
+
 def _make_native_fn(name: str, fn: Callable, length: int = 0) -> JSObject:
     """Wrap a Python callable as a JSObject with _call."""
     # Use Function.prototype as [[Prototype]] if already registered (lazy)
@@ -1829,8 +2455,8 @@ def _make_native_fn(name: str, fn: Callable, length: int = 0) -> JSObject:
     # Callers that need constructors should set obj._construct explicitly.
     # Store name and length in _descriptors so they respect configurable/writable
     obj._descriptors = {
-        'name': {'value': name, 'writable': False, 'enumerable': False, 'configurable': True},
         'length': {'value': length, 'writable': False, 'enumerable': False, 'configurable': True},
+        'name': {'value': name, 'writable': False, 'enumerable': False, 'configurable': True},
     }
     return obj
 
@@ -1838,7 +2464,12 @@ def _make_native_fn(name: str, fn: Callable, length: int = 0) -> JSObject:
 def _build_function_prototype(fn: JSFunction) -> JSObject:
     """Build and cache the default prototype object for a function."""
     if fn.prototype is None:
-        proto = JSObject(proto=_PROTOS.get('Object'))
+        # Generator functions' .prototype inherits from %GeneratorPrototype%
+        if getattr(fn, 'is_generator', False):
+            parent_proto = _PROTOS.get('Generator') or _PROTOS.get('Object')
+        else:
+            parent_proto = _PROTOS.get('Object')
+        proto = JSObject(proto=parent_proto)
         # constructor is non-enumerable, writable, configurable per ECMAScript spec
         proto._descriptors = {
             'constructor': {'value': fn, 'writable': True, 'enumerable': False, 'configurable': True}
@@ -2761,20 +3392,19 @@ class Interpreter:
 
         if isinstance(obj, JSObject):
             # Handle Proxy objects (lazy iteration via traps)
-            if obj._proxy_ownKeys is not None:
-                raw_keys = obj._proxy_ownKeys()
+            if _is_proxy(obj):
+                raw_keys = _proxy_ownkeys_trap(obj)
                 for_env = Environment(parent=env)
                 for k in raw_keys:
                     if not isinstance(k, str) or k.startswith('@@'):
                         continue
-                    # Check getOwnPropertyDescriptor trap lazily (after each body exec)
-                    if obj._proxy_getOwnPropDesc is not None:
-                        desc = obj._proxy_getOwnPropDesc(k)
-                        if desc is undefined or desc is None:
+                    # Check getOwnPropertyDescriptor trap for enumerability
+                    desc_result = _proxy_get_own_prop_desc_trap(obj, k)
+                    if desc_result is undefined or desc_result is None:
+                        continue
+                    if isinstance(desc_result, JSObject):
+                        if not js_is_truthy(desc_result.props.get('enumerable', False)):
                             continue
-                        if isinstance(desc, JSObject):
-                            if not js_is_truthy(desc.props.get('enumerable', False)):
-                                continue
                     try:
                         self._assign_for_iter_var(node.left, k, for_env, env)
                         self.exec(node.body, for_env)
@@ -3811,33 +4441,53 @@ class Interpreter:
             obj._static_props[key] = value
             return
         if isinstance(obj, JSObject):
+            if _is_proxy(obj):
+                _proxy_set_trap(obj, key, value)
+                return
             if obj._is_array and key == 'length':
-                # resize
-                new_len = js_to_integer(value)
+                # resize — validate range per 10.4.2.4 ArraySetLength
+                raw = js_to_uint32(value)
+                num = js_to_number(value)
+                if raw != num:
+                    raise _ThrowSignal(make_error('RangeError', 'Invalid array length'))
+                new_len = raw
                 old_len = obj.props.get('length', 0)
                 if new_len < old_len:
-                    # Delete elements from old_len-1 down to new_len
-                    # Stop (and throw) if a non-configurable element is encountered
-                    actual_new = old_len
-                    for i in range(old_len - 1, new_len - 1, -1):
-                        k = str(i)
-                        if obj._descriptors and k in obj._descriptors:
-                            desc = obj._descriptors[k]
-                            if not desc.get('configurable', True):
-                                # Can't delete this element; set length to i+1 and throw
-                                obj.props['length'] = i + 1
-                                data = obj.props.get('@@array_data')
-                                if data is not None:
-                                    while len(data) > i + 1:
-                                        data.pop()
-                                raise _ThrowSignal(make_error('TypeError',
-                                    f'Cannot delete property \'{k}\' of [object Array]'))
-                        if k in obj.props:
-                            del obj.props[k]
-                        data = obj.props.get('@@array_data')
-                        if data is not None and i < len(data):
-                            data.pop()
-                obj.props['length'] = max(new_len, 0)
+                    data = obj.props.get('@@array_data')
+                    if data is not None:
+                        # Dense: just truncate the list
+                        if new_len < len(data):
+                            for i in range(len(data) - 1, new_len - 1, -1):
+                                k = str(i)
+                                if obj._descriptors and k in obj._descriptors:
+                                    desc = obj._descriptors[k]
+                                    if not desc.get('configurable', True):
+                                        obj.props['length'] = i + 1
+                                        while len(data) > i + 1:
+                                            data.pop()
+                                        raise _ThrowSignal(make_error('TypeError',
+                                            f'Cannot delete property \'{k}\' of [object Array]'))
+                                obj.props.pop(k, None)
+                            del data[new_len:]
+                    else:
+                        # Sparse: only delete keys that actually exist
+                        for k in list(obj.props.keys()):
+                            if k.isdigit():
+                                idx = int(k)
+                                if idx >= new_len:
+                                    if obj._descriptors and k in obj._descriptors:
+                                        desc = obj._descriptors[k]
+                                        if not desc.get('configurable', True):
+                                            continue
+                                    del obj.props[k]
+                elif new_len > old_len:
+                    data = obj.props.get('@@array_data')
+                    if data is not None:
+                        if new_len <= _MAX_DENSE_ARRAY_LEN:
+                            data.extend([undefined] * (new_len - len(data)))
+                        else:
+                            del obj.props['@@array_data']
+                obj.props['length'] = new_len
                 return
             if obj._is_array:
                 # TypedArray: write to ArrayBuffer
@@ -3853,7 +4503,7 @@ class Interpreter:
                 else:
                     try:
                         idx = int(key)
-                        if str(idx) == key and idx >= 0:
+                        if str(idx) == key and 0 <= idx < 0xFFFFFFFF:
                             _array_set_item(obj, idx, value)
                             return
                     except (ValueError, TypeError):
@@ -3915,10 +4565,10 @@ class Interpreter:
                 return _build_function_prototype(obj)
             if key == 'call':
                 return _make_native_fn('call', lambda this, args:
-                    self.call_function(this, args[0] if args else undefined, list(args[1:])))
+                    self._call(this, args[0] if args else undefined, list(args[1:])))
             if key == 'apply':
                 return _make_native_fn('apply', lambda this, args:
-                    self.call_function(this, args[0] if args else undefined,
+                    self._call(this, args[0] if args else undefined,
                         _array_to_list(args[1]) if len(args) > 1 and isinstance(args[1], JSObject) else []))
             if key == 'bind':
                 return _make_native_fn('bind', lambda this, args:
@@ -3966,6 +4616,8 @@ class Interpreter:
                         return result
             return undefined
         if isinstance(obj, JSObject):
+            if _is_proxy(obj):
+                return _proxy_get_trap(obj, key, obj)
             if obj._is_array and key == 'length':
                 data = obj.props.get('@@array_data')
                 return len(data) if data is not None else obj.props.get('length', 0)
@@ -4598,7 +5250,7 @@ class Interpreter:
             call_env.define_let('this', actual_this)
             if not fn.is_arrow:
                 # Arrow functions don't have own 'arguments'; they inherit from enclosing scope
-                call_env.define_let('arguments', self._make_arguments(args))
+                call_env.define_let('arguments', self._make_arguments(args, strict=_fn_is_strict(fn) or _fn_has_non_simple_params(fn), callee=fn))
                 # Arrow functions don't have own 'new.target' either
                 call_env.define_let('new.target', undefined)
                 # Set @@super_proto for methods with a home object
@@ -4703,7 +5355,7 @@ class Interpreter:
             try:
                 call_env = Environment(parent=fn.env, is_function=True)
                 call_env.define_let('this', this)
-                call_env.define_let('arguments', self._make_arguments(args))
+                call_env.define_let('arguments', self._make_arguments(args, strict=_fn_is_strict(fn) or _fn_has_non_simple_params(fn), callee=fn))
                 call_env.define_let('new.target', undefined)
                 # Set @@super_proto for generator methods with a home object
                 if fn.home_obj is not None:
@@ -4758,11 +5410,22 @@ class Interpreter:
                 return {'value': val, 'done': True}
             to_gen.put(('return', val))
             try:
-                from_gen.get(timeout=5)
+                msg = from_gen.get(timeout=30)
             except Exception:
-                pass
-            _state['done'] = True
-            return {'value': val, 'done': True}
+                _state['done'] = True
+                return {'value': val, 'done': True}
+            if msg[0] == 'yield':
+                # Generator's finally block yielded a value
+                return {'value': msg[1], 'done': False}
+            elif msg[0] == 'return':
+                _state['done'] = True
+                return {'value': msg[1], 'done': True}
+            elif msg[0] == 'throw':
+                _state['done'] = True
+                raise _ThrowSignal(msg[1])
+            else:
+                _state['done'] = True
+                return {'value': val, 'done': True}
 
         def _gen_throw(err):
             if _state['done']:
@@ -4784,13 +5447,13 @@ class Interpreter:
                 _state['done'] = True
                 raise RuntimeError(f'Generator error: {msg[1]}')
 
-        gen_obj = JSObject(class_name='Generator')
+        gen_obj = JSObject(class_name='Generator', proto=_build_function_prototype(fn))
         gen_obj._gen_iter = True  # mark as generator for _get_iterator
 
         def next_fn(this_val, call_args):
             send_val = call_args[0] if call_args else undefined
             result = _gen_next(send_val)
-            res_obj = JSObject()
+            res_obj = JSObject(proto=_PROTOS.get('Object'))
             res_obj.props['value'] = result['value']
             res_obj.props['done'] = result['done']
             return res_obj
@@ -4798,7 +5461,7 @@ class Interpreter:
         def return_fn(this_val, call_args):
             val = call_args[0] if call_args else undefined
             result = _gen_return(val)
-            res_obj = JSObject()
+            res_obj = JSObject(proto=_PROTOS.get('Object'))
             res_obj.props['value'] = result['value']
             res_obj.props['done'] = result['done']
             return res_obj
@@ -4806,7 +5469,7 @@ class Interpreter:
         def throw_fn(this_val, call_args):
             err = call_args[0] if call_args else undefined
             result = _gen_throw(err)
-            res_obj = JSObject()
+            res_obj = JSObject(proto=_PROTOS.get('Object'))
             res_obj.props['value'] = result['value']
             res_obj.props['done'] = result['done']
             return res_obj
@@ -4822,7 +5485,7 @@ class Interpreter:
         """Execute a statement inside a generator (legacy, no longer used)."""
         self.exec(stmt, env)
 
-    def _make_arguments(self, args: list) -> JSObject:
+    def _make_arguments(self, args: list, strict: bool = False, callee=None) -> JSObject:
         """Create the 'arguments' object (array-like, NOT a real array)."""
         obj = JSObject(class_name='Arguments')
         # Arguments is NOT a real array — no _is_array, no @@array_data.
@@ -4838,7 +5501,38 @@ class Interpreter:
                 iter_fn = arr_proto.props.get('@@iterator')
                 if iter_fn is not None:
                     obj.props['@@iterator'] = iter_fn
+        if strict:
+            # Strict mode: callee/caller are poison-pill accessors
+            tte = self._get_throw_type_error()
+            obj._descriptors = obj._descriptors or {}
+            obj._descriptors['callee'] = {
+                'get': tte, 'set': tte,
+                'enumerable': False, 'configurable': False,
+            }
+            obj._non_enum = obj._non_enum or set()
+            obj._non_enum.add('callee')
+        else:
+            # Sloppy mode: callee is the calling function
+            if callee is not None:
+                obj.props['callee'] = callee
         return obj
+
+    def _get_throw_type_error(self) -> JSObject:
+        """Return the %ThrowTypeError% intrinsic (singleton per realm)."""
+        if hasattr(self, '_throw_type_error') and self._throw_type_error is not None:
+            return self._throw_type_error
+        def _tte_call(this, args):
+            raise _ThrowSignal(make_error('TypeError',
+                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"))
+        fn = _make_native_fn('%ThrowTypeError%', _tte_call, 0)
+        fn.extensible = False
+        # Freeze it: non-writable, non-configurable own properties
+        fn._descriptors = fn._descriptors or {}
+        fn._descriptors['length'] = {'value': 0, 'writable': False, 'enumerable': False, 'configurable': False}
+        fn._descriptors['name'] = {'value': '', 'writable': False, 'enumerable': False, 'configurable': False}
+        fn.name = ''
+        self._throw_type_error = fn
+        return fn
 
     def _bind_params(self, params: list, args: list, env: Environment) -> None:
         """Bind function parameters in the call environment."""
@@ -4878,7 +5572,12 @@ class Interpreter:
                     f'{ctor.name or "function"} is not a constructor'))
             # Use new_target for prototype lookup if provided
             actual_new_target = new_target or ctor
-            proto = _build_function_prototype(actual_new_target) if isinstance(actual_new_target, JSFunction) else _build_function_prototype(ctor)
+            if isinstance(actual_new_target, JSFunction):
+                proto = _build_function_prototype(actual_new_target)
+            elif isinstance(actual_new_target, JSObject) and 'prototype' in actual_new_target.props:
+                proto = actual_new_target.props['prototype']
+            else:
+                proto = _build_function_prototype(ctor)
             obj = JSObject(proto=proto)
 
             # Initialize instance fields before running constructor body
@@ -4894,7 +5593,7 @@ class Interpreter:
 
             call_env = Environment(parent=ctor.env, is_function=True)
             call_env.define_let('this', obj)
-            call_env.define_let('arguments', self._make_arguments(args))
+            call_env.define_let('arguments', self._make_arguments(args, strict=_fn_is_strict(ctor) or _fn_has_non_simple_params(ctor), callee=ctor))
             call_env.define_let('new.target', new_target or ctor)
             if ctor.home_obj is not None:
                 call_env.define_let('@@super_proto', ctor.home_obj.proto)
@@ -4922,6 +5621,8 @@ class Interpreter:
             return obj
         if isinstance(ctor, JSObject):
             if ctor._construct is not None:
+                if _is_proxy(ctor):
+                    return ctor._construct(new_target or ctor, args)
                 return ctor._construct(undefined, args)
             raise _ThrowSignal(make_error('TypeError',
                 f'{ctor.name or "[object {ctor.class_name}]"} is not a constructor'))
@@ -4989,6 +5690,10 @@ class Interpreter:
         fn.source_text = getattr(node, 'source_text', '')
         if getattr(node, 'line', None):
             fn._static_props = {'lineNumber': node.line, 'columnNumber': node.col}
+        if fn.is_generator:
+            gen_fn_proto = _PROTOS.get('GeneratorFunction')
+            if gen_fn_proto is not None:
+                fn._proto = gen_fn_proto
         return fn
 
     def _make_arrow(self, node: ArrowFunctionExpression, env: Environment) -> JSFunction:
@@ -5302,10 +6007,8 @@ class Interpreter:
                 s2 = js_to_string(this)
                 if not args:
                     return s2[0] if s2 else ''
-                n = js_to_number(args[0])
-                if math.isnan(n):
-                    n = 0
-                if math.isinf(n) or n < 0 or n >= len(s2):
+                n = js_to_integer(args[0])
+                if n < 0 or n >= len(s2):
                     return ''
                 return s2[int(n)]
             return str_method(charAt)

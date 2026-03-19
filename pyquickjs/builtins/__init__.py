@@ -21,13 +21,18 @@ from pyquickjs.interpreter import (
     JSGenerator, Environment,
     make_array, make_error, _make_native_fn, _array_to_list, _obj_get_property,
     _obj_set_property, _obj_has_property, _obj_define_property, _obj_delete_property,
-    _make_iter_result, _build_function_prototype, _call_value,
+    _make_iter_result, _build_function_prototype, _call_value, _invoke_callable,
     js_to_string, js_to_number, js_to_integer, js_to_int32, js_to_uint32,
     js_to_primitive, js_is_truthy, js_typeof, js_strict_equal, js_same_value_zero,
     js_add, _ThrowSignal, _ReturnSignal,
     _int_to_radix, _SENTINEL, register_proto, _def_method, _PROTOS,
     _symbol_to_key, register_well_known_symbol, _to_property_key,
     _get_iterator, _iterate_to_next, _iterator_close,
+    _is_proxy, _proxy_get_trap, _proxy_set_trap, _proxy_has_trap,
+    _proxy_delete_trap, _proxy_ownkeys_trap, _proxy_get_own_prop_desc_trap,
+    _proxy_define_property_trap, _proxy_get_prototype_trap, _proxy_set_prototype_trap,
+    _proxy_is_extensible_trap, _proxy_prevent_extensions_trap,
+    _typed_array_set,
 )
 
 
@@ -40,6 +45,16 @@ def _is_callable(val) -> bool:
     if callable(val) and val is not undefined and val is not null:
         return True
     return False
+
+
+def _setup_ctor_descriptors(obj: JSObject, name: str, length: int) -> None:
+    """Set proper name/length descriptors on a constructor object."""
+    obj.name = name
+    obj.length = length
+    if obj._descriptors is None:
+        obj._descriptors = {}
+    obj._descriptors['name'] = {'value': name, 'writable': False, 'enumerable': False, 'configurable': True}
+    obj._descriptors['length'] = {'value': length, 'writable': False, 'enumerable': False, 'configurable': True}
 
 
 def _set_ctor_prototype(obj: JSObject, proto: JSObject) -> None:
@@ -61,6 +76,50 @@ _ITERATOR_PROTO.props['@@iterator'] = _make_native_fn('[Symbol.iterator]',
 if _ITERATOR_PROTO._non_enum is None:
     _ITERATOR_PROTO._non_enum = set()
 _ITERATOR_PROTO._non_enum.add('@@iterator')
+
+# %GeneratorFunction.prototype.prototype% (a.k.a. %GeneratorPrototype%)
+_GENERATOR_PROTO = JSObject(proto=_ITERATOR_PROTO, class_name='Generator')
+# Placeholder methods — actual next/return/throw are per-instance but test262 checks proto shape
+def _gen_proto_next(this, args):
+    """Proxy to instance.next if available."""
+    fn = this.props.get('next') if isinstance(this, JSObject) else None
+    if fn is not None and callable(getattr(fn, '_call', None)):
+        return fn._call(this, args)
+    raise _ThrowSignal(make_error('TypeError', 'not a generator object'))
+def _gen_proto_return(this, args):
+    fn = this.props.get('return') if isinstance(this, JSObject) else None
+    if fn is not None and callable(getattr(fn, '_call', None)):
+        return fn._call(this, args)
+    raise _ThrowSignal(make_error('TypeError', 'not a generator object'))
+def _gen_proto_throw(this, args):
+    fn = this.props.get('throw') if isinstance(this, JSObject) else None
+    if fn is not None and callable(getattr(fn, '_call', None)):
+        return fn._call(this, args)
+    raise _ThrowSignal(make_error('TypeError', 'not a generator object'))
+_def_method(_GENERATOR_PROTO, 'next', _make_native_fn('next', _gen_proto_next, 1))
+_def_method(_GENERATOR_PROTO, 'return', _make_native_fn('return', _gen_proto_return, 1))
+_def_method(_GENERATOR_PROTO, 'throw', _make_native_fn('throw', _gen_proto_throw, 1))
+_obj_define_property(_GENERATOR_PROTO, '@@toStringTag', {
+    'value': 'Generator', 'writable': False, 'enumerable': False, 'configurable': True,
+})
+_PROTOS['Generator'] = _GENERATOR_PROTO
+
+# %GeneratorFunction.prototype% — the [[Prototype]] of generator functions
+# Its .prototype = %GeneratorPrototype%, and its [[Prototype]] = Function.prototype (set later)
+_GENERATOR_FUNCTION_PROTO = JSObject(class_name='GeneratorFunction')
+_GENERATOR_FUNCTION_PROTO.props['prototype'] = _GENERATOR_PROTO
+_obj_define_property(_GENERATOR_FUNCTION_PROTO, 'prototype', {
+    'value': _GENERATOR_PROTO, 'writable': False, 'enumerable': False, 'configurable': True,
+})
+_obj_define_property(_GENERATOR_FUNCTION_PROTO, '@@toStringTag', {
+    'value': 'GeneratorFunction', 'writable': False, 'enumerable': False, 'configurable': True,
+})
+# Set Generator.constructor → GeneratorFunction.prototype (circular)
+_GENERATOR_PROTO.props['constructor'] = _GENERATOR_FUNCTION_PROTO
+_obj_define_property(_GENERATOR_PROTO, 'constructor', {
+    'value': _GENERATOR_FUNCTION_PROTO, 'writable': False, 'enumerable': False, 'configurable': True,
+})
+_PROTOS['GeneratorFunction'] = _GENERATOR_FUNCTION_PROTO
 
 
 def _make_typed_iter_proto(tag: str, next_fn) -> JSObject:
@@ -294,20 +353,16 @@ def _descriptor_to_js(desc: dict) -> JSObject:
 
 
 def _js_to_descriptor(js_obj: JSObject) -> dict:
-    """Convert a JS descriptor object to a Python descriptor dict."""
+    """Convert a JS descriptor object to a Python descriptor dict (ToPropertyDescriptor)."""
     desc = {}
-    if 'value' in js_obj.props:
-        desc['value'] = js_obj.props['value']
-    if 'get' in js_obj.props:
-        desc['get'] = js_obj.props['get']
-    if 'set' in js_obj.props:
-        desc['set'] = js_obj.props['set']
-    if 'writable' in js_obj.props:
-        desc['writable'] = bool(js_obj.props['writable'])
-    if 'enumerable' in js_obj.props:
-        desc['enumerable'] = bool(js_obj.props['enumerable'])
-    if 'configurable' in js_obj.props:
-        desc['configurable'] = bool(js_obj.props['configurable'])
+    # Use _obj_has_property / _obj_get_property to trigger getters and propagate abrupt completions
+    for field in ('value', 'get', 'set', 'writable', 'enumerable', 'configurable'):
+        if _obj_has_property(js_obj, field):
+            val = _obj_get_property(js_obj, field)
+            if field in ('writable', 'enumerable', 'configurable'):
+                desc[field] = bool(val)
+            else:
+                desc[field] = val
     return desc
 
 
@@ -344,6 +399,9 @@ def make_object_builtin(interp) -> JSObject:
         elif isinstance(val, bool):
             result = JSObject(proto=_PROTOS.get('Boolean'))
             result.props['@@boolData'] = val
+        elif isinstance(val, JSBigInt):
+            result = JSObject(proto=_PROTOS.get('BigInt'))
+            result.props['@@bigintData'] = val
         elif isinstance(val, (int, float)):
             result = JSObject(proto=_PROTOS.get('Number'))
             result.props['@@numData'] = val
@@ -512,6 +570,25 @@ def make_object_builtin(interp) -> JSObject:
                 continue
             if isinstance(src, (JSObject, JSFunction)):
                 src_obj = src
+                # Proxy-aware path: use traps for ownKeys and getOwnPropertyDescriptor
+                if _is_proxy(src_obj):
+                    keys = _proxy_ownkeys_trap(src_obj)
+                    for k in keys:
+                        desc = _proxy_get_own_prop_desc_trap(src_obj, k)
+                        if desc is None or desc is undefined:
+                            continue
+                        # Check enumerable on the descriptor
+                        if isinstance(desc, (JSObject, JSFunction)):
+                            enum_val = _obj_get_property(desc, 'enumerable')
+                            if not enum_val:
+                                continue
+                        elif isinstance(desc, dict):
+                            if not desc.get('enumerable', True):
+                                continue
+                        # Per spec: Get(from, nextKey) — use the proxy [[Get]] trap
+                        v = _proxy_get_trap(src_obj, k, src_obj)
+                        _assign_prop(target, k, v)
+                    continue
                 # Collect all own enumerable property keys (string keys first, then symbol keys)
                 # Per OrdinaryOwnPropertyKeys: integer indices, then string keys, then symbol keys
                 if isinstance(src_obj, JSFunction):
@@ -581,7 +658,11 @@ def make_object_builtin(interp) -> JSObject:
             if args and (args[0] is null or args[0] is undefined):
                 raise _ThrowSignal(make_error('TypeError', 'Cannot convert to object'))
             return make_array([])
-        return make_array(_js_ordered_keys(args[0]))
+        o = args[0]
+        if _is_proxy(o):
+            keys = _proxy_ownkeys_trap(o)
+            return make_array([k for k in keys if isinstance(k, str)])
+        return make_array(_js_ordered_keys(o))
     _def_method(obj, 'keys', _make_native_fn('keys', object_keys))
 
     def object_values(this, args):
@@ -660,7 +741,11 @@ def make_object_builtin(interp) -> JSObject:
     def object_getOwnPropertyNames(this, args):
         if not args or not isinstance(args[0], JSObject):
             return make_array([])
-        return make_array(_get_own_property_names(args[0]))
+        o = args[0]
+        if _is_proxy(o):
+            keys = _proxy_ownkeys_trap(o)
+            return make_array([k for k in keys if isinstance(k, str)])
+        return make_array(_get_own_property_names(o))
     _def_method(obj, 'getOwnPropertyNames', _make_native_fn('getOwnPropertyNames', object_getOwnPropertyNames))
 
     def object_getOwnPropertyDescriptor(this, args):
@@ -671,6 +756,12 @@ def make_object_builtin(interp) -> JSObject:
             return undefined
         key_val = args[1] if len(args) > 1 else undefined
         key = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else (js_to_string(key_val) if key_val is not undefined else 'undefined')
+        # Proxy dispatch
+        if isinstance(o, JSObject) and _is_proxy(o):
+            result = _proxy_get_own_prop_desc_trap(o, key)
+            if result is undefined or result is None:
+                return undefined
+            return result
         # Check accessor descriptors first
         _descs = o._descriptors if hasattr(o, '_descriptors') else None
         if _descs and key in _descs:
@@ -760,6 +851,10 @@ def make_object_builtin(interp) -> JSObject:
         key_val = args[1]
         key = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else js_to_string(key_val)
         desc_obj = args[2]
+        if isinstance(o, JSObject) and _is_proxy(o):
+            desc = _js_to_descriptor(desc_obj) if isinstance(desc_obj, JSObject) else {}
+            _proxy_define_property_trap(o, key, desc_obj if isinstance(desc_obj, JSObject) else JSObject())
+            return o
         if isinstance(desc_obj, JSObject):
             desc = _js_to_descriptor(desc_obj)
             if isinstance(o, JSFunction):
@@ -787,6 +882,11 @@ def make_object_builtin(interp) -> JSObject:
         if not args:
             raise _ThrowSignal(make_error('TypeError', 'Object.getPrototypeOf requires argument'))
         arg = args[0]
+        if isinstance(arg, JSObject) and _is_proxy(arg):
+            result = _proxy_get_prototype_trap(arg)
+            if result is None:
+                return null
+            return result if result is not undefined else null
         if isinstance(arg, JSObject):
             return arg.proto if arg.proto is not None else null
         if isinstance(arg, JSFunction):
@@ -825,6 +925,9 @@ def make_object_builtin(interp) -> JSObject:
             raise _ThrowSignal(make_error('TypeError', 'Object.setPrototypeOf: target must be object'))
         o = args[0]
         proto_arg = args[1]
+        if isinstance(o, JSObject) and _is_proxy(o):
+            _proxy_set_prototype_trap(o, proto_arg if proto_arg is not null else None)
+            return o
         if isinstance(o, JSObject):
             if proto_arg is null:
                 o.proto = None
@@ -869,6 +972,9 @@ def make_object_builtin(interp) -> JSObject:
         if not args or not isinstance(args[0], JSObject):
             return args[0] if args else undefined
         o = args[0]
+        if _is_proxy(o):
+            _proxy_prevent_extensions_trap(o)
+            return o
         o.extensible = False
         return o
     _def_method(obj, 'preventExtensions', _make_native_fn('preventExtensions', object_preventExtensions))
@@ -876,7 +982,10 @@ def make_object_builtin(interp) -> JSObject:
     def object_isExtensible(this, args):
         if not args or not isinstance(args[0], JSObject):
             return False
-        return args[0].extensible
+        o = args[0]
+        if _is_proxy(o):
+            return _proxy_is_extensible_trap(o)
+        return o.extensible
     _def_method(obj, 'isExtensible', _make_native_fn('isExtensible', object_isExtensible))
 
     def object_seal(this, args):
@@ -985,19 +1094,34 @@ def _make_lazy_array_iterator(obj, kind='value'):
 
 def make_array_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
-    obj.name = 'Array'
+    _setup_ctor_descriptors(obj, 'Array', 1)
 
     def array_call(this, args):
         if len(args) == 1 and isinstance(args[0], (int, float)) and not isinstance(args[0], bool):
-            n = int(args[0])
-            arr = make_array([undefined] * n)
+            n = args[0]
+            uint32 = js_to_uint32(n)
+            if uint32 != js_to_number(n):
+                raise _ThrowSignal(make_error('RangeError', 'Invalid array length'))
+            # For large arrays, create sparse (no @@array_data backing list)
+            from pyquickjs.interpreter import _MAX_DENSE_ARRAY_LEN
+            if uint32 > _MAX_DENSE_ARRAY_LEN:
+                arr = JSObject(proto=_PROTOS.get('Array'), class_name='Array')
+                arr._is_array = True
+                arr.props['length'] = uint32
+                if arr._non_enum is None:
+                    arr._non_enum = set()
+                arr._non_enum.add('length')
+                return arr
+            arr = make_array([undefined] * uint32)
             return arr
         return make_array(list(args))
     obj._call = array_call
     obj._construct = array_call
 
     proto = JSObject(class_name='Array')
-    proto._is_array = False  # prototype itself is not array
+    proto._is_array = True  # Array.prototype is an exotic Array object per spec
+    proto.props['length'] = 0
+    proto.props['@@array_data'] = []
     _def_method(proto, 'constructor', obj)
     _set_ctor_prototype(obj, proto)
 
@@ -1537,44 +1661,112 @@ def make_array_builtin(interp) -> JSObject:
         if not args:
             return False
         a = args[0]
-        return isinstance(a, JSObject) and a._is_array
-    _def_method(obj, 'isArray', _make_native_fn('isArray', array_isArray))
+        if not isinstance(a, JSObject):
+            return False
+        # See through Proxy chains (spec 7.2.2 IsArray)
+        seen = set()
+        while True:
+            oid = id(a)
+            if oid in seen:
+                return False
+            seen.add(oid)
+            if a._is_array:
+                return True
+            if not _is_proxy(a):
+                return False
+            # It's a proxy — check if revoked
+            target = a._proxy_target
+            handler = a._proxy_handler
+            if target is None or handler is None:
+                raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'IsArray\' on a proxy that has been revoked'))
+            if not isinstance(target, JSObject):
+                return False
+            a = target
+    isArray_fn = _make_native_fn('isArray', array_isArray, 1)
+    _def_method(obj, 'isArray', isArray_fn)
 
     def array_from(this, args):
         if not args:
-            return make_array([])
+            raise _ThrowSignal(make_error('TypeError', 'Array.from requires an array-like or iterable object'))
         iterable = args[0]
+        if iterable is null or iterable is undefined:
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert undefined or null to object'))
         map_fn = args[1] if len(args) > 1 and args[1] is not undefined else None
-        if isinstance(iterable, JSObject) and iterable._is_array:
-            data = _array_to_list(iterable)
-        elif isinstance(iterable, str):
-            data = list(iterable)
+        this_arg = args[2] if len(args) > 2 else undefined
+        if map_fn is not None and not _is_callable(map_fn):
+            raise _ThrowSignal(make_error('TypeError', 'Array.from: mapFn must be callable'))
+
+        # Determine if this is a constructor (custom or Array)
+        use_ctor = _is_callable(this) and this is not obj  # obj is the Array constructor
+
+        # Try iterator first (check @@iterator property)
+        has_iter = False
+        if isinstance(iterable, str):
+            has_iter = True
         elif isinstance(iterable, JSObject):
-            # Try to iterate
+            iter_fn = _obj_get_property(iterable, '@@iterator')
+            if iter_fn is not undefined and iter_fn is not None and _is_callable(iter_fn):
+                has_iter = True
+
+        if has_iter:
+            # Iterable path — per spec: Construct first, then iterate
+            if use_ctor:
+                a = interp._construct(this, [])
+            else:
+                a = None
             data = []
-            from pyquickjs.interpreter import _get_iterator, _iterate_to_next
-            try:
+            if isinstance(iterable, str):
+                data = list(iterable)
+            else:
                 it = _get_iterator(iterable, interp)
                 while True:
                     v, done = _iterate_to_next(it)
                     if done:
                         break
                     data.append(v)
-            except _ThrowSignal:
-                # Try length-based
-                length = iterable.props.get('length', 0)
-                data = [iterable.props.get(str(i), undefined)
-                        for i in range(int(js_to_number(length)))]
+            if map_fn:
+                data = [_call_value(map_fn, this_arg, [v, i]) for i, v in enumerate(data)]
+            if a is not None and isinstance(a, JSObject):
+                for i, v in enumerate(data):
+                    _obj_set_property(a, str(i), v)
+                _obj_set_property(a, 'length', len(data))
+                return a
+            return make_array(data)
         else:
-            data = []
-        if map_fn:
-            data = [_call_value(map_fn, undefined, [v, i]) for i, v in enumerate(data)]
-        return make_array(data)
-    _def_method(obj, 'from', _make_native_fn('from', array_from))
+            # Array-like path
+            if isinstance(iterable, JSObject):
+                length_val = _obj_get_property(iterable, 'length')
+                length = int(js_to_number(length_val)) if length_val is not undefined else 0
+            else:
+                length = 0
+            if use_ctor:
+                a = interp._construct(this, [length])
+                if not isinstance(a, JSObject):
+                    a = make_array([undefined] * min(length, 1_000_000))
+            else:
+                a = make_array([undefined] * min(length, 1_000_000))
+            for i in range(length):
+                if isinstance(iterable, JSObject):
+                    v = _obj_get_property(iterable, str(i))
+                else:
+                    v = undefined
+                if map_fn:
+                    v = _call_value(map_fn, this_arg, [v, i])
+                _obj_set_property(a, str(i), v)
+            _obj_set_property(a, 'length', length)
+            return a
+    _def_method(obj, 'from', _make_native_fn('from', array_from, 1))
 
     def array_of(this, args):
+        if _is_callable(this) and this is not obj:
+            a = interp._construct(this, [len(args)])
+            if isinstance(a, JSObject):
+                for i, v in enumerate(args):
+                    _obj_set_property(a, str(i), v)
+                _obj_set_property(a, 'length', len(args))
+                return a
         return make_array(list(args))
-    _def_method(obj, 'of', _make_native_fn('of', array_of))
+    _def_method(obj, 'of', _make_native_fn('of', array_of, 0))
 
     return obj
 
@@ -1583,7 +1775,7 @@ def make_array_builtin(interp) -> JSObject:
 
 def make_function_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
-    obj.name = 'Function'
+    _setup_ctor_descriptors(obj, 'Function', 1)
 
     def func_call(this, args):
         # new Function(...params, body)
@@ -1645,52 +1837,22 @@ def make_function_builtin(interp) -> JSObject:
         proto.proto = obj_proto
 
     # Poison-pill accessors for 'caller' and 'arguments' on Function.prototype
-    # Strict functions: accessing these throws TypeError (spec 10.2.4 AddRestrictedFunctionProperties)
-    # Non-strict functions: .caller returns null, .arguments returns null
-    def _is_strict_fn(fn):
-        """Check if a JSFunction is strict mode."""
-        if fn.env is not None and fn.env._is_strict():
-            return True
-        body = fn.body
-        if (hasattr(body, 'body') and body.body and
-                type(body.body[0]).__name__ == 'ExpressionStatement' and
-                type(body.body[0].expression).__name__ == 'Literal' and
-                body.body[0].expression.value == 'use strict'):
-            return True
-        return False
-    def _caller_getter(this, args):
-        # Non-strict, non-bound, non-arrow user functions: return null
-        if (isinstance(this, JSFunction) and not this.is_arrow
-                and not getattr(this, '_bound_target', None)
-                and not _is_strict_fn(this)):
-            return None
-        raise _ThrowSignal(make_error('TypeError',
-            "'caller', 'arguments', and 'callee' are restricted function properties "
-            "and cannot be accessed in this context."))
-    def _args_getter(this, args):
-        if (isinstance(this, JSFunction) and not this.is_arrow
-                and not getattr(this, '_bound_target', None)
-                and not _is_strict_fn(this)):
-            return None
-        raise _ThrowSignal(make_error('TypeError',
-            "'caller', 'arguments', and 'callee' are restricted function properties "
-            "and cannot be accessed in this context."))
-    def _thrower(this, args):
-        raise _ThrowSignal(make_error('TypeError',
-            "'caller', 'arguments', and 'callee' are restricted function properties "
-            "and cannot be accessed in this context."))
-    _thrower_fn = _make_native_fn('ThrowTypeError', _thrower)
+    # Per spec (10.2.4 AddRestrictedFunctionProperties):
+    # Both use the same %ThrowTypeError% intrinsic from the realm.
+    _tte = interp._get_throw_type_error()
+    # Ensure TTE's [[Prototype]] is Function.prototype (may not be set yet in _PROTOS)
+    _tte.proto = proto
     if proto._descriptors is None:
         proto._descriptors = {}
     proto._descriptors['caller'] = {
-        'get': _make_native_fn('get caller', _caller_getter),
-        'set': _thrower_fn,
+        'get': _tte,
+        'set': _tte,
         'enumerable': False,
         'configurable': False,
     }
     proto._descriptors['arguments'] = {
-        'get': _make_native_fn('get arguments', _args_getter),
-        'set': _thrower_fn,
+        'get': _tte,
+        'set': _tte,
         'enumerable': False,
         'configurable': False,
     }
@@ -1705,7 +1867,7 @@ def make_function_builtin(interp) -> JSObject:
 
 def make_string_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
-    obj.name = 'String'
+    _setup_ctor_descriptors(obj, 'String', 1)
 
     def string_call(this, args):
         if not args:
@@ -1789,13 +1951,27 @@ def make_string_builtin(interp) -> JSObject:
 
     # Static
     def from_char_code(this, args):
-        return ''.join(chr(int(js_to_number(a))) for a in args)
-    _def_method(obj, 'fromCharCode', _make_native_fn('fromCharCode', from_char_code))
+        parts = []
+        for a in args:
+            n = js_to_number(a)
+            # ToUint16: handle NaN, Infinity, negative, etc.
+            if isinstance(n, float) and (math.isnan(n) or math.isinf(n)):
+                parts.append('\x00')
+            else:
+                parts.append(chr(int(n) & 0xFFFF))
+        return ''.join(parts)
+    _def_method(obj, 'fromCharCode', _make_native_fn('fromCharCode', from_char_code, 1))
 
     def from_code_point(this, args):
         parts = []
         for a in args:
-            n = int(js_to_number(a))
+            n = js_to_number(a)
+            # Must be an integer; NaN, Infinity, non-integer → RangeError
+            if isinstance(n, float):
+                if math.isnan(n) or math.isinf(n) or n != math.floor(n):
+                    raise _ThrowSignal(make_error('RangeError',
+                        f'Invalid code point {js_to_string(a)}'))
+                n = int(n)
             if n < 0 or n > 0x10FFFF:
                 raise _ThrowSignal(make_error('RangeError',
                     f'Invalid code point {n}'))
@@ -1807,7 +1983,7 @@ def make_string_builtin(interp) -> JSObject:
             else:
                 parts.append(chr(n))
         return ''.join(parts)
-    _def_method(obj, 'fromCodePoint', _make_native_fn('fromCodePoint', from_code_point))
+    _def_method(obj, 'fromCodePoint', _make_native_fn('fromCodePoint', from_code_point, 1))
 
     def raw(this, args):
         if not args:
@@ -1845,12 +2021,21 @@ def make_string_builtin(interp) -> JSObject:
 
 def make_number_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
-    obj.name = 'Number'
+    _setup_ctor_descriptors(obj, 'Number', 1)
 
     def number_call(this, args):
         if not args:
             return 0
-        return js_to_number(args[0])
+        v = args[0]
+        # Number(value) uses ToNumeric, then converts BigInt → Number
+        if isinstance(v, JSBigInt):
+            return float(v.value)
+        if isinstance(v, (JSObject, JSFunction)):
+            prim = js_to_primitive(v, 'number')
+            if isinstance(prim, JSBigInt):
+                return float(prim.value)
+            return js_to_number(prim)
+        return js_to_number(v)
     obj._call = number_call
 
     proto = JSObject(proto=_PROTOS.get('Object'))
@@ -1962,10 +2147,22 @@ def make_number_builtin(interp) -> JSObject:
         return js_to_number(js_to_string(args[0]))
     _def_method(obj, 'parseFloat', _make_native_fn('parseFloat', parse_float, 1))
 
+    # StrWhiteSpaceChar: tab, VT, FF, SP, NBSP, BOM, and USP (Unicode Space_Separator)
+    # U+180E is NOT a Space_Separator in Unicode 6.3+ (was removed)
+    _JS_WHITESPACE = ' \t\n\r\x0b\x0c\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff'
+
     def parse_int(this, args):
         if not args:
             return math.nan
-        s = js_to_string(args[0]).strip()
+        s = js_to_string(args[0])
+        # Strip only JS-spec whitespace
+        i_start = 0
+        while i_start < len(s) and s[i_start] in _JS_WHITESPACE:
+            i_start += 1
+        i_end = len(s)
+        while i_end > i_start and s[i_end - 1] in _JS_WHITESPACE:
+            i_end -= 1
+        s = s[i_start:i_end]
         radix = int(js_to_number(args[1])) if len(args) > 1 and args[1] is not undefined else 10
         if not s:
             return math.nan
@@ -1991,7 +2188,7 @@ def make_number_builtin(interp) -> JSObject:
 
 def make_boolean_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
-    obj.name = 'Boolean'
+    _setup_ctor_descriptors(obj, 'Boolean', 1)
     obj._call = lambda this, args: bool(js_is_truthy(args[0])) if args else False
 
     proto = JSObject(proto=_PROTOS.get('Object'))
@@ -2335,20 +2532,24 @@ def make_json_builtin(interp) -> JSObject:
             (isinstance(reviver, JSObject) and reviver._call is not None) or
             (callable(reviver) and reviver is not undefined and reviver is not null)
         )
+        # JSON spec only allows \x09 \x0a \x0d \x20 as whitespace, reject others
+        for ch in src:
+            if ch in '\xa0\u200b\u2028\u2029\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\ufeff':
+                raise _ThrowSignal(make_error('SyntaxError', 'JSON.parse: unexpected non-ASCII whitespace character'))
         try:
             py_obj = json.loads(src)
             result = python_to_js_val(py_obj)
         except json.JSONDecodeError as e:
             msg = f'JSON.parse: {e.msg}: line {e.lineno} column {e.colno} (char {e.pos})'
             err = make_error('SyntaxError', msg)
-            # Stack first line must contain :line:col so check_error_pos finds it
-            # QuickJS reports the col of the invalid char itself (e.g. after backslash for escape errors)
-            # Python reports the backslash position; add +1 to match QuickJS for escape errors
             colno = e.colno
             if e.pos < len(src) and src[e.pos] == '\\':
                 colno += 1
             err.props['stack'] = f'    at JSON.parse (<anonymous>:{e.lineno}:{colno})\nSyntaxError: {msg}'
             raise _ThrowSignal(err)
+        except Exception:
+            # PyPy may crash on exotic characters — treat as SyntaxError
+            raise _ThrowSignal(make_error('SyntaxError', 'JSON.parse: unexpected token'))
 
         if has_reviver:
             def _walk(holder, key):
@@ -2769,78 +2970,80 @@ def make_promise_builtin(interp) -> JSObject:
 
 def make_proxy_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
-    obj.name = 'Proxy'
+    _setup_ctor_descriptors(obj, 'Proxy', 2)
 
     def proxy_construct(this_val, args):
         if len(args) < 2:
             raise _ThrowSignal(make_error('TypeError', 'Proxy requires target and handler'))
         target = args[0]
         handler = args[1]
+        if not isinstance(target, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError',
+                'Cannot create proxy with a non-object as target'))
+        if not isinstance(handler, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError',
+                'Cannot create proxy with a non-object as handler'))
 
         proxy = JSObject(class_name='Proxy')
         proxy._proxy_target = target
         proxy._proxy_handler = handler
 
-        # Override property access to go through handler traps
-        # We implement a simple Proxy that supports get, set, has, ownKeys, getOwnPropertyDescriptor traps
-
-        def proxy_get(self_obj, key, ctx=None):
-            get_trap = _obj_get_property(handler, 'get') if isinstance(handler, JSObject) else undefined
-            if get_trap is not undefined and get_trap is not None:
-                return _call_value(get_trap, handler, [target, key, proxy])
-            return _obj_get_property(target, key) if isinstance(target, JSObject) else undefined
-
-        def proxy_set(self_obj, key, value):
-            set_trap = _obj_get_property(handler, 'set') if isinstance(handler, JSObject) else undefined
-            if set_trap is not undefined and set_trap is not None:
-                _call_value(set_trap, handler, [target, key, value, proxy])
-            elif isinstance(target, JSObject):
-                target.props[key] = value
-
-        # For for-in iteration
-        def get_own_keys():
-            ownKeys_trap = _obj_get_property(handler, 'ownKeys') if isinstance(handler, JSObject) else undefined
-            if ownKeys_trap is not undefined:
-                result = _call_value(ownKeys_trap, handler, [target])
-                if isinstance(result, JSObject) and result._is_array:
-                    return _array_to_list(result)
-            if isinstance(target, JSObject):
-                return [k for k in target.props.keys() if not k.startswith('@@')]
-            return []
-
-        def get_own_prop_desc(key):
-            desc_trap = _obj_get_property(handler, 'getOwnPropertyDescriptor') if isinstance(handler, JSObject) else undefined
-            if desc_trap is not undefined:
-                result = _call_value(desc_trap, handler, [target, key])
-                return result
-            if isinstance(target, JSObject) and key in target.props:
-                desc = JSObject()
-                desc.props['value'] = target.props[key]
-                desc.props['enumerable'] = True
-                desc.props['configurable'] = True
-                desc.props['writable'] = True
-                return desc
-            return undefined
-
-        proxy._proxy_get = proxy_get
-        proxy._proxy_set = proxy_set
-        proxy._proxy_ownKeys = get_own_keys
-        proxy._proxy_getOwnPropDesc = get_own_prop_desc
-
-        # Patch the proxy to support iteration via proxy_get for get trap
-        # The interpreter's _obj_get_property doesn't know about Proxy,
-        # so we save a reference to the handler get method
-        proxy.props['@@is_proxy'] = proxy  # marker
-
-        # Set the actual get/set to use traps
-        # We need to override the data storage: use a custom __getitem__ style...
-        # Simpler: populate props from target but intercept access
-        # For now, store enough info that the interpreter can use the traps
+        # Copy key attributes from target for correct behavior
+        if isinstance(target, (JSFunction, JSObject)):
+            if isinstance(target, JSFunction) or (isinstance(target, JSObject) and target._call is not None):
+                # Callable target → proxy should be callable
+                proxy._call = lambda this, a: _proxy_apply(proxy, this, a)
+            if isinstance(target, JSFunction) or (isinstance(target, JSObject) and (target._construct is not None or (isinstance(target, JSFunction)))):
+                if isinstance(target, JSFunction) or (isinstance(target, JSObject) and target._construct is not None):
+                    proxy._construct = lambda this, a: _proxy_construct_trap(proxy, this, a)
 
         return proxy
 
-    obj._call = proxy_construct
+    def _proxy_apply(proxy, this, args):
+        handler = proxy._proxy_handler
+        target = proxy._proxy_target
+        if handler is None:
+            raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'apply\' on a proxy that has been revoked'))
+        trap = _obj_get_property(handler, 'apply') if isinstance(handler, JSObject) else undefined
+        if trap is not undefined and trap is not null and trap is not None:
+            arg_array = make_array(args)
+            return _call_value(trap, handler, [target, this, arg_array])
+        # No trap — forward to target
+        return _call_value(target, this, args)
+
+    def _proxy_construct_trap(proxy, new_target, args):
+        handler = proxy._proxy_handler
+        target = proxy._proxy_target
+        if handler is None:
+            raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'construct\' on a proxy that has been revoked'))
+        trap = _obj_get_property(handler, 'construct') if isinstance(handler, JSObject) else undefined
+        if trap is not undefined and trap is not null and trap is not None:
+            arg_array = make_array(args)
+            result = _call_value(trap, handler, [target, arg_array, new_target if new_target is not None and new_target is not undefined else proxy])
+            if not isinstance(result, (JSObject, JSFunction)):
+                raise _ThrowSignal(make_error('TypeError',
+                    '\'construct\' on proxy: trap returned non-object'))
+            return result
+        # No trap — forward Construct(target, argumentsList, newTarget)
+        actual_new_target = new_target if new_target is not None and new_target is not undefined else proxy
+        return interp._construct(target, args, new_target=actual_new_target)
+
+    obj._call = lambda this_val, args: (_ for _ in ()).throw(
+        _ThrowSignal(make_error('TypeError', 'Constructor Proxy requires \'new\'')))
     obj._construct = proxy_construct
+
+    # Proxy.revocable(target, handler)
+    def proxy_revocable(this_val, args):
+        p = proxy_construct(undefined, args)
+        def revoke(this2, args2):
+            p._proxy_handler = None
+            p._proxy_target = None
+            return undefined
+        result = JSObject()
+        result.props['proxy'] = p
+        result.props['revoke'] = _make_native_fn('', revoke, 0)
+        return result
+    obj.props['revocable'] = _make_native_fn('revocable', proxy_revocable, 2)
 
     return obj
 
@@ -2864,7 +3067,7 @@ def make_reflect_builtin(interp) -> JSObject:
             raise _ThrowSignal(make_error('TypeError', 'Reflect.apply requires a function'))
         this_arg = args[1] if len(args) > 1 else undefined
         args_list = args[2] if len(args) > 2 else undefined
-        if args_list is undefined or args_list is null or not isinstance(args_list, JSObject):
+        if args_list is undefined or args_list is null or not isinstance(args_list, (JSObject, JSFunction)):
             raise _ThrowSignal(make_error('TypeError',
                 'Reflect.apply: args must be an array-like object'))
         fn_args = _array_to_list(args_list)
@@ -2875,8 +3078,8 @@ def make_reflect_builtin(interp) -> JSObject:
         if not args:
             raise _ThrowSignal(make_error('TypeError', 'Reflect.construct requires target'))
         ctor = args[0]
-        ctor_args = _array_to_list(args[1]) if len(args) > 1 and isinstance(args[1], JSObject) else []
-        if len(args) > 1 and not isinstance(args[1], JSObject):
+        ctor_args = _array_to_list(args[1]) if len(args) > 1 and isinstance(args[1], (JSObject, JSFunction)) else []
+        if len(args) > 1 and not isinstance(args[1], (JSObject, JSFunction)):
             raise _ThrowSignal(make_error('TypeError',
                 'Reflect.construct: args must be an array-like object'))
         # Third arg is newTarget; if provided, must be a constructor
@@ -2904,7 +3107,7 @@ def make_reflect_builtin(interp) -> JSObject:
         _require_object(target, 'get')
         key = _to_property_key(args[1]) if len(args) > 1 else 'undefined'
         receiver = args[2] if len(args) > 2 else target
-        return interp._get_property(target, key)
+        return _obj_get_property(target, key, receiver)
     _def_method(obj, 'get', _make_native_fn('get', reflect_get, 2))
 
     def reflect_set(this, args):
@@ -2914,7 +3117,10 @@ def make_reflect_builtin(interp) -> JSObject:
         _require_object(target, 'set')
         key = _to_property_key(args[1]) if len(args) > 1 else 'undefined'
         value = args[2] if len(args) > 2 else undefined
+        receiver = args[3] if len(args) > 3 else target
         try:
+            if _is_proxy(target):
+                return _proxy_set_trap(target, key, value, receiver)
             interp._set_property(target, key, value)
             return True
         except _ThrowSignal:
@@ -2950,6 +3156,8 @@ def make_reflect_builtin(interp) -> JSObject:
         desc_obj = args[2] if len(args) > 2 else undefined
         if desc_obj is not undefined and not isinstance(desc_obj, JSObject):
             raise _ThrowSignal(make_error('TypeError', 'descriptor must be an object'))
+        if isinstance(target, JSObject) and _is_proxy(target):
+            return _proxy_define_property_trap(target, key, desc_obj if isinstance(desc_obj, JSObject) else JSObject())
         desc = _js_to_descriptor(desc_obj) if isinstance(desc_obj, JSObject) else {}
         try:
             _obj_define_property(target, key, desc)
@@ -2965,6 +3173,11 @@ def make_reflect_builtin(interp) -> JSObject:
         _require_object(target, 'getOwnPropertyDescriptor')
         o = target
         key = _to_property_key(args[1]) if len(args) > 1 else 'undefined'
+        if isinstance(o, JSObject) and _is_proxy(o):
+            result = _proxy_get_own_prop_desc_trap(o, key)
+            if result is undefined or result is None:
+                return undefined
+            return result
         if isinstance(o, JSObject):
             if o._descriptors and key in o._descriptors:
                 return _descriptor_to_js(o._descriptors[key])
@@ -2986,6 +3199,9 @@ def make_reflect_builtin(interp) -> JSObject:
             raise _ThrowSignal(make_error('TypeError', 'Reflect.getPrototypeOf requires target'))
         _require_object(args[0], 'getPrototypeOf')
         a = args[0]
+        if isinstance(a, JSObject) and _is_proxy(a):
+            result = _proxy_get_prototype_trap(a)
+            return result if result is not None else null
         if isinstance(a, JSObject):
             return a.proto if a.proto else null
         # JSFunction
@@ -3003,6 +3219,8 @@ def make_reflect_builtin(interp) -> JSObject:
         proto = args[1] if len(args) > 1 else undefined
         if proto is not null and not isinstance(proto, (JSObject, JSFunction)):
             raise _ThrowSignal(make_error('TypeError', 'Object prototype may only be an Object or null'))
+        if isinstance(o, JSObject) and _is_proxy(o):
+            return _proxy_set_prototype_trap(o, proto if isinstance(proto, (JSObject, JSFunction)) else None)
         if isinstance(o, JSObject):
             if not o.extensible:
                 return False
@@ -3019,21 +3237,30 @@ def make_reflect_builtin(interp) -> JSObject:
         if not args:
             raise _ThrowSignal(make_error('TypeError', 'Reflect.ownKeys requires target'))
         _require_object(args[0], 'ownKeys')
-        return make_array(_get_own_property_names(args[0]))
+        target = args[0]
+        if isinstance(target, JSObject) and _is_proxy(target):
+            return make_array(_proxy_ownkeys_trap(target))
+        return make_array(_get_own_property_names(target))
     _def_method(obj, 'ownKeys', _make_native_fn('ownKeys', reflect_ownKeys, 1))
 
     def reflect_isExtensible(this, args):
         if not args:
             raise _ThrowSignal(make_error('TypeError', 'Reflect.isExtensible requires target'))
         _require_object(args[0], 'isExtensible')
-        return args[0].extensible
+        target = args[0]
+        if isinstance(target, JSObject) and _is_proxy(target):
+            return _proxy_is_extensible_trap(target)
+        return target.extensible
     _def_method(obj, 'isExtensible', _make_native_fn('isExtensible', reflect_isExtensible, 1))
 
     def reflect_preventExtensions(this, args):
         if not args:
             raise _ThrowSignal(make_error('TypeError', 'Reflect.preventExtensions requires target'))
         _require_object(args[0], 'preventExtensions')
-        args[0].extensible = False
+        target = args[0]
+        if isinstance(target, JSObject) and _is_proxy(target):
+            return _proxy_prevent_extensions_trap(target)
+        target.extensible = False
         return True
     _def_method(obj, 'preventExtensions', _make_native_fn('preventExtensions', reflect_preventExtensions, 1))
 
@@ -3045,7 +3272,7 @@ def make_reflect_builtin(interp) -> JSObject:
 def make_map_builtin(interp) -> JSObject:
 
     obj = JSObject(class_name='Function')
-    obj.name = 'Map'
+    _setup_ctor_descriptors(obj, 'Map', 0)
 
     proto = JSObject()
     _def_method(proto, 'constructor', obj)
@@ -3200,7 +3427,7 @@ def make_map_builtin(interp) -> JSObject:
 def make_set_builtin(interp) -> JSObject:
 
     obj = JSObject(class_name='Function')
-    obj.name = 'Set'
+    _setup_ctor_descriptors(obj, 'Set', 0)
 
     proto = JSObject()
     _def_method(proto, 'constructor', obj)
@@ -3332,7 +3559,7 @@ def _is_valid_weakmap_key(k):
 
 def make_weakmap_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
-    obj.name = 'WeakMap'
+    _setup_ctor_descriptors(obj, 'WeakMap', 0)
 
     proto = JSObject()
     _def_method(proto, 'constructor', obj)
@@ -3421,7 +3648,7 @@ def make_weakmap_builtin(interp) -> JSObject:
 
 def make_weakset_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
-    obj.name = 'WeakSet'
+    _setup_ctor_descriptors(obj, 'WeakSet', 0)
 
     proto = JSObject()
     _def_method(proto, 'constructor', obj)
@@ -3764,7 +3991,9 @@ def _make_date_object(ms_val, proto=None):
 
 
 def _date_get_ms(this):
-    return this._date_ms if hasattr(this, '_date_ms') else math.nan
+    if not isinstance(this, JSObject) or this._date_ms is None:
+        raise _ThrowSignal(make_error('TypeError', 'this is not a Date object'))
+    return this._date_ms
 
 
 def _setup_date_prototype(proto):
@@ -3847,34 +4076,46 @@ def _setup_date_prototype(proto):
     _def_method(proto, 'toJSON', _make_native_fn('toJSON', date_toJSON))
 
     # Local getters
+    def _make_date_getter(fn):
+        def getter(this, pargs):
+            ms = _date_get_ms(this)
+            if isinstance(ms, float) and math.isnan(ms):
+                return math.nan
+            try:
+                return fn(ms)
+            except (OSError, OverflowError, ValueError):
+                return math.nan
+        return getter
+
     for attr, fn in [
         ('getFullYear', lambda ms: _dt_mod.datetime.fromtimestamp(ms/1000).year),
         ('getMonth', lambda ms: _dt_mod.datetime.fromtimestamp(ms/1000).month - 1),
         ('getDate', lambda ms: _dt_mod.datetime.fromtimestamp(ms/1000).day),
-        ('getDay', lambda ms: _dt_mod.datetime.fromtimestamp(ms/1000).weekday()),
+        ('getDay', lambda ms: (_dt_mod.datetime.fromtimestamp(ms/1000).weekday() + 1) % 7),
         ('getHours', lambda ms: _dt_mod.datetime.fromtimestamp(ms/1000).hour),
         ('getMinutes', lambda ms: _dt_mod.datetime.fromtimestamp(ms/1000).minute),
         ('getSeconds', lambda ms: _dt_mod.datetime.fromtimestamp(ms/1000).second),
         ('getMilliseconds', lambda ms: int(ms % 1000) if ms >= 0 else int(ms % 1000 + 1000) % 1000),
     ]:
-        _fn = fn
-        _def_method(proto, attr, _make_native_fn(attr, lambda this, pargs, f=_fn: f(_date_get_ms(this))))
+        _def_method(proto, attr, _make_native_fn(attr, _make_date_getter(fn)))
 
     # UTC getters
     for attr, fn in [
         ('getUTCFullYear', lambda ms: _dt_mod.datetime.utcfromtimestamp(ms/1000).year),
         ('getUTCMonth', lambda ms: _dt_mod.datetime.utcfromtimestamp(ms/1000).month - 1),
         ('getUTCDate', lambda ms: _dt_mod.datetime.utcfromtimestamp(ms/1000).day),
-        ('getUTCDay', lambda ms: _dt_mod.datetime.utcfromtimestamp(ms/1000).weekday()),
+        ('getUTCDay', lambda ms: (_dt_mod.datetime.utcfromtimestamp(ms/1000).weekday() + 1) % 7),
         ('getUTCHours', lambda ms: _dt_mod.datetime.utcfromtimestamp(ms/1000).hour),
         ('getUTCMinutes', lambda ms: _dt_mod.datetime.utcfromtimestamp(ms/1000).minute),
         ('getUTCSeconds', lambda ms: _dt_mod.datetime.utcfromtimestamp(ms/1000).second),
         ('getUTCMilliseconds', lambda ms: int(ms % 1000) if ms >= 0 else int(ms % 1000 + 1000) % 1000),
     ]:
-        _fn = fn
-        _def_method(proto, attr, _make_native_fn(attr, lambda this, pargs, f=_fn: f(_date_get_ms(this))))
+        _def_method(proto, attr, _make_native_fn(attr, _make_date_getter(fn)))
 
     def date_getTimezoneOffset(this, pargs):
+        ms = _date_get_ms(this)
+        if isinstance(ms, float) and math.isnan(ms):
+            return math.nan
         import time as _time_mod
         return -(_time_mod.timezone // 60)
     _def_method(proto, 'getTimezoneOffset', _make_native_fn('getTimezoneOffset', date_getTimezoneOffset))
@@ -4029,7 +4270,7 @@ def _setup_date_prototype(proto):
 
 def make_date_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
-    obj.name = 'Date'
+    _setup_ctor_descriptors(obj, 'Date', 7)
 
     def date_construct(this_val, args):
         if not args:
@@ -4055,8 +4296,10 @@ def make_date_builtin(interp) -> JSObject:
         ss = int(nums[5]) if len(nums) > 5 else 0
         ms_f = int(nums[6]) if len(nums) > 6 else 0
         try:
+            if 0 <= year <= 99:
+                year += 1900  # JS spec: 2-digit year -> 1900+year
             dt = _dt_mod.datetime(year, mo + 1, day, hh, mm, ss)
-            utc_ms = _cal_mod.timegm(dt.timetuple()) * 1000 + ms_f
+            utc_ms = time.mktime(dt.timetuple()) * 1000 + ms_f
             return _make_date_object(float(utc_ms))
         except Exception:
             return _make_date_object(math.nan)
@@ -4081,7 +4324,7 @@ def make_date_builtin(interp) -> JSObject:
         if not args:
             return math.nan
         return _parse_date_string(js_to_string(args[0]))
-    _def_method(obj, 'parse', _make_native_fn('parse', _date_parse))
+    _def_method(obj, 'parse', _make_native_fn('parse', _date_parse, 1))
 
     # Static Date.UTC(year, month[, day, hrs, min, sec, ms])
     def _date_utc(this, args):
@@ -4105,7 +4348,7 @@ def make_date_builtin(interp) -> JSObject:
 
 def make_regexp_builtin(interp) -> JSObject:
     obj = JSObject(class_name='Function')
-    obj.name = 'RegExp'
+    _setup_ctor_descriptors(obj, 'RegExp', 2)
 
     def regexp_construct(this_val, args):
         if not args:
@@ -4528,7 +4771,223 @@ def build_global_env(interp) -> Environment:
         'value': _is_error_fn, 'writable': True, 'enumerable': False, 'configurable': True
     }
 
-    # TypedArrays (stubs)
+    # %TypedArray% intrinsic — abstract base for all typed array constructors
+    _ta_base = JSObject(class_name='Function', proto=_fn_proto)
+    _ta_base.name = 'TypedArray'
+    _ta_base.length = 0
+    _ta_base._descriptors = {
+        'name': {'value': 'TypedArray', 'writable': False, 'enumerable': False, 'configurable': True},
+        'length': {'value': 0, 'writable': False, 'enumerable': False, 'configurable': True},
+    }
+    def _ta_base_call(this, args):
+        raise _ThrowSignal(make_error('TypeError', 'Abstract class TypedArray not directly constructable'))
+    _ta_base._call = _ta_base_call
+    _ta_base._construct = _ta_base_call
+
+    # %TypedArray%.prototype
+    _ta_base_proto = JSObject(class_name='Object', proto=_PROTOS.get('Object'))
+    _PROTOS['TypedArray'] = _ta_base_proto
+    _ta_base.props['prototype'] = _ta_base_proto
+    if _ta_base._descriptors is None:
+        _ta_base._descriptors = {}
+    _ta_base._descriptors['prototype'] = {'value': _ta_base_proto, 'writable': False, 'enumerable': False, 'configurable': False}
+    _ta_base_proto.props['constructor'] = _ta_base
+    if _ta_base_proto._descriptors is None:
+        _ta_base_proto._descriptors = {}
+    _ta_base_proto._descriptors['constructor'] = {'value': _ta_base, 'writable': True, 'enumerable': False, 'configurable': True}
+
+    # %TypedArray%.prototype.at(index)
+    def _ta_proto_at(this, args):
+        if not isinstance(this, JSObject) or '@@ta_type' not in this.props:
+            raise _ThrowSignal(make_error('TypeError', 'not a TypedArray'))
+        n = this.props.get('@@ta_length', this.props.get('length', 0))
+        idx = js_to_integer(args[0]) if args else 0
+        if idx < 0:
+            idx = n + idx
+        if idx < 0 or idx >= n:
+            return undefined
+        # Read from buffer
+        buf = this.props.get('@@ab_buf')
+        if buf is not None:
+            import struct as _st
+            _TA_INFO = {
+                'Int8Array': (1, 'b', False), 'Uint8Array': (1, 'B', False), 'Uint8ClampedArray': (1, 'B', False),
+                'Int16Array': (2, 'h', False), 'Uint16Array': (2, 'H', False),
+                'Int32Array': (4, 'i', False), 'Uint32Array': (4, 'I', False),
+                'Float16Array': (2, 'e', True), 'Float32Array': (4, 'f', True), 'Float64Array': (8, 'd', True),
+                'BigInt64Array': (8, 'q', False), 'BigUint64Array': (8, 'Q', False),
+            }
+            ta_type = this.props.get('@@ta_type', '')
+            info = _TA_INFO.get(ta_type)
+            if info:
+                bpe_at, fmt_at, is_float_at = info
+                byte_offset = this.props.get('@@byte_offset', 0)
+                ab_data = getattr(buf, '_ab_data', None)
+                if ab_data is not None:
+                    offset = byte_offset + idx * bpe_at
+                    if offset + bpe_at <= len(ab_data):
+                        val = _st.unpack_from('<' + fmt_at, ab_data, offset)[0]
+                        if ta_type.startswith('Big'):
+                            return JSBigInt(val)
+                        return float(val) if is_float_at else val
+        return undefined
+    _def_method(_ta_base_proto, 'at', _make_native_fn('at', _ta_proto_at, 1))
+
+    # %TypedArray%.prototype.buffer (accessor)
+    def _ta_proto_buffer_get(this, args):
+        if not isinstance(this, JSObject) or '@@ta_type' not in this.props:
+            raise _ThrowSignal(make_error('TypeError', 'not a TypedArray'))
+        return this.props.get('@@ab_buf', undefined)
+    _buffer_getter = _make_native_fn('get buffer', _ta_proto_buffer_get, 0)
+    _ta_base_proto._descriptors['buffer'] = {
+        'get': _buffer_getter, 'set': undefined, 'enumerable': False, 'configurable': True
+    }
+
+    # %TypedArray%.prototype.byteLength (accessor)
+    def _ta_proto_byteLength_get(this, args):
+        if not isinstance(this, JSObject) or '@@ta_type' not in this.props:
+            raise _ThrowSignal(make_error('TypeError', 'not a TypedArray'))
+        return this.props.get('byteLength', 0)
+    _byteLength_getter = _make_native_fn('get byteLength', _ta_proto_byteLength_get, 0)
+    _ta_base_proto._descriptors['byteLength'] = {
+        'get': _byteLength_getter, 'set': undefined, 'enumerable': False, 'configurable': True
+    }
+
+    # %TypedArray%.prototype.byteOffset (accessor)
+    def _ta_proto_byteOffset_get(this, args):
+        if not isinstance(this, JSObject) or '@@ta_type' not in this.props:
+            raise _ThrowSignal(make_error('TypeError', 'not a TypedArray'))
+        return this.props.get('byteOffset', 0)
+    _byteOffset_getter = _make_native_fn('get byteOffset', _ta_proto_byteOffset_get, 0)
+    _ta_base_proto._descriptors['byteOffset'] = {
+        'get': _byteOffset_getter, 'set': undefined, 'enumerable': False, 'configurable': True
+    }
+
+    # %TypedArray%.prototype.length (accessor)
+    def _ta_proto_length_get(this, args):
+        if not isinstance(this, JSObject) or '@@ta_type' not in this.props:
+            raise _ThrowSignal(make_error('TypeError', 'not a TypedArray'))
+        return this.props.get('@@ta_length', this.props.get('length', 0))
+    _length_getter = _make_native_fn('get length', _ta_proto_length_get, 0)
+    _ta_base_proto._descriptors['length'] = {
+        'get': _length_getter, 'set': undefined, 'enumerable': False, 'configurable': True
+    }
+
+    # %TypedArray%.prototype[@@toStringTag] (accessor)
+    def _ta_proto_toStringTag_get(this, args):
+        if not isinstance(this, JSObject) or '@@ta_type' not in this.props:
+            return undefined
+        return this.props.get('@@ta_type', undefined)
+    _toStringTag_getter = _make_native_fn('get [Symbol.toStringTag]', _ta_proto_toStringTag_get, 0)
+    _ta_base_proto._descriptors['@@toStringTag'] = {
+        'get': _toStringTag_getter, 'set': undefined, 'enumerable': False, 'configurable': True
+    }
+
+    # %TypedArray%.from(source[, mapfn[, thisArg]])
+    def _ta_from(this, args):
+        source = args[0] if args else undefined
+        mapfn = args[1] if len(args) > 1 else undefined
+        this_arg = args[2] if len(args) > 2 else undefined
+        _mapfn_callable = (isinstance(mapfn, JSFunction) or (isinstance(mapfn, JSObject) and mapfn._call is not None))
+        if mapfn is not undefined and not _mapfn_callable:
+            raise _ThrowSignal(make_error('TypeError', 'mapfn is not a function'))
+        # Try iterator protocol first
+        items = []
+        if isinstance(source, (JSObject, JSFunction)):
+            iter_method = _obj_get_property(source, '@@iterator')
+            _iter_callable = (isinstance(iter_method, JSFunction) or
+                             (isinstance(iter_method, JSObject) and iter_method._call is not None))
+            if iter_method is not None and iter_method is not undefined and _iter_callable:
+                # Use iterator protocol
+                iter_obj = _invoke_callable(iter_method, source, [])
+                next_fn = _obj_get_property(iter_obj, 'next') if isinstance(iter_obj, (JSObject, JSFunction)) else None
+                _next_callable = (isinstance(next_fn, JSFunction) or
+                                 (isinstance(next_fn, JSObject) and next_fn._call is not None))
+                if next_fn is not None and _next_callable:
+                    while True:
+                        result = _invoke_callable(next_fn, iter_obj, [])
+                        if isinstance(result, (JSObject, JSFunction)):
+                            done = _obj_get_property(result, 'done')
+                            if done is True or (isinstance(done, bool) and done):
+                                break
+                            val = _obj_get_property(result, 'value')
+                            if val is None:
+                                val = undefined
+                            items.append(val)
+                        else:
+                            break
+            else:
+                # Array-like fallback
+                length_val = _obj_get_property(source, 'length')
+                length = int(js_to_number(length_val)) if length_val is not None and length_val is not undefined else 0
+                for i in range(length):
+                    v = _obj_get_property(source, str(i))
+                    if v is None:
+                        v = undefined
+                    items.append(v)
+        # Apply mapfn
+        if _mapfn_callable:
+            items = [_invoke_callable(mapfn, this_arg, [v, i]) for i, v in enumerate(items)]
+        # Construct new typed array — IsConstructor(C) check
+        _is_ctor = False
+        if isinstance(this, JSFunction):
+            # JSFunction is a constructor unless it's an arrow, generator, async, or method
+            _is_ctor = (not this.is_arrow and not this.is_generator and not this.is_async
+                        and this.home_obj is None and this.interp is not None)
+        elif isinstance(this, JSObject) and this._construct is not None:
+            _is_ctor = True
+        if not _is_ctor:
+            raise _ThrowSignal(make_error('TypeError', 'this is not a constructor'))
+        if isinstance(this, JSFunction):
+            result = this.interp._construct(this, [len(items)])
+        else:
+            result = this._construct(this, [len(items)])
+        if isinstance(result, JSObject) and result.props.get('@@ta_type'):
+            for i, v in enumerate(items):
+                _typed_array_set(result, i, v)
+        else:
+            for i, v in enumerate(items):
+                _obj_set_property(result, str(i), v)
+        return result
+    _ta_from_fn = _make_native_fn('from', _ta_from, 1)
+    _ta_base.props['from'] = _ta_from_fn
+    _ta_base._descriptors['from'] = {'value': _ta_from_fn, 'writable': True, 'enumerable': False, 'configurable': True}
+    if _ta_base._non_enum is None:
+        _ta_base._non_enum = set()
+    _ta_base._non_enum.add('from')
+
+    # %TypedArray%.of(...items)
+    def _ta_of(this, args):
+        items = args
+        _is_ctor = False
+        if isinstance(this, JSFunction):
+            _is_ctor = (not this.is_arrow and not this.is_generator and not this.is_async
+                        and this.home_obj is None and this.interp is not None)
+        elif isinstance(this, JSObject) and this._construct is not None:
+            _is_ctor = True
+        if not _is_ctor:
+            raise _ThrowSignal(make_error('TypeError', 'this is not a constructor'))
+        if isinstance(this, JSFunction):
+            result = this.interp._construct(this, [len(items)])
+        else:
+            result = this._construct(this, [len(items)])
+        if isinstance(result, JSObject) and result.props.get('@@ta_type'):
+            for i, v in enumerate(items):
+                _typed_array_set(result, i, v)
+        else:
+            for i, v in enumerate(items):
+                _obj_set_property(result, str(i), v)
+        return result
+    _ta_of_fn = _make_native_fn('of', _ta_of, 0)
+    _ta_base.props['of'] = _ta_of_fn
+    _ta_base._descriptors['of'] = {'value': _ta_of_fn, 'writable': True, 'enumerable': False, 'configurable': True}
+    _ta_base._non_enum.add('of')
+
+    # Make %TypedArray% available as TypedArray (not usually global, but intrinsic)
+    env._bindings['TypedArray'] = _ta_base
+    _PROTOS['@@TypedArrayCtor'] = _ta_base
+
+    # TypedArrays
     for ta_name in ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array',
                     'Uint16Array', 'Int32Array', 'Uint32Array', 'Float16Array',
                     'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array']:
@@ -4571,6 +5030,55 @@ def build_global_env(interp) -> Environment:
             if isinstance(_c, JSObject) and _c.proto is None:
                 _c.proto = _fn_proto
 
+    # Set %GeneratorFunction.prototype%.[[Prototype]] = Function.prototype
+    if _fn_proto is not None:
+        _GENERATOR_FUNCTION_PROTO.proto = _fn_proto
+
+    # Create the %GeneratorFunction% constructor (callable, creates generator functions from strings)
+    def _gen_func_call(this, args):
+        if not args:
+            body_src = ''
+            param_names = []
+        else:
+            body_src = js_to_string(args[-1])
+            param_names = [js_to_string(a) for a in args[:-1]]
+        from pyquickjs.parser import Parser
+        params_str = ', '.join(param_names)
+        src = f'(function* anonymous({params_str}) {{\n{body_src}\n}})'
+        try:
+            parser = Parser(interp._ctx, src, '<anonymous>')
+            ast = parser.parse_program()
+            fn_expr = ast.body[0].expression if ast.body else None
+            if fn_expr:
+                return interp.eval(fn_expr, interp.global_env)
+        except Exception as e:
+            raise _ThrowSignal(make_error('SyntaxError', str(e)))
+        return undefined
+
+    _gen_func_ctor = JSObject(class_name='Function')
+    _gen_func_ctor.props['length'] = 1
+    _gen_func_ctor.props['name'] = 'GeneratorFunction'
+    _gen_func_ctor.props['prototype'] = _GENERATOR_FUNCTION_PROTO
+    _obj_define_property(_gen_func_ctor, 'prototype', {
+        'value': _GENERATOR_FUNCTION_PROTO, 'writable': False, 'enumerable': False, 'configurable': False,
+    })
+    _obj_define_property(_gen_func_ctor, 'length', {
+        'value': 1, 'writable': False, 'enumerable': False, 'configurable': True,
+    })
+    _obj_define_property(_gen_func_ctor, 'name', {
+        'value': 'GeneratorFunction', 'writable': False, 'enumerable': False, 'configurable': True,
+    })
+    _gen_func_ctor._call = _gen_func_call
+    _gen_func_ctor._construct = _gen_func_call
+    if _fn_proto is not None:
+        _gen_func_ctor.proto = _fn_proto
+
+    # Update constructor link on prototype
+    _GENERATOR_FUNCTION_PROTO.props['constructor'] = _gen_func_ctor
+    _obj_define_property(_GENERATOR_FUNCTION_PROTO, 'constructor', {
+        'value': _gen_func_ctor, 'writable': False, 'enumerable': False, 'configurable': True,
+    })
+
     # Comprehensive pass: set Function.prototype on ALL native function objects
     # that were created before Function.prototype was registered.
     if _fn_proto is not None:
@@ -4599,33 +5107,203 @@ def build_global_env(interp) -> Environment:
                     _proto.proto = _obj_proto
 
     # BigInt
+    def _bigint_from_string(s_raw):
+        """Parse a string to BigInt, spec-compliant."""
+        s = s_raw.strip()
+        if s == '':
+            return JSBigInt(0)
+        # Reject negative hex/octal/binary (spec does not allow)
+        if len(s) > 1 and s[0] == '-' and len(s) > 2 and s[1] == '0' and s[2] in 'xXoObB':
+            raise _ThrowSignal(make_error('SyntaxError', f'Cannot convert {s_raw!r} to BigInt'))
+        # Reject strings with decimal points or exponents (but not hex digits)
+        if '.' in s:
+            raise _ThrowSignal(make_error('SyntaxError', f'Cannot convert {s_raw!r} to BigInt'))
+        _is_hex = (len(s) >= 2 and s[0] == '0' and s[1] in 'xX') or (len(s) >= 3 and s[0] == '-' and s[1] == '0' and s[2] in 'xX')
+        if not _is_hex and ('e' in s.lower() or 'E' in s):
+            raise _ThrowSignal(make_error('SyntaxError', f'Cannot convert {s_raw!r} to BigInt'))
+        try:
+            return JSBigInt(int(s, 0))
+        except ValueError:
+            raise _ThrowSignal(make_error('SyntaxError', f'Cannot convert {s_raw!r} to BigInt'))
+
     def bigint_fn(this, args):
         if not args:
             raise _ThrowSignal(make_error('TypeError', 'BigInt requires argument'))
         v = args[0]
+        # ToPrimitive for objects first
+        if isinstance(v, (JSObject, JSFunction)):
+            v = js_to_primitive(v, 'number')
         if isinstance(v, JSBigInt):
             return v
-        if isinstance(v, int) and not isinstance(v, bool):
+        if isinstance(v, bool):
+            return JSBigInt(1 if v else 0)
+        if isinstance(v, int):
             return JSBigInt(v)
         if isinstance(v, float):
-            if math.isnan(v) or math.isinf(v):
-                raise _ThrowSignal(make_error('RangeError', 'Cannot convert to BigInt'))
+            if math.isnan(v) or math.isinf(v) or v != math.trunc(v):
+                raise _ThrowSignal(make_error('RangeError',
+                    f'The number {v} cannot be converted to a BigInt because it is not an integer'))
             return JSBigInt(int(v))
+        if isinstance(v, str):
+            return _bigint_from_string(v)
+        if isinstance(v, JSSymbol):
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert a Symbol value to a BigInt'))
+        raise _ThrowSignal(make_error('TypeError', f'Cannot convert {js_typeof(v)} to BigInt'))
+    env._bindings['BigInt'] = _make_native_fn('BigInt', bigint_fn, 1)
+    bigint_ctor = env._bindings['BigInt']
+    # BigInt is a constructor (has [[Construct]]) but throws TypeError when called with new
+    def bigint_construct(this, args):
+        raise _ThrowSignal(make_error('TypeError', 'BigInt is not a constructor'))
+    bigint_ctor._construct = bigint_construct
+
+    # BigInt.asIntN and BigInt.asUintN
+
+    def _to_bigint(v):
+        """ToBigInt abstract operation."""
+        if isinstance(v, JSBigInt):
+            return v.value
+        if isinstance(v, bool):
+            return 1 if v else 0
         if isinstance(v, str):
             s = v.strip()
             if s == '':
-                return JSBigInt(0)
-            # Handle numeric literal prefixes (0x, 0o, 0b) and plain integers
+                return 0
+            # Reject negative hex/octal/binary
+            if len(s) > 2 and s[0] == '-' and s[1] == '0' and s[2] in 'xXoObB':
+                raise _ThrowSignal(make_error('SyntaxError', f'Cannot convert {v!r} to BigInt'))
+            if '.' in s:
+                raise _ThrowSignal(make_error('SyntaxError', f'Cannot convert {v!r} to BigInt'))
+            _is_hex = (len(s) >= 2 and s[0] == '0' and s[1] in 'xX')
+            if not _is_hex and ('e' in s.lower() or 'E' in s):
+                raise _ThrowSignal(make_error('SyntaxError', f'Cannot convert {v!r} to BigInt'))
             try:
-                # Use base 0 to handle 0x/0o/0b prefixes
-                return JSBigInt(int(s, 0))
+                return int(s, 0)
             except ValueError:
-                raise _ThrowSignal(make_error('SyntaxError',
-                    f'Cannot convert {v!r} to BigInt'))
-        if isinstance(v, bool):
-            return JSBigInt(1 if v else 0)
-        raise _ThrowSignal(make_error('TypeError', f'Cannot convert {js_typeof(v)} to BigInt'))
-    env._bindings['BigInt'] = _make_native_fn('BigInt', bigint_fn)
+                raise _ThrowSignal(make_error('SyntaxError', f'Cannot convert {v!r} to BigInt'))
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert a Number to a BigInt'))
+        if v is undefined:
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert undefined to a BigInt'))
+        if v is null:
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert null to a BigInt'))
+        if isinstance(v, JSSymbol):
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert a Symbol to a BigInt'))
+        # Object → ToPrimitive then recurse
+        if isinstance(v, (JSObject, JSFunction)):
+            prim = js_to_primitive(v, 'number')
+            return _to_bigint(prim)
+        raise _ThrowSignal(make_error('TypeError', f'Cannot convert {js_typeof(v)} to a BigInt'))
+
+    def _to_index(v):
+        """ToIndex abstract operation."""
+        if v is undefined:
+            return 0
+        n = js_to_number(v)
+        if isinstance(n, JSBigInt):
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert a BigInt value to a number'))
+        if isinstance(n, float):
+            if math.isnan(n):
+                return 0
+            if math.isinf(n):
+                raise _ThrowSignal(make_error('RangeError', 'Invalid index'))
+            idx = int(n)
+        else:
+            idx = n
+        if idx < 0 or idx > 2**53 - 1:
+            raise _ThrowSignal(make_error('RangeError', 'Invalid index'))
+        return idx
+
+    def bigint_asIntN(this, args):
+        bits_arg = args[0] if args else undefined
+        bigint_arg = args[1] if len(args) > 1 else undefined
+        bits = _to_index(bits_arg)
+        n = _to_bigint(bigint_arg)
+        if bits == 0:
+            return JSBigInt(0)
+        mod = n % (1 << bits)
+        if mod >= (1 << (bits - 1)):
+            mod -= (1 << bits)
+        return JSBigInt(mod)
+
+    def bigint_asUintN(this, args):
+        bits_arg = args[0] if args else undefined
+        bigint_arg = args[1] if len(args) > 1 else undefined
+        bits = _to_index(bits_arg)
+        n = _to_bigint(bigint_arg)
+        if bits == 0:
+            return JSBigInt(0)
+        return JSBigInt(n % (1 << bits))
+
+    _asIntN_fn = _make_native_fn('asIntN', bigint_asIntN, 2)
+    _asUintN_fn = _make_native_fn('asUintN', bigint_asUintN, 2)
+    bigint_ctor.props['asIntN'] = _asIntN_fn
+    bigint_ctor.props['asUintN'] = _asUintN_fn
+    if bigint_ctor._descriptors is None:
+        bigint_ctor._descriptors = {}
+    bigint_ctor._descriptors['asIntN'] = {'value': _asIntN_fn, 'writable': True, 'enumerable': False, 'configurable': True}
+    bigint_ctor._descriptors['asUintN'] = {'value': _asUintN_fn, 'writable': True, 'enumerable': False, 'configurable': True}
+    if bigint_ctor._non_enum is None:
+        bigint_ctor._non_enum = set()
+    bigint_ctor._non_enum.add('asIntN')
+    bigint_ctor._non_enum.add('asUintN')
+
+    # BigInt.prototype
+    bigint_proto = JSObject(class_name='BigInt', proto=_PROTOS.get('Object'))
+    _PROTOS['BigInt'] = bigint_proto
+    # Link BigInt.prototype to BigInt constructor
+    bigint_ctor.props['prototype'] = bigint_proto
+    bigint_ctor._descriptors['prototype'] = {'value': bigint_proto, 'writable': False, 'enumerable': False, 'configurable': False}
+
+    def bigint_proto_valueOf(this, args):
+        if isinstance(this, JSBigInt):
+            return this
+        if isinstance(this, JSObject) and '@@bigintData' in this.props:
+            return this.props['@@bigintData']
+        raise _ThrowSignal(make_error('TypeError', 'BigInt.prototype.valueOf requires a BigInt'))
+    _valueOf_fn = _make_native_fn('valueOf', bigint_proto_valueOf, 0)
+    _def_method(bigint_proto, 'valueOf', _valueOf_fn)
+    if bigint_proto._descriptors is None:
+        bigint_proto._descriptors = {}
+    bigint_proto._descriptors['valueOf'] = {'value': _valueOf_fn, 'writable': True, 'enumerable': False, 'configurable': True}
+
+    def bigint_proto_toString(this, args):
+        val = None
+        if isinstance(this, JSBigInt):
+            val = this.value
+        elif isinstance(this, JSObject) and '@@bigintData' in this.props:
+            val = this.props['@@bigintData'].value
+        else:
+            raise _ThrowSignal(make_error('TypeError', 'BigInt.prototype.toString requires a BigInt'))
+        radix = 10
+        if args and args[0] is not undefined:
+            radix = int(js_to_number(args[0]))
+            if radix < 2 or radix > 36:
+                raise _ThrowSignal(make_error('RangeError', 'toString() radix must be between 2 and 36'))
+        if radix == 10:
+            return str(val)
+        # Convert to string in given radix
+        if val < 0:
+            return '-' + _int_to_radix(abs(val), radix)
+        return _int_to_radix(val, radix)
+    _toString_fn = _make_native_fn('toString', bigint_proto_toString, 0)
+    _def_method(bigint_proto, 'toString', _toString_fn)
+    bigint_proto._descriptors['toString'] = {'value': _toString_fn, 'writable': True, 'enumerable': False, 'configurable': True}
+
+    def bigint_proto_toLocaleString(this, args):
+        return bigint_proto_toString(this, [])
+    _toLocaleStr_fn = _make_native_fn('toLocaleString', bigint_proto_toLocaleString, 0)
+    _def_method(bigint_proto, 'toLocaleString', _toLocaleStr_fn)
+    bigint_proto._descriptors['toLocaleString'] = {'value': _toLocaleStr_fn, 'writable': True, 'enumerable': False, 'configurable': True}
+
+    bigint_proto.props['constructor'] = bigint_ctor
+    bigint_proto._descriptors['constructor'] = {'value': bigint_ctor, 'writable': True, 'enumerable': False, 'configurable': True}
+    bigint_proto.props['@@toStringTag'] = 'BigInt'
+    if bigint_proto._non_enum is None:
+        bigint_proto._non_enum = set()
+    bigint_proto._non_enum.add('@@toStringTag')
+    _obj_define_property(bigint_proto, '@@toStringTag', {
+        'value': 'BigInt', 'writable': False, 'enumerable': False, 'configurable': True
+    })
 
     # globalThis
     global_obj = JSObject(class_name='global', proto=_PROTOS.get('Object'))
@@ -4671,10 +5349,20 @@ def build_global_env(interp) -> Environment:
     return env
 
 
+_JS_TRIM_CHARS = ' \t\n\r\x0b\x0c\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff'
+
 def _do_parseInt(args):
     if not args:
         return math.nan
-    s = js_to_string(args[0]).strip()
+    s = js_to_string(args[0])
+    # Strip only JS-spec whitespace (U+180E is NOT whitespace)
+    _i0 = 0
+    while _i0 < len(s) and s[_i0] in _JS_TRIM_CHARS:
+        _i0 += 1
+    _i1 = len(s)
+    while _i1 > _i0 and s[_i1 - 1] in _JS_TRIM_CHARS:
+        _i1 -= 1
+    s = s[_i0:_i1]
     # Per spec, radix is converted via ToInt32 (handles NaN→0, Infinity→0, modulo 2^32)
     if len(args) > 1 and args[1] is not undefined:
         radix = js_to_int32(args[1])
@@ -4925,11 +5613,120 @@ def _make_typed_array_builtin(name: str) -> JSObject:  # noqa: C901
         n = _ta_length(arr)
         return [_ta_get(arr, i) for i in range(n)]
 
+    # Create prototype first so ta_construct and methods can reference it
+    ta_proto_parent = _PROTOS.get('TypedArray') or _PROTOS.get('Object')
+    proto = JSObject(class_name=name, proto=ta_proto_parent)
+    _PROTOS[name] = proto
+
+    # ---- Prototype methods ----
+    def ta_join(this2, args2):
+        sep = js_to_string(args2[0]) if args2 else ','
+        n = _ta_length(this2)
+        parts = []
+        for i in range(n):
+            v = _ta_get(this2, i)
+            if v is undefined or v is null:
+                parts.append('')
+            else:
+                parts.append(js_to_string(v))
+        return sep.join(parts)
+
+    def ta_tostring(this2, args2):
+        return ta_join(this2, [','])
+
+    def ta_set(this2, args2):
+        src = args2[0] if args2 else undefined
+        offset = int(js_to_number(args2[1])) if len(args2) > 1 else 0
+        if isinstance(src, (list, JSObject)):
+            items = _array_to_list(src) if isinstance(src, JSObject) else src
+        else:
+            items = []
+        for i, v in enumerate(items):
+            if is_clamped:
+                c = _coerce_clamped(v)
+            else:
+                c = _coerce(v)
+            _ta_set_coerced(this2, offset + i, c)
+        return undefined
+
+    def _ta_set_coerced(arr2, idx, coerced_val):
+        buf2 = arr2.props.get('@@ab_buf')
+        if buf2 is None:
+            return
+        ab_data2 = getattr(buf2, '_ab_data', None)
+        if ab_data2 is None:
+            return
+        length2 = arr2.props.get('@@ta_length', 0)
+        if idx < 0 or idx >= length2:
+            return
+        byte_offset2 = arr2.props.get('@@byte_offset', 0)
+        offset2 = byte_offset2 + idx * bpe
+        _struct.pack_into('<' + fmt, ab_data2, offset2, coerced_val)
+
+    def ta_fill(this2, args2):
+        val = args2[0] if args2 else 0
+        n = _ta_length(this2)
+        start = int(js_to_number(args2[1])) if len(args2) > 1 else 0
+        end = int(js_to_number(args2[2])) if len(args2) > 2 else n
+        if start < 0:
+            start = max(0, n + start)
+        if end < 0:
+            end = max(0, n + end)
+        if is_clamped:
+            c = _coerce_clamped(val)
+        else:
+            c = _coerce(val)
+        for i in range(start, min(end, n)):
+            _ta_set_coerced(this2, i, c)
+        return this2
+
+    def ta_slice(this2, args2):
+        n = _ta_length(this2)
+        start = int(js_to_number(args2[0])) if args2 else 0
+        end = int(js_to_number(args2[1])) if len(args2) > 1 else n
+        if start < 0: start = max(0, n + start)
+        if end < 0: end = max(0, n + end)
+        items = [_ta_get(this2, i) for i in range(start, min(end, n))]
+        new_arr = JSObject(class_name=name, proto=proto)
+        new_arr._is_array = True
+        new_arr.props['@@ta_type'] = name
+        size = len(items)
+        _ab_p = _PROTOS.get('ArrayBuffer')
+        buf2 = JSObject(class_name='ArrayBuffer', proto=_ab_p) if _ab_p else JSObject(class_name='ArrayBuffer')
+        buf2._ab_data = bytearray(size * bpe)
+        new_arr.props['@@ab_buf'] = buf2
+        new_arr.props['@@byte_offset'] = 0
+        new_arr.props['@@ta_length'] = size
+        new_arr.props['length'] = size
+        new_arr.props['buffer'] = buf2
+        new_arr.props['byteOffset'] = 0
+        new_arr.props['byteLength'] = size * bpe
+        for i, v in enumerate(items):
+            if is_clamped:
+                c = _coerce_clamped(v) if v is not undefined else 0
+            else:
+                c = _coerce(v) if v is not undefined else 0
+            _struct.pack_into('<' + fmt, buf2._ab_data, i * bpe, c)
+        return new_arr
+
+    def ta_subarray(this2, args2):
+        return ta_slice(this2, args2)
+
+    # Install on prototype
+    _def_method(proto, 'join', _make_native_fn('join', ta_join, 1))
+    _def_method(proto, 'toString', _make_native_fn('toString', ta_tostring, 0))
+    _def_method(proto, 'set', _make_native_fn('set', ta_set, 1))
+    _def_method(proto, 'fill', _make_native_fn('fill', ta_fill, 1))
+    _def_method(proto, 'slice', _make_native_fn('slice', ta_slice, 2))
+    _def_method(proto, 'subarray', _make_native_fn('subarray', ta_subarray, 2))
+    _obj_define_property(proto, 'BYTES_PER_ELEMENT', {
+        'value': bpe, 'writable': False, 'enumerable': False, 'configurable': False
+    })
+
     def ta_construct(this, args):
-        arr = JSObject(class_name=name)
+        arr = JSObject(class_name=name, proto=proto)
         arr._is_array = True
         arr.props['@@ta_type'] = name
-        arr.props['BYTES_PER_ELEMENT'] = bpe
 
         def _new_ab(size):
             _ab_proto = _PROTOS.get('ArrayBuffer')
@@ -4956,11 +5753,46 @@ def _make_typed_array_builtin(name: str) -> JSObject:  # noqa: C901
             buf = first
             ab_data = getattr(buf, '_ab_data', None)
             total_bytes = len(ab_data) if ab_data is not None else 0
-            byte_offset = int(js_to_number(args[1])) if len(args) > 1 else 0
-            if len(args) > 2:
-                length = int(js_to_number(args[2]))
+
+            # ToIndex(byteOffset)
+            raw_off = args[1] if len(args) > 1 else undefined
+            if raw_off is undefined:
+                byte_offset = 0
             else:
-                length = (total_bytes - byte_offset) // bpe
+                n_off = js_to_number(raw_off)
+                if isinstance(n_off, float) and math.isnan(n_off):
+                    byte_offset = 0
+                elif isinstance(n_off, float) and math.isinf(n_off):
+                    raise _ThrowSignal(make_error('RangeError', 'Invalid typed array offset'))
+                else:
+                    byte_offset = int(n_off)
+
+            if byte_offset < 0:
+                raise _ThrowSignal(make_error('RangeError', 'Start offset is negative'))
+            if bpe > 1 and byte_offset % bpe != 0:
+                raise _ThrowSignal(make_error('RangeError', 'Start offset of ' + name + ' should be a multiple of ' + str(bpe)))
+
+            raw_len = args[2] if len(args) > 2 else undefined
+            if raw_len is undefined:
+                if total_bytes % bpe != 0:
+                    raise _ThrowSignal(make_error('RangeError', 'Byte length of ' + name + ' should be a multiple of ' + str(bpe)))
+                new_byte_len = total_bytes - byte_offset
+                if new_byte_len < 0:
+                    raise _ThrowSignal(make_error('RangeError', 'Start offset is too large'))
+                length = new_byte_len // bpe
+            else:
+                n_len = js_to_number(raw_len)
+                if isinstance(n_len, float) and math.isnan(n_len):
+                    length = 0
+                elif isinstance(n_len, float) and math.isinf(n_len):
+                    raise _ThrowSignal(make_error('RangeError', 'Invalid typed array length'))
+                else:
+                    length = int(n_len)
+                if length < 0:
+                    raise _ThrowSignal(make_error('RangeError', 'Invalid typed array length'))
+                if byte_offset + length * bpe > total_bytes:
+                    raise _ThrowSignal(make_error('RangeError', 'Invalid typed array length'))
+
             arr.props['@@ab_buf'] = buf
             arr.props['@@byte_offset'] = byte_offset
             arr.props['@@ta_length'] = length
@@ -4979,9 +5811,45 @@ def _make_typed_array_builtin(name: str) -> JSObject:  # noqa: C901
             arr.props['buffer'] = buf
             arr.props['byteOffset'] = 0
             arr.props['byteLength'] = size * bpe
-        elif isinstance(first, JSObject) and first._is_array:
-            # new TypedArray([1,2,3,...])
-            items = _array_to_list(first)
+        elif isinstance(first, (JSObject, JSFunction)):
+            # Check for another TypedArray first
+            is_ta_src = isinstance(first, JSObject) and '@@ta_type' in first.props
+            # Check for iterable
+            iter_method = _obj_get_property(first, '@@iterator') if not is_ta_src else None
+            _is_callable_iter = (isinstance(iter_method, JSFunction) or 
+                                (isinstance(iter_method, JSObject) and iter_method._call is not None))
+            has_iter = iter_method is not None and iter_method is not undefined and _is_callable_iter and not first._is_array and 'length' not in first.props
+            if has_iter:
+                # new TypedArray(iterable) — collect items via iterator
+                iter_obj = _invoke_callable(iter_method, first, [])
+                items = []
+                next_fn = _obj_get_property(iter_obj, 'next') if isinstance(iter_obj, (JSObject, JSFunction)) else None
+                _is_callable_next = (isinstance(next_fn, JSFunction) or 
+                                    (isinstance(next_fn, JSObject) and next_fn._call is not None))
+                if next_fn is not None and _is_callable_next:
+                    while True:
+                        result = _invoke_callable(next_fn, iter_obj, [])
+                        if isinstance(result, (JSObject, JSFunction)):
+                            done = _obj_get_property(result, 'done')
+                            if done is True or (isinstance(done, bool) and done):
+                                break
+                            val = _obj_get_property(result, 'value')
+                            items.append(val if val is not None else undefined)
+                        else:
+                            break
+            elif first._is_array or 'length' in first.props:
+                # new TypedArray(array-or-array-like)
+                if first._is_array:
+                    items = _array_to_list(first)
+                else:
+                    n_len = first.props.get('length', 0)
+                    n_len = int(js_to_number(n_len)) if not isinstance(n_len, int) else n_len
+                    items = []
+                    for i_idx in range(n_len):
+                        v_item = _obj_get_property(first, str(i_idx))
+                        items.append(v_item if v_item is not None else undefined)
+            else:
+                items = []
             size = len(items)
             buf = _new_ab(size * bpe)
             arr.props['@@ab_buf'] = buf
@@ -5007,120 +5875,31 @@ def _make_typed_array_builtin(name: str) -> JSObject:  # noqa: C901
             arr.props['byteOffset'] = 0
             arr.props['byteLength'] = 0
 
-        # Set up prototype methods
-        _setup_ta_proto(arr)
+        # Set up prototype link already done via JSObject(..., proto=proto)
         return arr
-
-    def _setup_ta_proto(arr):
-        """Install methods on the typed array instance."""
-        def ta_join(this2, args2):
-            sep = js_to_string(args2[0]) if args2 else ','
-            n = _ta_length(this2)
-            parts = []
-            for i in range(n):
-                v = _ta_get(this2, i)
-                if v is undefined or v is null:
-                    parts.append('')
-                else:
-                    parts.append(js_to_string(v))
-            return sep.join(parts)
-
-        def ta_tostring(this2, args2):
-            return ta_join(this2, [','])
-
-        def ta_set(this2, args2):
-            src = args2[0] if args2 else undefined
-            offset = int(js_to_number(args2[1])) if len(args2) > 1 else 0
-            if isinstance(src, (list, JSObject)):
-                items = _array_to_list(src) if isinstance(src, JSObject) else src
-            else:
-                items = []
-            for i, v in enumerate(items):
-                if is_clamped:
-                    c = _coerce_clamped(v)
-                else:
-                    c = _coerce(v)
-                _ta_set_coerced(this2, offset + i, c)
-            return undefined
-
-        def _ta_set_coerced(arr2, idx, coerced_val):
-            buf2 = arr2.props.get('@@ab_buf')
-            if buf2 is None:
-                return
-            ab_data2 = getattr(buf2, '_ab_data', None)
-            if ab_data2 is None:
-                return
-            length2 = arr2.props.get('@@ta_length', 0)
-            if idx < 0 or idx >= length2:
-                return
-            byte_offset2 = arr2.props.get('@@byte_offset', 0)
-            offset2 = byte_offset2 + idx * bpe
-            _struct.pack_into('<' + fmt, ab_data2, offset2, coerced_val)
-
-        def ta_fill(this2, args2):
-            val = args2[0] if args2 else 0
-            n = _ta_length(this2)
-            start = int(js_to_number(args2[1])) if len(args2) > 1 else 0
-            end = int(js_to_number(args2[2])) if len(args2) > 2 else n
-            if start < 0:
-                start = max(0, n + start)
-            if end < 0:
-                end = max(0, n + end)
-            if is_clamped:
-                c = _coerce_clamped(val)
-            else:
-                c = _coerce(val)
-            for i in range(start, min(end, n)):
-                _ta_set_coerced(this2, i, c)
-            return this2
-
-        def ta_slice(this2, args2):
-            n = _ta_length(this2)
-            start = int(js_to_number(args2[0])) if args2 else 0
-            end = int(js_to_number(args2[1])) if len(args2) > 1 else n
-            if start < 0: start = max(0, n + start)
-            if end < 0: end = max(0, n + end)
-            items = [_ta_get(this2, i) for i in range(start, min(end, n))]
-            # Build new typed array via constructor
-            new_arr = JSObject(class_name=name)
-            new_arr._is_array = True
-            new_arr.props['@@ta_type'] = name
-            new_arr.props['BYTES_PER_ELEMENT'] = bpe
-            size = len(items)
-            _ab_p = _PROTOS.get('ArrayBuffer')
-            buf2 = JSObject(class_name='ArrayBuffer', proto=_ab_p) if _ab_p else JSObject(class_name='ArrayBuffer')
-            buf2._ab_data = bytearray(size * bpe)
-            new_arr.props['@@ab_buf'] = buf2
-            new_arr.props['@@byte_offset'] = 0
-            new_arr.props['@@ta_length'] = size
-            new_arr.props['length'] = size
-            new_arr.props['buffer'] = buf2
-            new_arr.props['byteOffset'] = 0
-            new_arr.props['byteLength'] = size * bpe
-            for i, v in enumerate(items):
-                if is_clamped:
-                    c = _coerce_clamped(v) if v is not undefined else 0
-                else:
-                    c = _coerce(v) if v is not undefined else 0
-                _struct.pack_into('<' + fmt, buf2._ab_data, i * bpe, c)
-            _setup_ta_proto(new_arr)
-            return new_arr
-
-        def ta_subarray(this2, args2):
-            # Returns a view of the same buffer
-            return ta_slice(this2, args2)
-
-        arr.props['join'] = _make_native_fn('join', ta_join)
-        arr.props['toString'] = _make_native_fn('toString', ta_tostring)
-        arr.props['set'] = _make_native_fn('set', ta_set)
-        arr.props['fill'] = _make_native_fn('fill', ta_fill)
-        arr.props['slice'] = _make_native_fn('slice', ta_slice)
-        arr.props['subarray'] = _make_native_fn('subarray', ta_subarray)
 
     obj = JSObject(class_name='Function')
     obj.name = name
-    obj.props['BYTES_PER_ELEMENT'] = bpe
-    obj._call = ta_construct
+    # Each TypedArray constructor's [[Prototype]] is %TypedArray% constructor
+    _ta_base_ctor = _PROTOS.get('@@TypedArrayCtor')
+    if isinstance(_ta_base_ctor, JSObject):
+        obj.proto = _ta_base_ctor
+    _setup_ctor_descriptors(obj, name, 3)
+    _obj_define_property(obj, 'BYTES_PER_ELEMENT', {
+        'value': bpe, 'writable': False, 'enumerable': False, 'configurable': False
+    })
+    obj.props['prototype'] = proto
+    _obj_define_property(obj, 'prototype', {
+        'value': proto, 'writable': False, 'enumerable': False, 'configurable': False
+    })
+    proto.props['constructor'] = obj
+    _obj_define_property(proto, 'constructor', {
+        'value': obj, 'writable': True, 'enumerable': False, 'configurable': True
+    })
+    def ta_call(this, args):
+        raise _ThrowSignal(make_error('TypeError', 'Constructor ' + name + ' requires \'new\''))
+
+    obj._call = ta_call
     obj._construct = ta_construct
     return obj
 
@@ -5215,35 +5994,97 @@ def _make_data_view_builtin() -> JSObject:  # noqa: C901
                 'DataView constructor: first argument must be an ArrayBuffer'))
         ab_data = buf._ab_data
         ab_len = len(ab_data)
-        byte_offset = int(js_to_number(args[1])) if len(args) > 1 and args[1] is not undefined else 0
+        # ToIndex for byte_offset
+        raw_offset = args[1] if len(args) > 1 and args[1] is not undefined else undefined
+        if raw_offset is undefined:
+            byte_offset = 0
+        else:
+            n = js_to_number(raw_offset)
+            if isinstance(n, float) and (math.isnan(n) or math.isinf(n)):
+                raise _ThrowSignal(make_error('RangeError',
+                    f'DataView constructor: byteOffset is out of bounds'))
+            byte_offset = int(n)
         if byte_offset < 0 or byte_offset > ab_len:
             raise _ThrowSignal(make_error('RangeError',
                 f'DataView constructor: byteOffset {byte_offset} is out of bounds'))
         if len(args) > 2 and args[2] is not undefined:
-            byte_length = int(js_to_number(args[2]))
+            n2 = js_to_number(args[2])
+            if isinstance(n2, float) and (math.isnan(n2) or math.isinf(n2)):
+                raise _ThrowSignal(make_error('RangeError',
+                    f'DataView constructor: byteLength is out of bounds'))
+            byte_length = int(n2)
             if byte_length < 0 or byte_offset + byte_length > ab_len:
                 raise _ThrowSignal(make_error('RangeError',
                     f'DataView constructor: byteLength {byte_length} is out of bounds'))
         else:
             byte_length = ab_len - byte_offset
 
-        dv = JSObject(class_name='DataView')
+        dv = JSObject(class_name='DataView', proto=proto)
         dv.props['buffer'] = buf
         dv.props['byteOffset'] = byte_offset
         dv.props['byteLength'] = byte_length
         dv.props['@@dv_byte_offset'] = byte_offset
         dv.props['@@dv_byte_length'] = byte_length
 
-        for type_name in _DV_INFO:
-            dv.props[f'get{type_name}'] = _make_native_fn(f'get{type_name}', _make_getter(type_name))
-            dv.props[f'set{type_name}'] = _make_native_fn(f'set{type_name}', _make_setter(type_name))
-
         return dv
 
+    # Build prototype with getter/setter methods
+    proto = JSObject(class_name='DataView', proto=_PROTOS.get('Object'))
+    _PROTOS['DataView'] = proto
+
+    for type_name in _DV_INFO:
+        _def_method(proto, f'get{type_name}', _make_native_fn(f'get{type_name}', _make_getter(type_name), 1))
+        _def_method(proto, f'set{type_name}', _make_native_fn(f'set{type_name}', _make_setter(type_name), 2))
+
+    # buffer, byteLength, byteOffset as prototype getter accessors
+    def _dv_buffer_get(this, args):
+        if not isinstance(this, JSObject) or this.class_name != 'DataView':
+            raise _ThrowSignal(make_error('TypeError', 'DataView.prototype.buffer called on incompatible receiver'))
+        buf = this.props.get('buffer')
+        if buf is None:
+            raise _ThrowSignal(make_error('TypeError', 'DataView.prototype.buffer called on non-DataView'))
+        return buf
+    def _dv_byteLength_get(this, args):
+        if not isinstance(this, JSObject) or this.class_name != 'DataView':
+            raise _ThrowSignal(make_error('TypeError', 'DataView.prototype.byteLength called on incompatible receiver'))
+        bl = this.props.get('byteLength')
+        if bl is None:
+            raise _ThrowSignal(make_error('TypeError', 'DataView.prototype.byteLength called on non-DataView'))
+        return bl
+    def _dv_byteOffset_get(this, args):
+        if not isinstance(this, JSObject) or this.class_name != 'DataView':
+            raise _ThrowSignal(make_error('TypeError', 'DataView.prototype.byteOffset called on incompatible receiver'))
+        bo = this.props.get('byteOffset')
+        if bo is None:
+            raise _ThrowSignal(make_error('TypeError', 'DataView.prototype.byteOffset called on non-DataView'))
+        return bo
+    _obj_define_property(proto, 'buffer', {
+        'get': _make_native_fn('get buffer', _dv_buffer_get, 0),
+        'enumerable': False, 'configurable': True
+    })
+    _obj_define_property(proto, 'byteLength', {
+        'get': _make_native_fn('get byteLength', _dv_byteLength_get, 0),
+        'enumerable': False, 'configurable': True
+    })
+    _obj_define_property(proto, 'byteOffset', {
+        'get': _make_native_fn('get byteOffset', _dv_byteOffset_get, 0),
+        'enumerable': False, 'configurable': True
+    })
+
+    # @@toStringTag
+    _obj_define_property(proto, '@@toStringTag', {
+        'value': 'DataView', 'writable': False, 'enumerable': False, 'configurable': True
+    })
+
+    def dv_call(this, args):
+        raise _ThrowSignal(make_error('TypeError', 'Constructor DataView requires "new"'))
+
     obj = JSObject(class_name='Function')
-    obj.name = 'DataView'
-    obj._call = dv_construct
+    _setup_ctor_descriptors(obj, 'DataView', 1)
+    obj._call = dv_call
     obj._construct = dv_construct
+    obj.props['prototype'] = proto
+    proto.props['constructor'] = obj
     return obj
 
 
@@ -5413,8 +6254,8 @@ def _make_array_buffer_builtin() -> JSObject:
         # Has [[ViewedArrayBuffer]] internal slot = TypedArray or DataView
         if arg.props.get('@@ab_buf') is not None:
             return True  # TypedArray
-        if arg.class_name == 'DataView':
-            return True
+        if '@@dv_byte_offset' in arg.props:
+            return True  # DataView (or subclass)
         return False
     _def_method(obj, 'isView', _make_native_fn('isView', ab_isView, 1))
 

@@ -27,7 +27,11 @@ from __future__ import annotations
 
 import gc
 import sys
-import tracemalloc
+try:
+    import tracemalloc
+    _HAS_TRACEMALLOC = True
+except ImportError:
+    _HAS_TRACEMALLOC = False
 from pathlib import Path
 
 # Ensure project root is on sys.path so pyquickjs is importable when the
@@ -88,7 +92,8 @@ def main() -> None:
     expected_error: str | None = sys.argv[5] if sys.argv[5] not in ("None", "") else None
     expected_phase: str | None = sys.argv[6] if sys.argv[6] not in ("None", "") else None
 
-    tracemalloc.start()
+    if _HAS_TRACEMALLOC:
+        tracemalloc.start()
 
     from pyquickjs.runtime import JSRuntime
     from pyquickjs.context import JSContext
@@ -119,15 +124,16 @@ def main() -> None:
         ctx.eval(test_source, test_file)
 
         # Check memory peak BEFORE deciding pass/fail.
-        _current, peak = tracemalloc.get_traced_memory()
-        peak_mb = peak / 1024 / 1024
-        if peak_mb > MEMORY_LIMIT_MB:
-            print(
-                f"MemoryError: test allocated {peak_mb:.1f} MB peak "
-                f"(limit {MEMORY_LIMIT_MB} MB)",
-                file=sys.stderr,
-            )
-            sys.exit(3)
+        if _HAS_TRACEMALLOC:
+            _current, peak = tracemalloc.get_traced_memory()
+            peak_mb = peak / 1024 / 1024
+            if peak_mb > MEMORY_LIMIT_MB:
+                print(
+                    f"MemoryError: test allocated {peak_mb:.1f} MB peak "
+                    f"(limit {MEMORY_LIMIT_MB} MB)",
+                    file=sys.stderr,
+                )
+                sys.exit(3)
 
         if expected_error:
             print(
