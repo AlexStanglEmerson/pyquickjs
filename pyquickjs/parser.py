@@ -332,6 +332,104 @@ def _check_assignment_pattern_validity(node, strict: bool = False) -> str | None
     return None
 
 
+def _check_re_pattern(pattern: str):
+    """Check for common JS regex early errors. Raises ValueError for invalid patterns."""
+    n = len(pattern)
+    i = 0
+    # Track whether we're at a position where a quantifier is invalid
+    # (start of pattern, after |, after opening paren)
+    can_quantify = False  # True if there's an atom before current position
+
+    while i < n:
+        c = pattern[i]
+        if c == '\\':
+            # Escape sequence — skip next char
+            can_quantify = True
+            i += 2
+            continue
+        if c == '[':
+            # Character class — skip to closing ]
+            can_quantify = True
+            i += 1
+            while i < n and pattern[i] != ']':
+                if pattern[i] == '\\':
+                    i += 1  # skip escape
+                i += 1
+            i += 1  # skip ]
+            continue
+        if c == '(':
+            # Check for lookbehind before the group body
+            if i + 3 < n and pattern[i+1] == '?' and pattern[i+2] == '<' and pattern[i+3] in ('=', '!'):
+                # Lookbehind assertion: (?<=...) or (?<!...)
+                # Find matching close paren
+                depth = 1
+                j = i + 4
+                while j < n and depth > 0:
+                    if pattern[j] == '\\':
+                        j += 2
+                        continue
+                    if pattern[j] == '(':
+                        depth += 1
+                    elif pattern[j] == ')':
+                        depth -= 1
+                    j += 1
+                # j is now past the closing paren
+                # Check if followed by a quantifier (lookbehind is not quantifiable)
+                if j < n and pattern[j] in '?*+{':
+                    raise ValueError(f"Nothing to repeat: quantifier after lookbehind assertion")
+                can_quantify = True
+                i = j
+                continue
+            can_quantify = False
+            i += 1
+            # Skip group modifiers: (?:, (?=, (?!
+            if i < n and pattern[i] == '?':
+                i += 1
+                if i < n and pattern[i] in ':=!<':
+                    if pattern[i] == '<' and i + 1 < n and pattern[i+1] not in '=!':
+                        # Named group (?<name>...) — skip name
+                        i += 1
+                        while i < n and pattern[i] != '>':
+                            i += 1
+                        i += 1  # skip >
+                    else:
+                        i += 1
+            continue
+        if c == ')':
+            can_quantify = True
+            i += 1
+            continue
+        if c == '|':
+            can_quantify = False
+            i += 1
+            continue
+        if c in '?*+':
+            if not can_quantify:
+                raise ValueError(f"Nothing to repeat: '{c}'")
+            can_quantify = True  # quantifier applied; next quantifier would be invalid unless +lazy
+            # Skip lazy modifier
+            if c in '?*+' and i + 1 < n and pattern[i+1] == '?':
+                i += 2
+            else:
+                i += 1
+            continue
+        if c == '{':
+            # Braced quantifier: {n}, {n,}, {n,m}
+            if not can_quantify:
+                # Check if it's a valid quantifier
+                j = i + 1
+                while j < n and pattern[j].isdigit():
+                    j += 1
+                if j > i + 1 and j < n and pattern[j] in ',}':
+                    raise ValueError(f"Nothing to repeat: braced quantifier")
+            can_quantify = True
+            i += 1
+            continue
+        # Regular atom (., literal char, etc.)
+        can_quantify = True
+        i += 1
+
+
 class Parser:
     """Recursive-descent JavaScript parser producing AST nodes."""
 
@@ -589,6 +687,45 @@ class Parser:
                 is_iteration = nt in (Tok.FOR, Tok.WHILE, Tok.DO)
                 self.s.cur_func.label_set[name] = is_iteration
                 try:
+                    # Per spec §13.13: only Statement or FunctionDeclaration (sloppy)
+                    # Reject class, const, let, generator declarations after labels
+                    bt = self._tok()
+                    if bt == Tok.CLASS:
+                        raise self._error("Lexical declaration cannot appear in a single-statement context")
+                    if bt == Tok.CONST:
+                        raise self._error("Lexical declaration cannot appear in a single-statement context")
+                    if bt == Tok.LET:
+                        # In strict mode, always reject. In sloppy mode, only reject if it's actually a let decl
+                        is_strict = bool(self.s.cur_func.js_mode & JS_MODE_STRICT)
+                        if is_strict or self._is_let_decl():
+                            raise self._error("Lexical declaration cannot appear in a single-statement context")
+                    bn = self._get_ident_name() if bt == Tok.IDENT else None
+                    is_strict = bool(self.s.cur_func.js_mode & JS_MODE_STRICT)
+                    if bt == Tok.FUNCTION:
+                        # In strict mode, function declarations after labels are forbidden
+                        if is_strict:
+                            raise self._error("In strict mode code, functions can only be declared at top level or inside a block")
+                        # Check for generator function: function*
+                        save2_pos = self.s.pos
+                        save2_token = self.s.token
+                        self._next()  # consume 'function'
+                        if self._tok() == ord('*'):
+                            self.s.pos = save2_pos
+                            self.s.token = save2_token
+                            raise self._error("Generator declarations are not allowed in a single-statement context")
+                        self.s.pos = save2_pos
+                        self.s.token = save2_token
+                    if bn == 'async':
+                        # async function / async function* after label is forbidden
+                        save2_pos = self.s.pos
+                        save2_token = self.s.token
+                        self._next()  # consume 'async'
+                        if not self.s.got_lf and self._tok() == Tok.FUNCTION:
+                            self.s.pos = save2_pos
+                            self.s.token = save2_token
+                            raise self._error("Async function declarations are not allowed in a single-statement context")
+                        self.s.pos = save2_pos
+                        self.s.token = save2_token
                     body = self._parse_statement(declaration=True)
                 finally:
                     self.s.cur_func.label_set.pop(name, None)
@@ -2520,7 +2657,7 @@ class Parser:
             elif c == '/' and not in_class:
                 self.s.advance()
                 break
-            elif c in ('\n', '\r'):
+            elif c in ('\n', '\r', '\u2028', '\u2029'):
                 raise self._error("unterminated regexp")
             else:
                 body.append(c)
@@ -2532,6 +2669,16 @@ class Parser:
             self.s.advance()
         pattern = ''.join(body)
         flag_str = ''.join(flags)
+        # Validate flags: only valid flag characters, no duplicates
+        _VALID_RE_FLAGS = frozenset('dgimsuyv')
+        for f in flags:
+            if f not in _VALID_RE_FLAGS:
+                raise self._error(f"invalid regular expression flag: {f}")
+        if len(set(flags)) != len(flags):
+            raise self._error("duplicate regular expression flag")
+        # 'u' and 'v' are mutually exclusive
+        if 'u' in flag_str and 'v' in flag_str:
+            raise self._error("invalid regular expression flags: u and v are mutually exclusive")
         # With 'u' flag, validate pattern — unmatched ] is a SyntaxError in Unicode mode
         if 'u' in flag_str:
             depth = 0
@@ -2549,6 +2696,9 @@ class Parser:
                         raise self._error("invalid regular expression: unmatched ]")
                     depth -= 1
                 i += 1
+        # Validate the pattern — check for common early errors
+        # Leading quantifier (nothing to quantify): ?, *, +, {n}
+        _check_re_pattern(pattern)
         self._next()  # advance to next token
         return Literal(value=None, regex={"pattern": pattern, "flags": flag_str})
 

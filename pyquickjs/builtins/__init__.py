@@ -2052,37 +2052,77 @@ def make_number_builtin(interp) -> JSObject:
 
     # Ensure Number.prototype has its own toString/valueOf so they shadow Object.prototype.toString
     def _num_toString(this, args):
-        from pyquickjs.interpreter import js_to_number as _jtn
+        from pyquickjs.interpreter import _float_to_radix_string
         radix = int(js_to_number(args[0])) if args and args[0] is not undefined else 10
+        if radix < 2 or radix > 36:
+            raise _ThrowSignal(make_error('RangeError', 'toString() radix must be between 2 and 36'))
         v = _get_num_val(this)
         if radix == 10:
             return js_to_string(v)
-        return _int_to_radix(int(v), radix)
-    _def_method(proto, 'toString', _make_native_fn('toString', _num_toString))
+        if isinstance(v, float):
+            return _float_to_radix_string(v, radix)
+        if isinstance(v, int):
+            return _int_to_radix(v, radix)
+        return js_to_string(v)
+    _def_method(proto, 'toString', _make_native_fn('toString', _num_toString, 1))
     _def_method(proto, 'valueOf', _make_native_fn('valueOf', lambda this, args: _get_num_val(this)))
     _def_method(proto, 'toLocaleString', _make_native_fn('toLocaleString', lambda this, args: js_to_string(_get_num_val(this))))
 
     def _num_toFixed(this, args):
-        digits = int(js_to_number(args[0])) if args and args[0] is not undefined else 0
+        from pyquickjs.interpreter import _js_to_fixed
         v = _get_num_val(this)
-        return format(float(v), f'.{digits}f')
-    _def_method(proto, 'toFixed', _make_native_fn('toFixed', _num_toFixed))
+        v = float(v) if isinstance(v, int) else v
+        raw_digits = js_to_number(args[0]) if args and args[0] is not undefined else 0
+        if isinstance(raw_digits, float) and (math.isnan(raw_digits) or math.isinf(raw_digits)):
+            raise _ThrowSignal(make_error('RangeError', 'toFixed() digits argument must be between 0 and 100'))
+        digits = int(raw_digits)
+        if digits < 0 or digits > 100:
+            raise _ThrowSignal(make_error('RangeError', 'toFixed() digits argument must be between 0 and 100'))
+        if math.isnan(v):
+            return 'NaN'
+        if math.isinf(v):
+            return 'Infinity' if v > 0 else '-Infinity'
+        if abs(v) >= 1e21:
+            return js_to_string(v)
+        return _js_to_fixed(v, digits)
+    _def_method(proto, 'toFixed', _make_native_fn('toFixed', _num_toFixed, 1))
 
     def _num_toPrecision(this, args):
-        if not args or args[0] is undefined:
-            v = _get_num_val(this)
-            return js_to_string(v)
-        prec = int(js_to_number(args[0]))
+        from pyquickjs.interpreter import _js_to_precision
         v = _get_num_val(this)
-        return format(float(v), f'.{prec}g')
-    _def_method(proto, 'toPrecision', _make_native_fn('toPrecision', _num_toPrecision))
+        if not args or args[0] is undefined:
+            return js_to_string(v)
+        v = float(v) if isinstance(v, int) else v
+        raw_prec = js_to_number(args[0])
+        if isinstance(raw_prec, float) and (math.isnan(raw_prec) or math.isinf(raw_prec)):
+            raise _ThrowSignal(make_error('RangeError', 'toPrecision() argument must be between 1 and 100'))
+        prec = int(raw_prec)
+        if prec < 1 or prec > 100:
+            raise _ThrowSignal(make_error('RangeError', 'toPrecision() argument must be between 1 and 100'))
+        if math.isnan(v):
+            return 'NaN'
+        if math.isinf(v):
+            return 'Infinity' if v > 0 else '-Infinity'
+        return _js_to_precision(v, prec)
+    _def_method(proto, 'toPrecision', _make_native_fn('toPrecision', _num_toPrecision, 1))
 
     def _num_toExponential(this, args):
-        digits = int(js_to_number(args[0])) if args and args[0] is not undefined else None
+        from pyquickjs.interpreter import _js_to_exponential
         v = _get_num_val(this)
-        if digits is None:
-            return format(float(v), 'e')
-        return format(float(v), f'.{digits}e')
+        v = float(v) if isinstance(v, int) else v
+        if math.isnan(v):
+            return 'NaN'
+        if math.isinf(v):
+            return 'Infinity' if v > 0 else '-Infinity'
+        if not args or args[0] is undefined:
+            return _js_to_exponential(v, None)
+        raw_fd = js_to_number(args[0])
+        if isinstance(raw_fd, float) and (math.isnan(raw_fd) or math.isinf(raw_fd)):
+            raise _ThrowSignal(make_error('RangeError', 'toExponential() argument must be between 0 and 100'))
+        fd = int(raw_fd)
+        if fd < 0 or fd > 100:
+            raise _ThrowSignal(make_error('RangeError', 'toExponential() argument must be between 0 and 100'))
+        return _js_to_exponential(v, fd)
     _def_method(proto, 'toExponential', _make_native_fn('toExponential', _num_toExponential, 1))
 
     _set_ctor_prototype(obj, proto)
@@ -2480,24 +2520,340 @@ def make_json_builtin(interp) -> JSObject:
     def json_stringify(this, args):
         if not args:
             return undefined
-        val = args[0]
-        replacer = args[1] if len(args) > 1 else undefined
-        space = args[2] if len(args) > 2 else undefined
-        indent = None
-        if space is not undefined:
-            if isinstance(space, int):
-                indent = space
-            elif isinstance(space, str):
-                indent = space  # type: ignore
-        py_val = js_val_to_python(val)
-        if py_val is _SKIP:
+        value = args[0]
+        replacer_arg = args[1] if len(args) > 1 else undefined
+        space_arg = args[2] if len(args) > 2 else undefined
+
+        from pyquickjs.interpreter import JSFunction as _JSFn
+
+        # --- Replacer ---
+        replacer_fn = None
+        property_list = None
+
+        if isinstance(replacer_arg, JSObject) or isinstance(replacer_arg, _JSFn):
+            if _is_callable(replacer_arg):
+                replacer_fn = replacer_arg
+            else:
+                # Check IsArray (handles proxies + revoked proxies)
+                is_arr = False
+                obj_check = replacer_arg
+                seen_ids = set()
+                while isinstance(obj_check, JSObject):
+                    oid = id(obj_check)
+                    if oid in seen_ids:
+                        break
+                    seen_ids.add(oid)
+                    if obj_check._is_array:
+                        is_arr = True
+                        break
+                    if not _is_proxy(obj_check):
+                        break
+                    target = obj_check._proxy_target
+                    handler = obj_check._proxy_handler
+                    if target is None or handler is None:
+                        raise _ThrowSignal(make_error('TypeError', "Cannot perform 'IsArray' on a proxy that has been revoked"))
+                    obj_check = target
+
+                if is_arr:
+                    property_list = []
+                    length_val = _obj_get_property(replacer_arg, 'length')
+                    length = int(js_to_number(length_val)) if length_val is not undefined else 0
+                    for idx in range(length):
+                        item = _obj_get_property(replacer_arg, str(idx))
+                        key = None
+                        if isinstance(item, str):
+                            key = item
+                        elif isinstance(item, (int, float)) and not isinstance(item, bool):
+                            key = js_to_string(item)
+                        elif isinstance(item, JSObject):
+                            if '@@strData' in item.props or '@@numData' in item.props:
+                                key = js_to_string(item)
+                        if key is not None and key not in property_list:
+                            property_list.append(key)
+
+        # --- Space / gap ---
+        gap = ''
+        space = space_arg
+        # Unwrap wrapper objects
+        if isinstance(space, JSObject):
+            if '@@numData' in space.props:
+                space = js_to_number(space)
+            elif '@@strData' in space.props:
+                space = js_to_string(space)
+        if isinstance(space, (int, float)) and not isinstance(space, bool):
+            count = min(10, max(0, int(space)))
+            gap = ' ' * count
+        elif isinstance(space, str):
+            gap = space[:10]
+
+        # --- Circular reference detection ---
+        stack = []  # list of object ids
+
+        def _is_array_like(v):
+            """IsArray check that handles proxies and revoked proxies."""
+            seen = set()
+            while isinstance(v, JSObject):
+                oid = id(v)
+                if oid in seen:
+                    return False
+                seen.add(oid)
+                if v._is_array:
+                    return True
+                if not _is_proxy(v):
+                    return False
+                target = v._proxy_target
+                handler = v._proxy_handler
+                if target is None or handler is None:
+                    raise _ThrowSignal(make_error('TypeError', "Cannot perform 'IsArray' on a proxy that has been revoked"))
+                v = target
+            return False
+
+        def _quote(s):
+            """QuoteJSONString — with well-formed JSON (lone surrogate escaping)."""
+            result = ['"']
+            i = 0
+            while i < len(s):
+                ch = s[i]
+                cp = ord(ch)
+                if ch == '"':
+                    result.append('\\"')
+                elif ch == '\\':
+                    result.append('\\\\')
+                elif ch == '\b':
+                    result.append('\\b')
+                elif ch == '\f':
+                    result.append('\\f')
+                elif ch == '\n':
+                    result.append('\\n')
+                elif ch == '\r':
+                    result.append('\\r')
+                elif ch == '\t':
+                    result.append('\\t')
+                elif cp < 0x20:
+                    result.append(f'\\u{cp:04x}')
+                elif 0xD800 <= cp <= 0xDBFF:
+                    # High surrogate — check for valid pair
+                    if i + 1 < len(s) and 0xDC00 <= ord(s[i + 1]) <= 0xDFFF:
+                        result.append(ch)
+                        result.append(s[i + 1])
+                        i += 2
+                        continue
+                    else:
+                        result.append(f'\\u{cp:04x}')
+                elif 0xDC00 <= cp <= 0xDFFF:
+                    # Lone low surrogate
+                    result.append(f'\\u{cp:04x}')
+                else:
+                    result.append(ch)
+                i += 1
+            result.append('"')
+            return ''.join(result)
+
+        def _enumerable_own_keys(obj):
+            """EnumerableOwnPropertyNames(obj, 'key') — handles proxies."""
+            from pyquickjs.interpreter import _proxy_ownkeys_trap
+            # Unwrap proxy chain to find real target
+            if _is_proxy(obj):
+                raw_keys = _proxy_ownkeys_trap(obj)
+                result = []
+                for k in raw_keys:
+                    if k.startswith('@@'):
+                        continue
+                    # Check enumerability via getOwnPropertyDescriptor trap
+                    desc_obj = _proxy_getownpropdesc_trap(obj, k)
+                    if desc_obj is not undefined and desc_obj is not None:
+                        if isinstance(desc_obj, JSObject):
+                            enum_val = _obj_get_property(desc_obj, 'enumerable')
+                            if js_is_truthy(enum_val):
+                                result.append(k)
+                        else:
+                            result.append(k)
+                return result
+            keys = []
+            # Collect keys preserving insertion order
+            all_keys = set()
+            for k in obj.props:
+                if not k.startswith('@@'):
+                    all_keys.add(k)
+            if obj._descriptors:
+                for k in obj._descriptors:
+                    if not k.startswith('@@'):
+                        all_keys.add(k)
+            # Preserve insertion order from props
+            for k in obj.props:
+                if k.startswith('@@'):
+                    continue
+                if obj._descriptors and k in obj._descriptors:
+                    desc = obj._descriptors[k]
+                    if not desc.get('enumerable', True):
+                        continue
+                keys.append(k)
+            # Add descriptor-only keys
+            if obj._descriptors:
+                for k in obj._descriptors:
+                    if k.startswith('@@') or k in obj.props:
+                        continue
+                    desc = obj._descriptors[k]
+                    if desc.get('enumerable', True):
+                        keys.append(k)
+            return keys
+
+        def _proxy_getownpropdesc_trap(proxy, key):
+            """Minimal getOwnPropertyDescriptor trap call for proxies."""
+            handler = proxy._proxy_handler
+            target = proxy._proxy_target
+            if handler is None:
+                raise _ThrowSignal(make_error('TypeError', "Cannot perform 'getOwnPropertyDescriptor' on a proxy that has been revoked"))
+            trap = _obj_get_property(handler, 'getOwnPropertyDescriptor') if isinstance(handler, JSObject) else undefined
+            if trap is not undefined and trap is not None and trap is not null and _is_callable(trap):
+                return _call_value(trap, handler, [target, key])
+            # No trap — forward to target
+            if isinstance(target, JSObject):
+                if _is_proxy(target):
+                    return _proxy_getownpropdesc_trap(target, key)
+                if target._descriptors and key in target._descriptors:
+                    desc = target._descriptors[key]
+                    result = JSObject(proto=_PROTOS.get('Object'))
+                    for dk, dv in desc.items():
+                        result.props[dk] = dv
+                    return result
+                if key in target.props:
+                    result = JSObject(proto=_PROTOS.get('Object'))
+                    result.props['value'] = target.props[key]
+                    result.props['writable'] = True
+                    result.props['enumerable'] = True
+                    result.props['configurable'] = True
+                    return result
             return undefined
-        try:
-            if indent is None:
-                return json.dumps(py_val, separators=(',', ':'), ensure_ascii=False)
-            return json.dumps(py_val, indent=indent, ensure_ascii=False)
-        except (TypeError, ValueError) as e:
-            raise _ThrowSignal(make_error('TypeError', str(e)))
+
+        def _serialize_property(key, holder):
+            """SerializeJSONProperty(key, holder)."""
+            val = _obj_get_property(holder, key) if isinstance(holder, JSObject) else undefined
+
+            # Step 2: toJSON (works for Object AND BigInt via prototype)
+            if isinstance(val, JSObject) or isinstance(val, _JSFn):
+                to_json = _obj_get_property(val, 'toJSON') if isinstance(val, JSObject) else None
+                if to_json is not None and _is_callable(to_json):
+                    val = _call_value(to_json, val, [key])
+            elif isinstance(val, JSBigInt):
+                # BigInt: check BigInt.prototype.toJSON
+                bigint_proto = _PROTOS.get('BigInt')
+                if bigint_proto is not None:
+                    to_json = _obj_get_property(bigint_proto, 'toJSON')
+                    if to_json is not None and to_json is not undefined and _is_callable(to_json):
+                        val = _call_value(to_json, val, [key])
+
+            # Step 3: Replacer function
+            if replacer_fn is not None:
+                val = _call_value(replacer_fn, holder, [key, val])
+
+            # Step 4: Unwrap wrapper objects
+            if isinstance(val, JSObject):
+                if '@@numData' in val.props:
+                    val = js_to_number(val)
+                elif '@@strData' in val.props:
+                    val = js_to_string(val)
+                elif '@@boolData' in val.props:
+                    val = val.props['@@boolData']
+                elif '@@bigintData' in val.props:
+                    val = val.props['@@bigintData']
+
+            # Step 5-8: Primitives
+            if val is null:
+                return 'null'
+            if val is True:
+                return 'true'
+            if val is False:
+                return 'false'
+            if isinstance(val, str):
+                return _quote(val)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                    return 'null'
+                # Use JS-style number formatting
+                return js_to_string(val)
+            if isinstance(val, JSBigInt):
+                raise _ThrowSignal(make_error('TypeError', 'Do not know how to serialize a BigInt'))
+
+            # Step 10: Object (non-callable)
+            if isinstance(val, JSObject) and not _is_callable(val):
+                if _is_array_like(val):
+                    return _serialize_array(val)
+                return _serialize_object(val)
+            if isinstance(val, _JSFn):
+                return None  # undefined
+            # undefined, symbol → undefined
+            return None
+
+        def _serialize_object(value):
+            """SerializeJSONObject(value)."""
+            obj_id = id(value)
+            if obj_id in stack:
+                raise _ThrowSignal(make_error('TypeError', 'Converting circular structure to JSON'))
+            stack.append(obj_id)
+
+            if property_list is not None:
+                keys = property_list
+            else:
+                keys = _enumerable_own_keys(value)
+
+            partial = []
+            for k in keys:
+                str_p = _serialize_property(k, value)
+                if str_p is not None:
+                    if gap:
+                        member = _quote(k) + ': ' + str_p
+                    else:
+                        member = _quote(k) + ':' + str_p
+                    partial.append(member)
+
+            if not partial:
+                result = '{}'
+            elif not gap:
+                result = '{' + ','.join(partial) + '}'
+            else:
+                indent = '\n' + gap * (len(stack))
+                final_indent = '\n' + gap * (len(stack) - 1)
+                result = '{' + indent + (',' + indent).join(partial) + final_indent + '}'
+
+            stack.pop()
+            return result
+
+        def _serialize_array(value):
+            """SerializeJSONArray(value)."""
+            obj_id = id(value)
+            if obj_id in stack:
+                raise _ThrowSignal(make_error('TypeError', 'Converting circular structure to JSON'))
+            stack.append(obj_id)
+
+            length_val = _obj_get_property(value, 'length')
+            length = int(js_to_number(length_val)) if length_val is not undefined else 0
+
+            partial = []
+            for i in range(length):
+                str_p = _serialize_property(str(i), value)
+                if str_p is None:
+                    partial.append('null')
+                else:
+                    partial.append(str_p)
+
+            if not partial:
+                result = '[]'
+            elif not gap:
+                result = '[' + ','.join(partial) + ']'
+            else:
+                indent = '\n' + gap * (len(stack))
+                final_indent = '\n' + gap * (len(stack) - 1)
+                result = '[' + indent + (',' + indent).join(partial) + final_indent + ']'
+
+            stack.pop()
+            return result
+
+        # --- Main: create wrapper and serialize ---
+        wrapper = JSObject(proto=_PROTOS.get('Object'))
+        wrapper.props[''] = value
+        result = _serialize_property('', wrapper)
+        return result if result is not None else undefined
     _def_method(obj, 'stringify', _make_native_fn('stringify', json_stringify, 3))
 
     def python_to_js_val(v):
@@ -4358,7 +4714,9 @@ def make_regexp_builtin(interp) -> JSObject:
         if isinstance(pattern, JSObject) and pattern.class_name == 'RegExp':
             pat_str = pattern.props.get('source', '')
             if not flags:
-                flags = pattern.props.get('flags', '')
+                flags = getattr(pattern, '_regex_flags', '') or ''
+        elif pattern is undefined:
+            pat_str = ''
         else:
             pat_str = js_to_string(pattern)
         return interp._make_regexp(pat_str, flags)
@@ -4366,16 +4724,361 @@ def make_regexp_builtin(interp) -> JSObject:
     obj._call = regexp_construct
     obj._construct = regexp_construct
 
-    proto = JSObject(class_name='RegExp')
+    proto = JSObject(class_name='Object')  # Per spec, RegExp.prototype is ordinary object
     _def_method(proto, 'constructor', obj)
     _def_method(proto, 'test', _make_native_fn('test', lambda this, args:
-        _regexp_test(this, args)))
+        _regexp_test(this, args), 1))
     _def_method(proto, 'exec', _make_native_fn('exec', lambda this, args:
-        _regexp_exec(this, args[0] if args else undefined)))
+        _regexp_exec(this, args[0] if args else undefined), 1))
     _def_method(proto, 'toString', _make_native_fn('toString', lambda this, args:
         f'/{this.props.get("source", "")}/{this.props.get("flags", "")}' if isinstance(this, JSObject) else '//undefined'))
 
+    # Flag accessor getters on RegExp.prototype
+    if proto._descriptors is None:
+        proto._descriptors = {}
+
+    def _make_flag_getter(flag_char, name):
+        def getter(this, args):
+            if not isinstance(this, JSObject):
+                raise _ThrowSignal(make_error('TypeError', f'RegExp.prototype.{name} getter called on non-object'))
+            f = getattr(this, '_regex_flags', None)
+            if f is None:
+                # RegExp.prototype itself: return undefined per spec
+                if this is proto:
+                    return undefined
+                raise _ThrowSignal(make_error('TypeError', f'RegExp.prototype.{name} requires a RegExp receiver'))
+            return flag_char in f
+        return _make_native_fn(f'get {name}', getter, 0)
+
+    for flag_char, prop_name in [
+        ('d', 'hasIndices'),
+        ('g', 'global'),
+        ('i', 'ignoreCase'),
+        ('m', 'multiline'),
+        ('s', 'dotAll'),
+        ('u', 'unicode'),
+        ('v', 'unicodeSets'),
+        ('y', 'sticky'),
+    ]:
+        proto._descriptors[prop_name] = {
+            'get': _make_flag_getter(flag_char, prop_name),
+            'set': undefined,
+            'enumerable': False,
+            'configurable': True,
+        }
+
+    # source getter
+    def _source_getter(this, args):
+        if not isinstance(this, JSObject):
+            raise _ThrowSignal(make_error('TypeError', 'RegExp.prototype.source getter called on non-object'))
+        src = this.props.get('source')
+        if src is None:
+            if this is proto:
+                return '(?:)'
+            raise _ThrowSignal(make_error('TypeError', 'RegExp.prototype.source requires a RegExp receiver'))
+        return src
+    proto._descriptors['source'] = {
+        'get': _make_native_fn('get source', _source_getter, 0),
+        'set': undefined,
+        'enumerable': False,
+        'configurable': True,
+    }
+
+    # flags getter (computed)
+    def _flags_getter(this, args):
+        if not isinstance(this, JSObject):
+            raise _ThrowSignal(make_error('TypeError', 'RegExp.prototype.flags getter called on non-object'))
+        result = ''
+        f = getattr(this, '_regex_flags', None)
+        if f is not None:
+            # Fast path: read from stored flags
+            for ch in 'dgimsuy':
+                if ch in f:
+                    result += ch
+            if 'v' in f:
+                result += 'v'
+        else:
+            # Slow path: read individual flag properties
+            for ch, name in [('d', 'hasIndices'), ('g', 'global'), ('i', 'ignoreCase'),
+                             ('m', 'multiline'), ('s', 'dotAll'), ('u', 'unicode'),
+                             ('v', 'unicodeSets'), ('y', 'sticky')]:
+                val = _obj_get_property(this, name)
+                if js_is_truthy(val):
+                    result += ch
+        return result
+    proto._descriptors['flags'] = {
+        'get': _make_native_fn('get flags', _flags_getter, 0),
+        'set': undefined,
+        'enumerable': False,
+        'configurable': True,
+    }
+
+    # Well-known symbol methods on RegExp.prototype
+
+    # @@match  -  RegExp.prototype[@@match](string)
+    def _regexp_symbol_match(this, args):
+        if not isinstance(this, JSObject) or this._regex is None:
+            raise _ThrowSignal(make_error('TypeError', 'RegExp.prototype[@@match] requires a RegExp receiver'))
+        s_str = js_to_string(args[0]) if args else ''
+        flags = getattr(this, '_regex_flags', '') or ''
+        if 'g' not in flags:
+            return _regexp_exec(this, s_str)
+        # Global match: collect all matches
+        this.props['lastIndex'] = 0
+        results = []
+        while True:
+            result = _regexp_exec(this, s_str)
+            if result is null:
+                break
+            match_str = js_to_string(_obj_get_property(result, '0'))
+            results.append(match_str)
+            if match_str == '':
+                this_index = js_to_number(this.props.get('lastIndex', 0))
+                this.props['lastIndex'] = _advance_string_index(s_str, int(this_index), 'u' in flags or 'v' in flags)
+        if not results:
+            return null
+        return make_array(results)
+    proto.props['@@match'] = _make_native_fn('[Symbol.match]', _regexp_symbol_match, 1)
+
+    # Build %RegExpStringIteratorPrototype%
+    from pyquickjs.interpreter import _WELL_KNOWN_SYMBOLS, _symbol_to_key
+    _regexp_str_iter_proto = JSObject(class_name='Object')
+    _iter_proto = _PROTOS.get('IteratorPrototype')
+    if _iter_proto:
+        _regexp_str_iter_proto.proto = _iter_proto
+    # [Symbol.toStringTag]
+    ts_sym = _WELL_KNOWN_SYMBOLS.get('Symbol.toStringTag')
+    if ts_sym:
+        ts_key = _symbol_to_key(ts_sym)
+        _regexp_str_iter_proto.props[ts_key] = 'RegExp String Iterator'
+        if _regexp_str_iter_proto._descriptors is None:
+            _regexp_str_iter_proto._descriptors = {}
+        _regexp_str_iter_proto._descriptors[ts_key] = {
+            'value': 'RegExp String Iterator', 'writable': False,
+            'enumerable': False, 'configurable': True,
+        }
+    # Register for ancestry test
+    _PROTOS['RegExpStringIterator'] = _regexp_str_iter_proto
+
+    # .next method placeholder — real next is per-instance, stored on the instance
+    # but the prototype needs a `next` for property descriptor tests
+    def _regexp_str_iter_next(this_iter, iter_args):
+        # Per-instance _matchAll_next stored on the instance
+        real_next = this_iter.props.get('_next')
+        if real_next is None:
+            raise _ThrowSignal(make_error('TypeError',
+                '%RegExpStringIteratorPrototype%.next requires a RegExp String Iterator'))
+        return _call_value(real_next, this_iter, iter_args or [])
+    _next_fn = _make_native_fn('next', _regexp_str_iter_next, 0)
+    _regexp_str_iter_proto.props['next'] = _next_fn
+
+    # @@matchAll  -  RegExp.prototype[@@matchAll](string)
+    def _regexp_symbol_matchAll(this, args):
+        if not isinstance(this, JSObject) or this._regex is None:
+            raise _ThrowSignal(make_error('TypeError', 'RegExp.prototype[@@matchAll] requires a RegExp receiver'))
+        s_str = js_to_string(args[0]) if args else ''
+        flags = getattr(this, '_regex_flags', '') or ''
+        # Create a copy of the regexp with 'g' flag
+        source = this.props.get('source', '')
+        new_flags = flags if 'g' in flags else flags + 'g'
+        matcher = interp._make_regexp(source, new_flags)
+        matcher.props['lastIndex'] = js_to_number(this.props.get('lastIndex', 0))
+        g_flag = 'g' in flags  # original global flag
+        u_flag = 'u' in new_flags or 'v' in new_flags
+
+        done = [False]
+
+        def _matchAll_next(this_iter, iter_args):
+            if done[0]:
+                return _make_iter_result(undefined, True)
+            result = _regexp_exec(matcher, s_str)
+            if result is null:
+                done[0] = True
+                return _make_iter_result(undefined, True)
+            if not g_flag:
+                # Non-global: yield one match, then done
+                done[0] = True
+            else:
+                match_str = js_to_string(_obj_get_property(result, '0'))
+                if match_str == '':
+                    this_index = js_to_number(matcher.props.get('lastIndex', 0))
+                    matcher.props['lastIndex'] = _advance_string_index(s_str, int(this_index), u_flag)
+            return _make_iter_result(result, False)
+
+        iter_obj = JSObject(class_name='RegExp String Iterator')
+        iter_obj.proto = _regexp_str_iter_proto
+        iter_obj.props['_next'] = _make_native_fn('next', _matchAll_next, 0)
+        iter_obj.props['@@iterator'] = _make_native_fn('[Symbol.iterator]', lambda t, a: iter_obj, 0)
+        return iter_obj
+    proto.props['@@matchAll'] = _make_native_fn('[Symbol.matchAll]', _regexp_symbol_matchAll, 1)
+
+    # @@search  -  RegExp.prototype[@@search](string)
+    def _regexp_symbol_search(this, args):
+        if not isinstance(this, JSObject) or this._regex is None:
+            raise _ThrowSignal(make_error('TypeError', 'RegExp.prototype[@@search] requires a RegExp receiver'))
+        s_str = js_to_string(args[0]) if args else ''
+        prev_last = this.props.get('lastIndex', 0)
+        this.props['lastIndex'] = 0
+        result = _regexp_exec(this, s_str)
+        this.props['lastIndex'] = prev_last
+        if result is null:
+            return -1
+        return _obj_get_property(result, 'index')
+    proto.props['@@search'] = _make_native_fn('[Symbol.search]', _regexp_symbol_search, 1)
+
+    # @@replace  -  RegExp.prototype[@@replace](string, replaceValue)
+    def _regexp_symbol_replace(this, args):
+        if not isinstance(this, JSObject) or this._regex is None:
+            raise _ThrowSignal(make_error('TypeError', 'RegExp.prototype[@@replace] requires a RegExp receiver'))
+        s_str = js_to_string(args[0]) if args else ''
+        replace_value = args[1] if len(args) > 1 else undefined
+        flags = getattr(this, '_regex_flags', '') or ''
+        is_global = 'g' in flags
+        u_flag = 'u' in flags or 'v' in flags
+        is_fn = isinstance(replace_value, (JSFunction, JSObject)) and (
+            isinstance(replace_value, JSFunction) or replace_value._call is not None)
+        if is_global:
+            this.props['lastIndex'] = 0
+        results = []
+        while True:
+            exec_result = _regexp_exec(this, s_str)
+            if exec_result is null:
+                break
+            results.append(exec_result)
+            if not is_global:
+                break
+            match_str = js_to_string(_obj_get_property(exec_result, '0'))
+            if match_str == '':
+                this_index = js_to_number(this.props.get('lastIndex', 0))
+                this.props['lastIndex'] = _advance_string_index(s_str, int(this_index), u_flag)
+        acc = ''
+        next_src_pos = 0
+        for r in results:
+            n_captures = max(0, int(js_to_number(_obj_get_property(r, 'length'))) - 1)
+            matched = js_to_string(_obj_get_property(r, '0'))
+            position = max(0, min(int(js_to_number(_obj_get_property(r, 'index'))), len(s_str)))
+            captures = []
+            for i in range(1, n_captures + 1):
+                cap = _obj_get_property(r, str(i))
+                if cap is not undefined and cap is not None:
+                    cap = js_to_string(cap)
+                else:
+                    cap = undefined
+                captures.append(cap)
+            named_captures = _obj_get_property(r, 'groups')
+            if is_fn:
+                fn_args = [matched] + captures + [position, s_str]
+                if named_captures is not undefined:
+                    fn_args.append(named_captures)
+                rep = js_to_string(_call_value(replace_value, undefined, fn_args))
+            else:
+                repl_str = js_to_string(replace_value)
+                # Build named dict for _js_get_substitution
+                from pyquickjs.interpreter import _js_get_substitution
+                named = None
+                if named_captures is not undefined and isinstance(named_captures, JSObject):
+                    named = dict(named_captures.props)
+                rep = _js_get_substitution(matched, s_str, position, captures, named, repl_str)
+            if position >= next_src_pos:
+                acc += s_str[next_src_pos:position] + rep
+                next_src_pos = position + len(matched)
+        acc += s_str[next_src_pos:]
+        return acc
+    proto.props['@@replace'] = _make_native_fn('[Symbol.replace]', _regexp_symbol_replace, 2)
+
+    # @@split  -  RegExp.prototype[@@split](string, limit)
+    def _regexp_symbol_split(this, args):
+        if not isinstance(this, JSObject) or this._regex is None:
+            raise _ThrowSignal(make_error('TypeError', 'RegExp.prototype[@@split] requires a RegExp receiver'))
+        s_str = js_to_string(args[0]) if args else ''
+        limit_arg = args[1] if len(args) > 1 else undefined
+        if limit_arg is undefined:
+            lim = 2**32 - 1
+        else:
+            lim = int(js_to_number(limit_arg)) & 0xFFFFFFFF
+        if lim == 0:
+            return make_array([])
+        regex = this._regex
+        flags = getattr(this, '_regex_flags', '') or ''
+        u_flag = 'u' in flags or 'v' in flags
+        result = []
+        p = 0  # last match end (start of next potential split)
+        if not s_str:
+            m = regex.search(s_str)
+            if m is None:
+                return make_array([s_str])
+            return make_array([])
+        q = p
+        while q < len(s_str):
+            m = regex.search(s_str, q)
+            if m is None or m.start() >= len(s_str):
+                break
+            e = m.end()
+            if e == p:
+                q = _advance_string_index(s_str, q, u_flag)
+                continue
+            result.append(s_str[p:m.start()])
+            if len(result) >= lim:
+                return make_array(result)
+            p = e
+            # Add captures
+            for i in range(1, m.re.groups + 1):
+                g = m.group(i)
+                result.append(undefined if g is None else g)
+                if len(result) >= lim:
+                    return make_array(result)
+            q = p
+        result.append(s_str[p:])
+        return make_array(result)
+    proto.props['@@split'] = _make_native_fn('[Symbol.split]', _regexp_symbol_split, 2)
+
     _set_ctor_prototype(obj, proto)
+
+    # RegExp.escape static method
+    _SYNTAX_CHARS = set('.*+?^$|()[]{}\\/')
+    _CONTROL_MAP = {'\t': '\\t', '\n': '\\n', '\x0b': '\\v', '\f': '\\f', '\r': '\\r'}
+    _OTHER_PUNCTUATORS = set(',-=<>#&!%:;@~\'`"')
+    _WHITESPACE = set(' \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\ufeff')
+    _LINE_TERMINATORS = set('\u2028\u2029')
+
+    def _regexp_escape(this_val, args):
+        if not args or not isinstance(args[0], str):
+            raise _ThrowSignal(make_error('TypeError', 'RegExp.escape requires a string argument'))
+        s = args[0]
+        if not s:
+            return ''
+        result = []
+        for i, ch in enumerate(s):
+            cp = ord(ch)
+            if ch in _SYNTAX_CHARS:
+                result.append('\\')
+                result.append(ch)
+            elif ch in _CONTROL_MAP:
+                result.append(_CONTROL_MAP[ch])
+            elif ch in _OTHER_PUNCTUATORS:
+                result.append('\\x%02x' % cp)
+            elif ch in _WHITESPACE:
+                if cp <= 0xff:
+                    result.append('\\x%02x' % cp)
+                else:
+                    result.append('\\u%04x' % cp)
+            elif ch in _LINE_TERMINATORS:
+                result.append('\\u%04x' % cp)
+            elif 0xd800 <= cp <= 0xdfff:
+                # Lone surrogates
+                result.append('\\u%04x' % cp)
+            elif i == 0 and ch != '_' and (ch.isascii() and (ch.isalpha() or ch.isdigit())):
+                # Leading ASCII letter or digit (not underscore)
+                result.append('\\x%02x' % cp)
+            else:
+                result.append(ch)
+        return ''.join(result)
+
+    escape_fn = _make_native_fn('escape', _regexp_escape, 1)
+    if obj._descriptors is None:
+        obj._descriptors = {}
+    obj.props['escape'] = escape_fn
+    obj._descriptors['escape'] = {'value': escape_fn, 'writable': True, 'enumerable': False, 'configurable': True}
 
     return obj
 
@@ -4384,7 +5087,8 @@ def _regexp_test(regexp, args):
     if not isinstance(regexp, JSObject) or regexp._regex is None:
         return False
     s = js_to_string(args[0]) if args else ''
-    if regexp.props.get('global') or regexp.props.get('sticky'):
+    rf = getattr(regexp, '_regex_flags', '') or ''
+    if 'g' in rf or 'y' in rf:
         last = regexp.props.get('lastIndex', 0)
         m = regexp._regex.search(s, int(js_to_number(last)))
         if m:
@@ -4443,22 +5147,28 @@ def _advance_string_index(s, index, unicode_mode):
 
 def _regexp_exec(regexp, s):
     if not isinstance(regexp, JSObject) or regexp._regex is None:
-        return null
+        raise _ThrowSignal(make_error('TypeError', 'RegExp.prototype.exec requires a RegExp receiver'))
     s_str = js_to_string(s)
-    flags = regexp.props.get('flags', '')
+    flags = getattr(regexp, '_regex_flags', '') or ''
     u_mode = 'u' in flags or 'v' in flags
-    if regexp.props.get('global') or regexp.props.get('sticky'):
-        last = int(js_to_number(regexp.props.get('lastIndex', 0)))
+    if 'g' in flags or 'y' in flags:
+        raw_last = regexp.props.get('lastIndex', 0)
+        n = js_to_number(raw_last)
+        import math as _math
+        if _math.isnan(n) or n < 0:
+            last = 0
+        elif _math.isinf(n):
+            last = 2**53
+        else:
+            last = int(n)
         # With u/v flag, if lastIndex is inside a surrogate pair, advance/snap as per spec
         advanced_past_surrogate = False
         if u_mode and 0 < last < len(s_str) and _is_trailing_surrogate(s_str[last]):
             if _is_leading_surrogate(s_str[last - 1]):
                 v_mode = 'v' in flags
                 if v_mode:
-                    # v-flag: snap back to start of surrogate pair
                     last = last - 1
                 else:
-                    # u-flag: advance past the trailing surrogate
                     last += 1
                     advanced_past_surrogate = True
         if last > len(s_str) or (advanced_past_surrogate and last >= len(s_str)):
@@ -4474,10 +5184,25 @@ def _regexp_exec(regexp, s):
         m = regexp._regex.search(s_str)
     if m is None:
         return null
+    return _build_exec_result(m, s_str, flags)
+
+
+def _build_exec_result(m, s_str, flags):
+    """Build the result array from a match object (shared by exec and str_match)."""
     groups = _js_groups_from_match(m)
     result = make_array([m.group(0)] + [undefined if g is None else g for g in groups])
     result.props['index'] = m.start()
     result.props['input'] = s_str
+    # groups property (named captures → null-proto object, else undefined)
+    gdict = m.groupdict()
+    if gdict:
+        groups_obj = JSObject()
+        groups_obj.proto = None  # Object.create(null)
+        for name, val in gdict.items():
+            groups_obj.props[name] = undefined if val is None else val
+        result.props['groups'] = groups_obj
+    else:
+        result.props['groups'] = undefined
     # d flag: add indices property
     if 'd' in flags:
         idx_items = [make_array([m.start(), m.end()])]
@@ -4490,7 +5215,24 @@ def _regexp_exec(regexp, s):
                     idx_items.append(make_array([gs, ge]))
                 except Exception:
                     idx_items.append(undefined)
-        result.props['indices'] = make_array(idx_items)
+        indices_arr = make_array(idx_items)
+        # d flag + named groups: add groups to indices
+        if gdict:
+            idx_groups = JSObject()
+            idx_groups.proto = None
+            for name in gdict:
+                try:
+                    gs, ge = m.span(name)
+                    if gdict[name] is None:
+                        idx_groups.props[name] = undefined
+                    else:
+                        idx_groups.props[name] = make_array([gs, ge])
+                except Exception:
+                    idx_groups.props[name] = undefined
+            indices_arr.props['groups'] = idx_groups
+        else:
+            indices_arr.props['groups'] = undefined
+        result.props['indices'] = indices_arr
     return result
 
 

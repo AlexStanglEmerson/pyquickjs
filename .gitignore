@@ -222,3 +222,4 @@ Sandbox.py
 debug_*.py
 *.txt
 debug/
+js_test_results.xml

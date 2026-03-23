@@ -15,6 +15,14 @@ from __future__ import annotations
 
 import gc
 import sys
+from pathlib import Path
+
+# Ensure the project root is on sys.path so pyquickjs is importable
+# when this script is run as a subprocess.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 try:
     import tracemalloc
     _HAS_TRACEMALLOC = True

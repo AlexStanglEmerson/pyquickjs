@@ -3604,7 +3604,7 @@ class Interpreter:
             return self.exec(node.body, env)
         except _BreakSignal as e:
             if e.label == label:
-                return undefined
+                return e.value if e.value is not None else undefined
             raise
 
     def _exec_switch(self, node: SwitchStatement, env: Environment) -> Any:
@@ -3983,10 +3983,14 @@ class Interpreter:
             obj._regex = None
         obj.props['source'] = pattern
         obj.props['flags'] = flags
-        obj.props['global'] = 'g' in flags
-        obj.props['ignoreCase'] = 'i' in flags
-        obj.props['multiline'] = 'm' in flags
         obj.props['lastIndex'] = 0
+        # lastIndex: writable, non-enumerable, non-configurable
+        if obj._descriptors is None:
+            obj._descriptors = {}
+        obj._descriptors['lastIndex'] = {'value': 0, 'writable': True, 'enumerable': False, 'configurable': False}
+        # source and flags should also be non-enumerable
+        obj._descriptors['source'] = {'value': pattern, 'writable': False, 'enumerable': False, 'configurable': True}
+        obj._descriptors['flags'] = {'value': flags, 'writable': False, 'enumerable': False, 'configurable': True}
         return obj
 
     def _eval_array_expr(self, node: ArrayExpression, env: Environment) -> JSObject:
@@ -4898,7 +4902,22 @@ class Interpreter:
         # Compound assignment - cache MemberExpression evaluation
         cached_obj = None
         cached_key = None
+        cached_is_super = False
+
+        def _compound_set(new_val):
+            """Set the compound assignment target."""
+            if cached_obj is not None:
+                if cached_is_super:
+                    this_val = env.get('this') if env.has_binding('this') else undefined
+                    if isinstance(this_val, JSObject):
+                        _obj_set_property(this_val, cached_key, new_val, env._is_strict())
+                        return
+                self._set_property(cached_obj, cached_key, new_val, env._is_strict())
+            else:
+                self._set_ref(left, new_val, env)
+
         if lt == 'MemberExpression':
+            cached_is_super = type(left.object).__name__ == 'Super'
             cached_obj = self.eval(left.object, env)
             if left.computed:
                 key_val = self.eval(left.property, env)
@@ -4910,7 +4929,11 @@ class Interpreter:
                 cached_key = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else js_to_string(key_val)
             else:
                 cached_key = left.property.name
-            current = self._get_property(cached_obj, cached_key)
+            if cached_is_super and isinstance(cached_obj, JSObject):
+                this_val = env.get('this') if env.has_binding('this') else undefined
+                current = _obj_get_property(cached_obj, cached_key, this=this_val)
+            else:
+                current = self._get_property(cached_obj, cached_key)
         else:
             current = self._get_ref(left, env)
         # Logical assignments: short-circuit BEFORE evaluating RHS
@@ -4920,10 +4943,7 @@ class Interpreter:
             new_val = self.eval(node.right, env)
             if lt == 'Identifier' and _is_anonymous_function_def(node.right):
                 _set_function_name(new_val, left.name)
-            if cached_obj is not None:
-                self._set_property(cached_obj, cached_key, new_val, env._is_strict())
-            else:
-                self._set_ref(left, new_val, env)
+            _compound_set(new_val)
             return new_val
         if op == '||=':
             if js_is_truthy(current):
@@ -4931,10 +4951,7 @@ class Interpreter:
             new_val = self.eval(node.right, env)
             if lt == 'Identifier' and _is_anonymous_function_def(node.right):
                 _set_function_name(new_val, left.name)
-            if cached_obj is not None:
-                self._set_property(cached_obj, cached_key, new_val, env._is_strict())
-            else:
-                self._set_ref(left, new_val, env)
+            _compound_set(new_val)
             return new_val
         if op == '??=':
             if current is not null and current is not undefined:
@@ -4942,10 +4959,7 @@ class Interpreter:
             new_val = self.eval(node.right, env)
             if lt == 'Identifier' and _is_anonymous_function_def(node.right):
                 _set_function_name(new_val, left.name)
-            if cached_obj is not None:
-                self._set_property(cached_obj, cached_key, new_val, env._is_strict())
-            else:
-                self._set_ref(left, new_val, env)
+            _compound_set(new_val)
             return new_val
 
         right_val = self.eval(node.right, env)
@@ -4977,10 +4991,7 @@ class Interpreter:
         else:
             raise _ThrowSignal(make_error('TypeError', f'Unknown assignment op: {op}'))
 
-        if cached_obj is not None:
-            self._set_property(cached_obj, cached_key, new_val, env._is_strict())
-        else:
-            self._set_ref(left, new_val, env)
+        _compound_set(new_val)
         return new_val
 
     def _assign_to(self, left, value, env: Environment) -> None:
@@ -4989,13 +5000,22 @@ class Interpreter:
         if t == 'Identifier':
             env.set(left.name, value)
         elif t == 'MemberExpression':
+            is_super = type(left.object).__name__ == 'Super'
             obj = self.eval(left.object, env)
             if left.computed:
                 key_val = self.eval(left.property, env)
                 key = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else js_to_string(key_val)
             else:
                 key = left.property.name
-            self._set_property(obj, key, value, env._is_strict())
+            if is_super:
+                # super.x = val: set on `this`, walking super proto chain for descriptors
+                this_val = env.get('this') if env.has_binding('this') else undefined
+                if isinstance(this_val, JSObject):
+                    _obj_set_property(this_val, key, value, env._is_strict())
+                elif isinstance(obj, JSObject):
+                    _obj_set_property(obj, key, value, env._is_strict())
+            else:
+                self._set_property(obj, key, value, env._is_strict())
         elif t == 'ArrayPattern':
             self._bind_array_pattern(left, value, env, 'var')
         elif t == 'ObjectPattern':
@@ -5320,6 +5340,22 @@ class Interpreter:
         to_gen: _queue_module.Queue = _queue_module.Queue()
         _state = {'started': False, 'done': False}
 
+        # Eagerly bind parameters in the calling thread (per spec:
+        # FunctionDeclarationInstantiation happens during [[Call]], not .next()).
+        # Errors during parameter binding propagate immediately to the caller.
+        call_env = Environment(parent=fn.env, is_function=True)
+        call_env.define_let('this', this)
+        call_env.define_let('arguments', self._make_arguments(args, strict=_fn_is_strict(fn) or _fn_has_non_simple_params(fn), callee=fn))
+        call_env.define_let('new.target', undefined)
+        if fn.home_obj is not None:
+            if isinstance(fn.home_obj, JSFunction):
+                call_env.define_let('@@super_proto', fn.home_obj._super_ctor)
+            else:
+                call_env.define_let('@@super_proto', fn.home_obj.proto)
+        self._bind_params(fn.params, args, call_env)
+        if isinstance(fn.body, BlockStatement):
+            self._hoist_declarations(fn.body.body, call_env)
+
         def yield_hook(val: Any, delegate: bool) -> Any:
             """Called from within the generator thread when a yield is encountered."""
             if delegate:
@@ -5361,19 +5397,7 @@ class Interpreter:
         def gen_run():
             _thread_local.yield_hook = yield_hook
             try:
-                call_env = Environment(parent=fn.env, is_function=True)
-                call_env.define_let('this', this)
-                call_env.define_let('arguments', self._make_arguments(args, strict=_fn_is_strict(fn) or _fn_has_non_simple_params(fn), callee=fn))
-                call_env.define_let('new.target', undefined)
-                # Set @@super_proto for generator methods with a home object
-                if fn.home_obj is not None:
-                    if isinstance(fn.home_obj, JSFunction):
-                        call_env.define_let('@@super_proto', fn.home_obj._super_ctor)
-                    else:
-                        call_env.define_let('@@super_proto', fn.home_obj.proto)
-                self._bind_params(fn.params, args, call_env)
                 if isinstance(fn.body, BlockStatement):
-                    self._hoist_declarations(fn.body.body, call_env)
                     try:
                         self._exec_block(fn.body, call_env, new_scope=False)
                         from_gen.put(('return', undefined))
@@ -5641,9 +5665,14 @@ class Interpreter:
         if node.line:
             self._current_line = node.line
             self._current_col = node.col
+        is_super = type(node.object).__name__ == 'Super'
         obj = self.eval(node.object, env)
         if node.optional and (obj is null or obj is undefined):
             raise _OptionalChainShortCircuit()
+        # For super property access, null base must throw TypeError
+        if is_super and (obj is null or obj is None or obj is undefined):
+            raise _ThrowSignal(make_error('TypeError',
+                "Cannot read properties of null (reading from super)"))
         if node.computed:
             key = self.eval(node.property, env)
             # Per spec: throw TypeError for null/undefined BEFORE ToPropertyKey
@@ -5659,6 +5688,10 @@ class Interpreter:
                 key_str = js_to_string(key)
         else:
             key_str = node.property.name
+        if is_super and isinstance(obj, JSObject):
+            # Super property read: look up on super proto chain, but invoke getters with `this`
+            this_val = env.get('this') if env.has_binding('this') else undefined
+            return _obj_get_property(obj, key_str, this=this_val)
         return self._get_property(obj, key_str)
 
     def _eval_template(self, node: TemplateLiteral, env: Environment) -> str:
@@ -5671,13 +5704,62 @@ class Interpreter:
         return ''.join(parts)
 
     def _eval_tagged_template(self, node: TaggedTemplateExpression, env: Environment) -> Any:
-        tag = self.eval(node.tag, env)
-        strings = make_array([q.value for q in node.quasi.quasis])
-        # raw strings — use the raw field which preserves escape sequences
-        raw = make_array([q.raw for q in node.quasi.quasis])
-        strings.props['raw'] = raw
+        # Determine tag function and this binding
+        tag_node = node.tag
+        tag_type = type(tag_node).__name__
+        if tag_type == 'MemberExpression':
+            obj = self.eval(tag_node.object, env)
+            if tag_node.computed:
+                prop = self.eval(tag_node.property, env)
+                tag = _obj_get_property(obj, js_to_string(prop) if not isinstance(prop, str) else prop)
+            else:
+                tag = _obj_get_property(obj, tag_node.property.name)
+            this_val = obj
+        else:
+            tag = self.eval(tag_node, env)
+            this_val = undefined
+
+        # GetTemplateObject: cache by AST node identity
+        cache = getattr(self, '_template_cache', None)
+        if cache is None:
+            cache = {}
+            self._template_cache = cache
+        node_id = id(node.quasi)
+        if node_id in cache:
+            strings = cache[node_id]
+        else:
+            cooked = [q.value if q.value is not None else undefined for q in node.quasi.quasis]
+            raw_vals = [q.raw for q in node.quasi.quasis]
+            strings = make_array(cooked)
+            raw = make_array(raw_vals)
+            # Freeze both arrays: make elements and length non-writable/non-configurable
+            def _freeze_template_arr(arr):
+                if arr._descriptors is None:
+                    arr._descriptors = {}
+                data = arr.props.get('@@array_data', [])
+                for i in range(len(data)):
+                    arr._descriptors[str(i)] = {
+                        'value': data[i], 'writable': False,
+                        'enumerable': True, 'configurable': False,
+                    }
+                arr._descriptors['length'] = {
+                    'value': len(data), 'writable': False,
+                    'enumerable': False, 'configurable': False,
+                }
+                arr.extensible = False
+            _freeze_template_arr(raw)
+            strings.props['raw'] = raw
+            if strings._descriptors is None:
+                strings._descriptors = {}
+            strings._descriptors['raw'] = {
+                'value': raw, 'writable': False,
+                'enumerable': False, 'configurable': False,
+            }
+            _freeze_template_arr(strings)
+            cache[node_id] = strings
+
         args = [strings] + [self.eval(e, env) for e in node.quasi.expressions]
-        return self._call(tag, undefined, args)
+        return self._call(tag, this_val, args)
 
     def _make_function(self, node, env: Environment) -> JSFunction:
         """Create a JSFunction from a function AST node."""
@@ -6097,14 +6179,63 @@ class Interpreter:
                 return s2.rfind(search)
             return str_method(lastIndexOf)
         if key == 'includes':
-            return str_method(lambda this, args:
-                js_to_string(args[0]) in js_to_string(this) if args else False)
+            def str_includes(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.includes called on null or undefined"))
+                s2 = js_to_string(this)
+                if args and isinstance(args[0], JSObject) and args[0]._regex:
+                    raise _ThrowSignal(make_error('TypeError', "First argument to String.prototype.includes must not be a regular expression"))
+                search = js_to_string(args[0]) if args else 'undefined'
+                pos = 0
+                if len(args) > 1 and args[1] is not undefined:
+                    n = js_to_number(args[1])
+                    if math.isnan(n):
+                        pos = 0
+                    elif math.isinf(n):
+                        pos = len(s2) if n > 0 else 0
+                    else:
+                        pos = max(0, int(n))
+                return s2.find(search, pos) != -1
+            return str_method(str_includes)
         if key == 'startsWith':
-            return str_method(lambda this, args:
-                js_to_string(this).startswith(js_to_string(args[0])) if args else False)
+            def str_startsWith(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.startsWith called on null or undefined"))
+                s2 = js_to_string(this)
+                if args and isinstance(args[0], JSObject) and args[0]._regex:
+                    raise _ThrowSignal(make_error('TypeError', "First argument to String.prototype.startsWith must not be a regular expression"))
+                search = js_to_string(args[0]) if args else 'undefined'
+                pos = 0
+                if len(args) > 1 and args[1] is not undefined:
+                    n = js_to_number(args[1])
+                    if math.isnan(n):
+                        pos = 0
+                    elif math.isinf(n):
+                        pos = len(s2) if n > 0 else 0
+                    else:
+                        pos = max(0, int(n))
+                return s2.startswith(search, pos)
+            return str_method(str_startsWith)
         if key == 'endsWith':
-            return str_method(lambda this, args:
-                js_to_string(this).endswith(js_to_string(args[0])) if args else False)
+            def str_endsWith(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.endsWith called on null or undefined"))
+                s2 = js_to_string(this)
+                if args and isinstance(args[0], JSObject) and args[0]._regex:
+                    raise _ThrowSignal(make_error('TypeError', "First argument to String.prototype.endsWith must not be a regular expression"))
+                search = js_to_string(args[0]) if args else 'undefined'
+                if len(args) > 1 and args[1] is not undefined:
+                    n = js_to_number(args[1])
+                    if math.isnan(n):
+                        end_pos = 0
+                    elif math.isinf(n):
+                        end_pos = len(s2) if n > 0 else 0
+                    else:
+                        end_pos = max(0, min(int(n), len(s2)))
+                else:
+                    end_pos = len(s2)
+                return s2[:end_pos].endswith(search)
+            return str_method(str_endsWith)
         if key == 'slice':
             def str_slice(this, args):
                 s2 = js_to_string(this)
@@ -6133,9 +6264,16 @@ class Interpreter:
             return str_method(lambda this, args: js_to_string(this).rstrip())
         if key == 'split':
             def str_split(this, args):
-                s2 = js_to_string(this)
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.split called on null or undefined"))
                 sep = args[0] if args else undefined
                 limit_arg = args[1] if len(args) > 1 else undefined
+                # @@split protocol
+                if sep is not undefined and sep is not null and isinstance(sep, JSObject):
+                    splitter = _obj_get_property(sep, '@@split')
+                    if splitter is not undefined and splitter is not None:
+                        return _call_value(splitter, sep, [this, limit_arg])
+                s2 = js_to_string(this)
                 if limit_arg is not undefined:
                     lim = js_to_number(limit_arg)
                     limit = 0 if math.isnan(lim) or lim < 0 else min(int(lim), 2**32 - 1)
@@ -6148,8 +6286,7 @@ class Interpreter:
                     return make_array(result)
                 sep_str = js_to_string(sep)
                 if sep_str == '':
-                    # Split into UTF-16 code units
-                    parts = list(s2)  # already stored as code units
+                    parts = list(s2)
                 else:
                     parts = s2.split(sep_str)
                 if limit is not None:
@@ -6158,6 +6295,12 @@ class Interpreter:
             return str_method(str_split)
         if key == 'replace':
             def str_replace(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.replace called on null or undefined"))
+                if args and args[0] is not undefined and args[0] is not null and isinstance(args[0], JSObject):
+                    replacer = _obj_get_property(args[0], '@@replace')
+                    if replacer is not undefined and replacer is not None:
+                        return _call_value(replacer, args[0], [this] + args[1:])
                 s2 = js_to_string(this)
                 if not args:
                     return s2
@@ -6165,22 +6308,67 @@ class Interpreter:
                 replacement = args[1] if len(args) > 1 else undefined
                 if isinstance(pattern, JSObject) and pattern._regex:
                     regex = pattern._regex
-                    if pattern.props.get('global'):
-                        if isinstance(replacement, JSFunction):
-                            def repl_fn(m):
-                                groups = [m.group(0)] + list(m.groups())
-                                return js_to_string(interp.call_function(replacement, undefined, groups + [m.start(), s2]))
-                            return regex.sub(repl_fn, s2)
-                        return regex.sub(js_to_string(replacement), s2)
-                    else:
-                        if isinstance(replacement, JSFunction):
+                    flags = getattr(pattern, '_regex_flags', '') or ''
+                    is_global = 'g' in flags
+                    if isinstance(replacement, JSFunction):
+                        if is_global:
+                            # Global functional replace
+                            result_parts = []
+                            last_end = 0
+                            for m in regex.finditer(s2):
+                                result_parts.append(s2[last_end:m.start()])
+                                caps = [undefined if g is None else g for g in m.groups()]
+                                repl_args = [m.group(0)] + caps + [m.start(), s2]
+                                gdict = m.groupdict()
+                                if gdict:
+                                    go = JSObject()
+                                    go.proto = None
+                                    for gn, gv in gdict.items():
+                                        go.props[gn] = undefined if gv is None else gv
+                                    repl_args.append(go)
+                                result_parts.append(js_to_string(interp.call_function(replacement, undefined, repl_args)))
+                                last_end = m.end()
+                            result_parts.append(s2[last_end:])
+                            return ''.join(result_parts)
+                        else:
+                            # Non-global functional replace
                             m = regex.search(s2)
                             if m:
-                                groups = [m.group(0)] + list(m.groups())
-                                r = js_to_string(interp.call_function(replacement, undefined, groups + [m.start(), s2]))
+                                caps = [undefined if g is None else g for g in m.groups()]
+                                repl_args = [m.group(0)] + caps + [m.start(), s2]
+                                gdict = m.groupdict()
+                                if gdict:
+                                    go = JSObject()
+                                    go.proto = None
+                                    for gn, gv in gdict.items():
+                                        go.props[gn] = undefined if gv is None else gv
+                                    repl_args.append(go)
+                                r = js_to_string(interp.call_function(replacement, undefined, repl_args))
                                 return s2[:m.start()] + r + s2[m.end():]
                             return s2
-                        return regex.sub(js_to_string(replacement), s2, count=1)
+                    else:
+                        repl_str = js_to_string(replacement)
+                        if is_global:
+                            result_parts = []
+                            last_end = 0
+                            for m in regex.finditer(s2):
+                                result_parts.append(s2[last_end:m.start()])
+                                caps = [undefined if g is None else g for g in m.groups()]
+                                gdict = m.groupdict()
+                                named = gdict if gdict else None
+                                result_parts.append(_js_get_substitution(m.group(0), s2, m.start(), caps, named, repl_str))
+                                last_end = m.end()
+                            result_parts.append(s2[last_end:])
+                            return ''.join(result_parts)
+                        else:
+                            m = regex.search(s2)
+                            if m:
+                                caps = [undefined if g is None else g for g in m.groups()]
+                                gdict = m.groupdict()
+                                named = gdict if gdict else None
+                                r = _js_get_substitution(m.group(0), s2, m.start(), caps, named, repl_str)
+                                return s2[:m.start()] + r + s2[m.end():]
+                            return s2
                 pat_str = js_to_string(pattern)
                 if isinstance(replacement, JSFunction):
                     idx = s2.find(pat_str)
@@ -6192,22 +6380,59 @@ class Interpreter:
             return str_method(str_replace)
         if key == 'replaceAll':
             def str_replaceAll(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.replaceAll called on null or undefined"))
+                if args and args[0] is not undefined and args[0] is not null and isinstance(args[0], JSObject):
+                    # If first arg is a RegExp, it must have the 'g' flag
+                    if args[0]._regex:
+                        flags = getattr(args[0], '_regex_flags', '') or ''
+                        if 'g' not in flags:
+                            raise _ThrowSignal(make_error('TypeError', "String.prototype.replaceAll called with a non-global RegExp argument"))
+                    replacer = _obj_get_property(args[0], '@@replace')
+                    if replacer is not undefined and replacer is not None:
+                        return _call_value(replacer, args[0], [this] + args[1:])
                 s2 = js_to_string(this)
                 if not args:
                     return s2
-                pat_str = js_to_string(args[0])
-                repl = js_to_string(args[1]) if len(args) > 1 else ''
-                return s2.replace(pat_str, repl)
+                searchValue = args[0]
+                replaceValue = args[1] if len(args) > 1 else undefined
+                pat_str = js_to_string(searchValue)
+                if isinstance(replaceValue, JSFunction):
+                    result_parts = []
+                    last_end = 0
+                    idx = s2.find(pat_str)
+                    while idx >= 0:
+                        result_parts.append(s2[last_end:idx])
+                        r = js_to_string(interp.call_function(replaceValue, undefined, [pat_str, idx, s2]))
+                        result_parts.append(r)
+                        last_end = idx + len(pat_str)
+                        if not pat_str:
+                            if last_end < len(s2):
+                                result_parts.append(s2[last_end])
+                                last_end += 1
+                            else:
+                                break
+                        idx = s2.find(pat_str, last_end)
+                    result_parts.append(s2[last_end:])
+                    return ''.join(result_parts)
+                repl_str = js_to_string(replaceValue)
+                return s2.replace(pat_str, repl_str)
             return str_method(str_replaceAll)
         if key == 'match':
             def str_match(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.match called on null or undefined"))
+                if args and args[0] is not undefined and args[0] is not null and isinstance(args[0], JSObject):
+                    matcher = _obj_get_property(args[0], '@@match')
+                    if matcher is not undefined and matcher is not None:
+                        return _call_value(matcher, args[0], [this])
                 s2 = js_to_string(this)
                 if not args:
                     return null
                 pattern = args[0]
                 if isinstance(pattern, JSObject) and pattern._regex:
                     regex = pattern._regex
-                    if pattern.props.get('global'):
+                    if 'g' in (getattr(pattern, '_regex_flags', '') or ''):
                         matches = regex.findall(s2)
                         if not matches:
                             return null
@@ -6216,9 +6441,19 @@ class Interpreter:
                         m = regex.search(s2)
                         if m is None:
                             return null
-                        result = make_array([m.group(0)] + list(m.groups()))
+                        grps = list(m.groups())
+                        result = make_array([m.group(0)] + [undefined if g is None else g for g in grps])
                         result.props['index'] = m.start()
                         result.props['input'] = s2
+                        gdict = m.groupdict()
+                        if gdict:
+                            groups_obj = JSObject()
+                            groups_obj.proto = None
+                            for gname, gval in gdict.items():
+                                groups_obj.props[gname] = undefined if gval is None else gval
+                            result.props['groups'] = groups_obj
+                        else:
+                            result.props['groups'] = undefined
                         return result
                 # String pattern: create temp regex
                 pat_str = js_to_string(pattern)
@@ -6231,23 +6466,60 @@ class Interpreter:
             return str_method(str_match)
         if key == 'matchAll':
             def str_matchAll(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.matchAll called on null or undefined"))
+                pattern = args[0] if args else undefined
+                if pattern is not undefined and pattern is not null and isinstance(pattern, JSObject):
+                    # If pattern is a regexp, it must have 'g' flag
+                    if pattern._regex:
+                        flags = getattr(pattern, '_regex_flags', '') or ''
+                        if 'g' not in flags:
+                            raise _ThrowSignal(make_error('TypeError', "String.prototype.matchAll called with a non-global RegExp argument"))
+                    matcher = _obj_get_property(pattern, '@@matchAll')
+                    if matcher is not undefined and matcher is not None:
+                        return _call_value(matcher, pattern, [this])
                 s2 = js_to_string(this)
-                if not args:
-                    return _string_iterator('')
-                pattern = args[0]
+                if pattern is undefined or pattern is null:
+                    return _to_iterator_obj([])
                 if isinstance(pattern, JSObject) and pattern._regex:
                     regex = pattern._regex
                     matches_list = []
                     for m in regex.finditer(s2):
-                        result = make_array([m.group(0)] + list(m.groups()))
-                        result.props['index'] = m.start()
-                        result.props['input'] = s2
-                        matches_list.append(result)
+                        grps = list(m.groups())
+                        r = make_array([m.group(0)] + [undefined if g is None else g for g in grps])
+                        r.props['index'] = m.start()
+                        r.props['input'] = s2
+                        gdict = m.groupdict()
+                        if gdict:
+                            go = JSObject()
+                            go.proto = None
+                            for gn, gv in gdict.items():
+                                go.props[gn] = undefined if gv is None else gv
+                            r.props['groups'] = go
+                        else:
+                            r.props['groups'] = undefined
+                        matches_list.append(r)
                     return _to_iterator_obj(matches_list)
-                return _to_iterator_obj([])
+                # Convert to string and treat as regex with 'g' flag
+                pat_str = js_to_string(pattern)
+                escaped = re.escape(pat_str)
+                matches_list = []
+                for m in re.finditer(escaped, s2):
+                    r = make_array([m.group(0)])
+                    r.props['index'] = m.start()
+                    r.props['input'] = s2
+                    r.props['groups'] = undefined
+                    matches_list.append(r)
+                return _to_iterator_obj(matches_list)
             return str_method(str_matchAll)
         if key == 'search':
             def str_search(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.search called on null or undefined"))
+                if args and args[0] is not undefined and args[0] is not null and isinstance(args[0], JSObject):
+                    searcher = _obj_get_property(args[0], '@@search')
+                    if searcher is not undefined and searcher is not None:
+                        return _call_value(searcher, args[0], [this])
                 s2 = js_to_string(this)
                 if not args:
                     return -1
@@ -6344,36 +6616,69 @@ class Interpreter:
         if key == 'toString':
             def toString(this, args):
                 radix = int(js_to_number(args[0])) if args and args[0] is not undefined else 10
+                if radix < 2 or radix > 36:
+                    raise _ThrowSignal(make_error('RangeError', 'toString() radix must be between 2 and 36'))
                 v = this if not isinstance(this, JSObject) else js_to_number(this)
                 if radix == 10:
                     return js_to_string(v)
-                if isinstance(v, float) and (v != math.trunc(v) or math.isnan(v) or math.isinf(v)):
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v) or v != math.trunc(v)):
                     return _float_to_radix_string(v, radix)
                 return _int_to_radix(int(v), radix)
-            return _make_native_fn('toString', toString)
+            return _make_native_fn('toString', toString, 1)
         if key == 'toFixed':
             def toFixed(this, args):
-                digits = int(js_to_number(args[0])) if args else 0
                 v = js_to_number(this) if isinstance(this, JSObject) else this
                 v = float(v) if isinstance(v, int) else v
+                raw_digits = js_to_number(args[0]) if args and args[0] is not undefined else 0
+                if isinstance(raw_digits, float) and (math.isnan(raw_digits) or math.isinf(raw_digits)):
+                    raise _ThrowSignal(make_error('RangeError', 'toFixed() digits argument must be between 0 and 100'))
+                digits = int(raw_digits)
+                if digits < 0 or digits > 100:
+                    raise _ThrowSignal(make_error('RangeError', 'toFixed() digits argument must be between 0 and 100'))
+                if math.isnan(v):
+                    return 'NaN'
+                if math.isinf(v):
+                    return 'Infinity' if v > 0 else '-Infinity'
+                if abs(v) >= 1e21:
+                    return js_to_string(v)
                 return _js_to_fixed(v, digits)
-            return _make_native_fn('toFixed', toFixed)
+            return _make_native_fn('toFixed', toFixed, 1)
         if key == 'toExponential':
             def toExponential(this, args):
                 v = js_to_number(this) if isinstance(this, JSObject) else this
                 v = float(v) if isinstance(v, int) else v
-                fd = None if not args or args[0] is undefined else int(js_to_number(args[0]))
+                if math.isnan(v):
+                    return 'NaN'
+                if math.isinf(v):
+                    return 'Infinity' if v > 0 else '-Infinity'
+                if not args or args[0] is undefined:
+                    return _js_to_exponential(v, None)
+                raw_fd = js_to_number(args[0])
+                if isinstance(raw_fd, float) and (math.isnan(raw_fd) or math.isinf(raw_fd)):
+                    raise _ThrowSignal(make_error('RangeError', 'toExponential() argument must be between 0 and 100'))
+                fd = int(raw_fd)
+                if fd < 0 or fd > 100:
+                    raise _ThrowSignal(make_error('RangeError', 'toExponential() argument must be between 0 and 100'))
                 return _js_to_exponential(v, fd)
-            return _make_native_fn('toExponential', toExponential)
+            return _make_native_fn('toExponential', toExponential, 1)
         if key == 'toPrecision':
             def toPrecision(this, args):
                 v = js_to_number(this) if isinstance(this, JSObject) else this
                 v = float(v) if isinstance(v, int) else v
                 if not args or args[0] is undefined:
                     return js_to_string(v)
-                p = int(js_to_number(args[0]))
+                raw_p = js_to_number(args[0])
+                if isinstance(raw_p, float) and (math.isnan(raw_p) or math.isinf(raw_p)):
+                    raise _ThrowSignal(make_error('RangeError', 'toPrecision() argument must be between 1 and 100'))
+                p = int(raw_p)
+                if p < 1 or p > 100:
+                    raise _ThrowSignal(make_error('RangeError', 'toPrecision() argument must be between 1 and 100'))
+                if math.isnan(v):
+                    return 'NaN'
+                if math.isinf(v):
+                    return 'Infinity' if v > 0 else '-Infinity'
                 return _js_to_precision(v, p)
-            return _make_native_fn('toPrecision', toPrecision)
+            return _make_native_fn('toPrecision', toPrecision, 1)
         if key == 'valueOf':
             return _make_native_fn('valueOf', lambda this, args:
                 js_to_number(this) if isinstance(this, JSObject) else this)
@@ -6654,55 +6959,86 @@ def _float_to_radix_string(v: float, radix: int) -> str:
 
 def _js_to_fixed(v: float, digits: int) -> str:
     """Number.prototype.toFixed with round-half-away-from-zero."""
-    from decimal import Decimal, ROUND_HALF_UP
+    from decimal import Decimal, ROUND_HALF_UP, Context as _DCtx, InvalidOperation
     if math.isnan(v):
         return 'NaN'
     if math.isinf(v):
         return 'Infinity' if v > 0 else '-Infinity'
-    sign = '-' if math.copysign(1, v) < 0 else ''
-    d = Decimal(abs(v))  # exact float64 value (preserves full integer precision)
+    # Negative zero → treat as positive zero
+    if v == 0.0:
+        if digits == 0:
+            return '0'
+        return '0.' + '0' * digits
+    sign = '-' if v < 0 else ''
+    ctx = _DCtx(prec=150)
+    d = ctx.create_decimal_from_float(abs(v))
     quant = Decimal('1.' + '0' * digits) if digits > 0 else Decimal('1')
-    rounded = d.quantize(quant, rounding=ROUND_HALF_UP)
+    try:
+        rounded = d.quantize(quant, rounding=ROUND_HALF_UP, context=ctx)
+    except InvalidOperation:
+        rounded = d
     result = format(rounded, f'.{digits}f')
     return sign + result
 
 
 def _js_to_exponential(v: float, fraction_digits) -> str:
     """Number.prototype.toExponential with round-half-away-from-zero."""
-    from decimal import Decimal, ROUND_HALF_UP
+    from decimal import Decimal, ROUND_HALF_UP, InvalidOperation, Context
     if math.isnan(v):
         return 'NaN'
     if math.isinf(v):
         return 'Infinity' if v > 0 else '-Infinity'
-    sign = '-' if math.copysign(1, v) < 0 else ''
+    sign = '-' if v < 0 else ''
     abs_v = abs(v)
     if abs_v == 0.0:
         if fraction_digits is None:
-            return sign + '0e+0'
-        return sign + '0' + ('.' + '0' * fraction_digits if fraction_digits > 0 else '') + 'e+0'
-    exp = math.floor(math.log10(abs_v))
-    mantissa = abs_v / (10.0 ** exp)
-    # Guard against floating-point imprecision nudging mantissa to 10
-    if mantissa >= 10.0:
-        mantissa /= 10.0
-        exp += 1
+            return '0e+0'
+        return '0' + ('.' + '0' * fraction_digits if fraction_digits > 0 else '') + 'e+0'
+
     if fraction_digits is None:
-        n = 20  # Enough digits for full precision
+        # Use Python's repr to get the shortest representation, then format as exponential
+        s = repr(abs_v)
+        # Parse the result — could be in scientific notation or plain
+        d = Decimal(s)
+        # Convert to exactly one digit before decimal point
+        sign_d, digits, exponent = d.as_tuple()
+        total_digits = len(digits)
+        # Reconstruct: mantissa = d.ddd...  e = total exponent
+        e = total_digits + exponent - 1  # exponent in scientific notation
+        if total_digits == 1:
+            mant_str = str(digits[0])
+        else:
+            mant_str = str(digits[0]) + '.' + ''.join(str(d) for d in digits[1:])
+            # Strip trailing zeros
+            mant_str = mant_str.rstrip('0').rstrip('.')
+        exp_sign = '+' if e >= 0 else '-'
+        return sign + mant_str + 'e' + exp_sign + str(abs(e))
     else:
         n = fraction_digits
-    d = Decimal(repr(mantissa))
-    quant = Decimal('1.' + '0' * n) if n > 0 else Decimal('1')
-    rounded_m = d.quantize(quant, rounding=ROUND_HALF_UP)
-    if rounded_m >= 10:
-        rounded_m = Decimal(repr(float(rounded_m) / 10.0))
-        rounded_m = rounded_m.quantize(quant, rounding=ROUND_HALF_UP)
-        exp += 1
-    mant_str = format(rounded_m, f'.{n}f')
-    if fraction_digits is None:
-        # Trim trailing zeros for auto-precision
-        mant_str = mant_str.rstrip('0').rstrip('.')
-    exp_sign = '+' if exp >= 0 else '-'
-    return sign + mant_str + 'e' + exp_sign + str(abs(exp))
+        from decimal import Context as _DCtx
+        ctx = _DCtx(prec=50)
+        d = ctx.create_decimal_from_float(abs_v)
+        # Use Decimal's own decomposition to avoid float division error
+        _sign, _digits, _exp = d.as_tuple()
+        total_digits = len(_digits)
+        e = total_digits + _exp - 1  # scientific notation exponent
+        # Reconstruct mantissa as Decimal with one digit before point
+        mantissa_d = d / (Decimal(10) ** e)
+        quant = Decimal('1.' + '0' * n) if n > 0 else Decimal('1')
+        try:
+            rounded_m = mantissa_d.quantize(quant, rounding=ROUND_HALF_UP, context=ctx)
+        except InvalidOperation:
+            rounded_m = mantissa_d
+        if rounded_m >= 10:
+            rounded_m = rounded_m / Decimal(10)
+            try:
+                rounded_m = rounded_m.quantize(quant, rounding=ROUND_HALF_UP, context=ctx)
+            except InvalidOperation:
+                pass
+            e += 1
+        mant_str = format(rounded_m, f'.{n}f')
+        exp_sign = '+' if e >= 0 else '-'
+        return sign + mant_str + 'e' + exp_sign + str(abs(e))
 
 
 def _js_to_precision(v: float, precision: int) -> str:
@@ -6711,7 +7047,7 @@ def _js_to_precision(v: float, precision: int) -> str:
         return 'NaN'
     if math.isinf(v):
         return 'Infinity' if v > 0 else '-Infinity'
-    sign = '-' if math.copysign(1, v) < 0 else ''
+    sign = '-' if v < 0 else ''
     abs_v = abs(v)
     if abs_v == 0.0:
         if precision <= 1:
@@ -7000,6 +7336,79 @@ def _transform_v_flag_q_classes(pattern: str, i_flag: bool = False) -> str:
             result.append('(?:' + '|'.join(filtered) + ')')
         i = j
     
+    return ''.join(result)
+
+
+def _js_get_substitution(matched, s, position, captures, named_captures, replacement):
+    """ES2023 GetSubstitution(matched, str, position, captures, namedCaptures, replacement).
+    
+    Processes $ replacement patterns in string replacements.
+    captures: list of capture values (undefined for non-participating)
+    named_captures: dict of name->value or None if no named groups
+    """
+    result = []
+    i = 0
+    repl = replacement
+    while i < len(repl):
+        if repl[i] == '$' and i + 1 < len(repl):
+            ch = repl[i + 1]
+            if ch == '$':
+                result.append('$')
+                i += 2
+            elif ch == '&':
+                result.append(matched)
+                i += 2
+            elif ch == '`':
+                result.append(s[:position])
+                i += 2
+            elif ch == "'":
+                result.append(s[position + len(matched):])
+                i += 2
+            elif ch == '<':
+                gt = repl.find('>', i + 2)
+                if gt == -1 or named_captures is None:
+                    result.append('$<')
+                    i += 2
+                else:
+                    group_name = repl[i + 2:gt]
+                    if named_captures is not None and group_name in named_captures:
+                        val = named_captures[group_name]
+                        if val is undefined or val is None:
+                            result.append('')
+                        else:
+                            result.append(js_to_string(val))
+                    else:
+                        result.append('')
+                    i = gt + 1
+            elif '0' <= ch <= '9':
+                # $n or $nn
+                if i + 2 < len(repl) and '0' <= repl[i + 2] <= '9':
+                    nn = int(repl[i + 1:i + 3])
+                    if 1 <= nn <= len(captures):
+                        val = captures[nn - 1]
+                        if val is undefined or val is None:
+                            result.append('')
+                        else:
+                            result.append(js_to_string(val))
+                        i += 3
+                        continue
+                n = int(ch)
+                if 1 <= n <= len(captures):
+                    val = captures[n - 1]
+                    if val is undefined or val is None:
+                        result.append('')
+                    else:
+                        result.append(js_to_string(val))
+                    i += 2
+                else:
+                    result.append('$')
+                    i += 1
+            else:
+                result.append('$')
+                i += 1
+        else:
+            result.append(repl[i])
+            i += 1
     return ''.join(result)
 
 
