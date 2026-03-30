@@ -98,8 +98,44 @@ def main() -> None:
     from pyquickjs.runtime import JSRuntime
     from pyquickjs.context import JSContext
 
+    def _inject_host_object(ctx):
+        """Inject $262 host object needed by some test262 harness files."""
+        from pyquickjs.interpreter import (
+            JSObject, undefined, _make_native_fn, _PROTOS,
+        )
+        host = JSObject(proto=_PROTOS.get('Object'))
+
+        def detach_array_buffer(this, args):
+            buf = args[0] if args else undefined
+            if isinstance(buf, JSObject) and hasattr(buf, '_ab_data'):
+                buf._ab_data = None
+            return undefined
+
+        host.props['detachArrayBuffer'] = _make_native_fn(
+            'detachArrayBuffer', detach_array_buffer, 1)
+        # createRealm: stub (not needed for most tests)
+        host.props['createRealm'] = _make_native_fn(
+            'createRealm', lambda this, args: undefined, 0)
+        # gc: stub
+        host.props['gc'] = _make_native_fn('gc', lambda this, args: undefined, 0)
+
+        # evalScript: evaluate code as a new script in the same context
+        def eval_script(this, args):
+            code = args[0] if args else undefined
+            if not isinstance(code, str):
+                return undefined
+            return ctx.eval(code, '<evalScript>')
+
+        host.props['evalScript'] = _make_native_fn(
+            'evalScript', eval_script, 1)
+
+        ctx.set_global('$262', host)
+
     rt = JSRuntime()
     ctx = JSContext(rt)
+
+    # Inject $262 host object for test262 harness
+    _inject_host_object(ctx)
 
     harness_path = Path(harness_dir)
 

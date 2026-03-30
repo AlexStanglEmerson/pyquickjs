@@ -181,6 +181,7 @@ class Literal(Node):
     value: Any = None  # str, int, float, bool, None
     raw: str = ""
     regex: dict | None = None  # {"pattern": ..., "flags": ...} for regex
+    has_escape: bool = False  # True if string literal contained escape sequences
 
 
 @dataclass
@@ -299,6 +300,11 @@ class MemberExpression(Node):
     property: Node = None  # type: ignore
     computed: bool = False  # True for a[b], False for a.b
     optional: bool = False  # True for a?.b
+
+
+@dataclass
+class PrivateIdentifier(Node):
+    name: str = ""  # e.g. "#x"
 
 
 @dataclass

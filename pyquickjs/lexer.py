@@ -142,6 +142,17 @@ TOK_LAST_KEYWORD = Tok.AWAIT
 
 # ---- Character classification (matching libunicode.h) ----
 
+# Unicode derived property Other_ID_Start (characters with ID_Start but not covered
+# by general categories Lu, Ll, Lt, Lm, Lo, Nl)
+_OTHER_ID_START = frozenset({0x1885, 0x1886, 0x2118, 0x212E, 0x309B, 0x309C})
+
+# Unicode derived property Other_ID_Continue (characters with ID_Continue but not
+# covered by general categories or Other_ID_Start)
+_OTHER_ID_CONTINUE = frozenset({
+    0x00B7, 0x0387, 0x1369, 0x136A, 0x136B, 0x136C, 0x136D,
+    0x136E, 0x136F, 0x1370, 0x1371, 0x19DA,
+})
+
 def _is_id_start(c: int) -> bool:
     """Check if codepoint c can start an identifier (ES2023 ID_Start + $ + _)."""
     if c < 128:
@@ -149,6 +160,8 @@ def _is_id_start(c: int) -> bool:
                 or (0x41 <= c <= 0x5A)  # A-Z
                 or c == 0x5F  # _
                 or (0x61 <= c <= 0x7A))  # a-z
+    if c in _OTHER_ID_START:
+        return True
     # Unicode: use category check
     cat = unicodedata.category(chr(c))
     return cat in ('Lu', 'Ll', 'Lt', 'Lm', 'Lo', 'Nl')
@@ -163,6 +176,8 @@ def _is_id_continue(c: int) -> bool:
                 or c == 0x5F  # _
                 or (0x61 <= c <= 0x7A))  # a-z
     if c == 0x200C or c == 0x200D:  # ZWNJ, ZWJ
+        return True
+    if c in _OTHER_ID_START or c in _OTHER_ID_CONTINUE:
         return True
     cat = unicodedata.category(chr(c))
     return cat in ('Lu', 'Ll', 'Lt', 'Lm', 'Lo', 'Nl', 'Mn', 'Mc', 'Nd', 'Pc')
@@ -205,6 +220,8 @@ class TokenStr:
     string: str = ""
     sep: str = ""  # The separator character: ' " or `
     raw: str = ""  # Raw text for template literals
+    has_escape: bool = False  # Whether the string contained escape sequences or line continuations
+    has_invalid_escape: bool = False  # Whether a template contained invalid escape sequences
 
 
 @dataclass
@@ -614,6 +631,7 @@ class JSParseState:
         self.pos should be past the opening quote.
         """
         buf: list[str] = []
+        has_escape = False
 
         while True:
             if self.at_end():
@@ -639,6 +657,7 @@ class JSParseState:
                 break
 
             if c == '\\':
+                has_escape = True
                 parsed = self._parse_escape(sep)
                 if parsed is not None:
                     buf.append(parsed)
@@ -656,6 +675,7 @@ class JSParseState:
         self.token.val = Tok.STRING
         self.token.str_val.string = ''.join(buf)
         self.token.str_val.sep = sep
+        self.token.str_val.has_escape = has_escape
 
     def _parse_template_part(self) -> None:
         """Parse a template literal part. self.pos is past the opening ` or }."""
@@ -663,6 +683,7 @@ class JSParseState:
         raw_buf: list[str] = []
         sep = ''
         raw_start = self.pos
+        has_invalid_escape = False
 
         while True:
             if self.at_end():
@@ -684,7 +705,14 @@ class JSParseState:
             if c == '\\':
                 # Capture raw text: the backslash + the escape sequence chars
                 raw_pos_before = self.pos
-                parsed = self._parse_escape('`')
+                try:
+                    parsed = self._parse_escape('`')
+                except JSSyntaxError:
+                    # Invalid escape in template — record but continue parsing
+                    has_invalid_escape = True
+                    raw_buf.append('\\')
+                    raw_buf.append(self.source[raw_pos_before:self.pos])
+                    continue
                 # Raw: backslash + the characters consumed by _parse_escape
                 raw_buf.append('\\')
                 raw_buf.append(self.source[raw_pos_before:self.pos])
@@ -715,6 +743,7 @@ class JSParseState:
         self.token.str_val.string = ''.join(buf)
         self.token.str_val.raw = ''.join(raw_buf)
         self.token.str_val.sep = sep
+        self.token.str_val.has_invalid_escape = has_invalid_escape
 
     def _parse_escape(self, sep: str) -> str | None:
         """Parse an escape sequence after \\. Returns the character(s) or None
@@ -1071,6 +1100,7 @@ class JSParseState:
         is_bigint = False
         is_float = False
         has_legacy_octal = False
+        is_non_octal_decimal = False  # 08, 09, 0008, 012348 etc.
         allow_sep = True  # numeric separators allowed?
 
         c = self.peek()
@@ -1100,15 +1130,19 @@ class JSParseState:
                         # Not octal — fall back to decimal
                         radix = 10
                         has_legacy_octal = False
+                        is_non_octal_decimal = True
                         break
                     temp_pos += 1
             elif p1 and '8' <= p1 <= '9':
                 # Non-octal decimal starting with 0 (like 08, 09)
                 # Numeric separators not allowed (follows same legacy rules)
+                is_non_octal_decimal = True
                 self.advance()  # skip leading '0'
                 allow_sep = False
             else:
-                self.advance()  # skip the '0'
+                # Bare '0' possibly followed by '.', 'e', 'E', 'n', or end
+                # Do NOT advance; let _scan_number_body consume the '0'
+                pass
         elif c != '.':
             pass  # digit 1-9, handled by _scan_digits
 
@@ -1119,7 +1153,7 @@ class JSParseState:
         if self.peek() == 'n':
             is_bigint = True
             self.advance()
-            if is_float or has_legacy_octal:
+            if is_float or has_legacy_octal or is_non_octal_decimal:
                 self._error("invalid number literal")
                 return
 
@@ -1338,6 +1372,8 @@ class _StubFunctionDef:
         self.label_set: dict[str, bool] = {}  # label name → is_iteration
         self.super_call_allowed: bool = False  # True only in derived class constructors
         self.super_prop_allowed: bool = False  # True in methods (super.x)
+        self.is_arrow: bool = False  # True for arrow function bodies
+        self.is_eval: bool = False  # True for direct eval code
 
 
 class JSSyntaxError(Exception):

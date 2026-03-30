@@ -25,7 +25,7 @@ from pyquickjs.ast_nodes import (
     LabeledStatement, Literal, LogicalExpression,
     MemberExpression, MethodDefinition, MetaProperty, NewExpression, Node, Super,
     ObjectExpression, ObjectPattern,
-    Program, Property,
+    Program, Property, PrivateIdentifier,
     RestElement, ReturnStatement,
     SequenceExpression, SpreadElement, SwitchCase, SwitchStatement,
     TaggedTemplateExpression, TemplateElement, TemplateLiteral,
@@ -39,6 +39,7 @@ from pyquickjs.lexer import (
     JSParseState, JSToken, Tok,
     TokenIdent,
     _StubFunctionDef, _JS_FUNC_ASYNC, _JS_FUNC_GENERATOR, _JS_PARSE_FUNC_ARROW,
+    _is_id_start, _is_id_continue,
 )
 
 if TYPE_CHECKING:
@@ -236,6 +237,94 @@ def _lexically_declared_names(stmts) -> list[str]:
     return names
 
 
+def _var_declared_names(stmts) -> list[str]:
+    """Collect VarDeclaredNames from a statement list, recursing into nested
+    blocks, if/else, for, while, switch, try/catch, with, labeled statements,
+    but NOT into function/class/generator/async bodies."""
+    names: list[str] = []
+    for stmt in stmts:
+        t = type(stmt).__name__
+        if t == 'VariableDeclaration' and stmt.kind == 'var':
+            for decl in stmt.declarations:
+                dt = type(decl.id).__name__
+                if dt == 'Identifier':
+                    names.append(decl.id.name)
+                elif dt in ('ArrayPattern', 'ObjectPattern'):
+                    names.extend(_binding_names(decl.id))
+        elif t == 'ForStatement':
+            if hasattr(stmt, 'init') and stmt.init is not None:
+                names.extend(_var_declared_names([stmt.init]))
+            if hasattr(stmt, 'body') and stmt.body is not None:
+                names.extend(_var_declared_names([stmt.body]))
+        elif t in ('ForInStatement', 'ForOfStatement'):
+            if hasattr(stmt, 'left') and stmt.left is not None:
+                names.extend(_var_declared_names([stmt.left]))
+            if hasattr(stmt, 'body') and stmt.body is not None:
+                names.extend(_var_declared_names([stmt.body]))
+        elif t == 'BlockStatement':
+            names.extend(_var_declared_names(stmt.body))
+        elif t == 'IfStatement':
+            if hasattr(stmt, 'consequent') and stmt.consequent is not None:
+                names.extend(_var_declared_names([stmt.consequent]))
+            if hasattr(stmt, 'alternate') and stmt.alternate is not None:
+                names.extend(_var_declared_names([stmt.alternate]))
+        elif t in ('WhileStatement', 'DoWhileStatement'):
+            if hasattr(stmt, 'body') and stmt.body is not None:
+                names.extend(_var_declared_names([stmt.body]))
+        elif t == 'WithStatement':
+            if hasattr(stmt, 'body') and stmt.body is not None:
+                names.extend(_var_declared_names([stmt.body]))
+        elif t == 'SwitchStatement':
+            if hasattr(stmt, 'cases'):
+                for case in stmt.cases:
+                    if hasattr(case, 'consequent'):
+                        names.extend(_var_declared_names(case.consequent))
+        elif t == 'TryStatement':
+            if hasattr(stmt, 'block') and stmt.block is not None:
+                names.extend(_var_declared_names(stmt.block.body if hasattr(stmt.block, 'body') else [stmt.block]))
+            if hasattr(stmt, 'handler') and stmt.handler is not None:
+                handler_body = stmt.handler.body
+                if hasattr(handler_body, 'body'):
+                    names.extend(_var_declared_names(handler_body.body))
+            if hasattr(stmt, 'finalizer') and stmt.finalizer is not None:
+                finalizer = stmt.finalizer
+                if hasattr(finalizer, 'body'):
+                    names.extend(_var_declared_names(finalizer.body))
+        elif t == 'LabeledStatement':
+            if hasattr(stmt, 'body') and stmt.body is not None:
+                names.extend(_var_declared_names([stmt.body]))
+        # Do NOT recurse into FunctionDeclaration, ClassDeclaration, etc.
+    return names
+
+
+def _binding_names(pattern) -> list[str]:
+    """Extract all binding names from a destructuring pattern."""
+    t = type(pattern).__name__
+    if t == 'Identifier':
+        return [pattern.name]
+    names: list[str] = []
+    if t == 'ArrayPattern':
+        for elem in (pattern.elements or []):
+            if elem is not None:
+                et = type(elem).__name__
+                if et == 'RestElement':
+                    names.extend(_binding_names(elem.argument))
+                elif et == 'AssignmentPattern':
+                    names.extend(_binding_names(elem.left))
+                else:
+                    names.extend(_binding_names(elem))
+    elif t == 'ObjectPattern':
+        for prop in (pattern.properties or []):
+            pt = type(prop).__name__
+            if pt == 'RestElement':
+                names.extend(_binding_names(prop.argument))
+            elif pt == 'Property':
+                names.extend(_binding_names(prop.value))
+    elif t == 'AssignmentPattern':
+        names.extend(_binding_names(pattern.left))
+    return names
+
+
 def _is_valid_simple_assignment_target(node) -> bool:
     """Check whether an expression is a valid simple assignment target (LeftHandSideExpression)
     for for-in/for-of when it's not a destructuring pattern."""
@@ -332,18 +421,50 @@ def _check_assignment_pattern_validity(node, strict: bool = False) -> str | None
     return None
 
 
-def _check_re_pattern(pattern: str):
+def _check_re_pattern(pattern: str, u_flag: bool = False):
     """Check for common JS regex early errors. Raises ValueError for invalid patterns."""
     n = len(pattern)
     i = 0
     # Track whether we're at a position where a quantifier is invalid
     # (start of pattern, after |, after opening paren)
     can_quantify = False  # True if there's an atom before current position
+    # Track named groups for duplicate detection
+    all_group_names: set[str] = set()
+    # Track group names per alternative at each group depth.
+    # Each entry is [current_alt_names, all_alts_names] — a pair of sets.
+    # current_alt: names in the current alternative
+    # all_alts: names seen in any previous alternative at this depth
+    _dup_stack: list[list[set[str]]] = [[set(), set()]]  # top-level
+
+    # Track named backreferences (\k<name>) for dangling reference check
+    backrefs: list[str] = []
+
+    # Track bare \k (without proper <name>) for deferred rejection
+    has_bare_k = False
 
     while i < n:
         c = pattern[i]
         if c == '\\':
-            # Escape sequence — skip next char
+            # Escape sequence — check for \k backreference
+            if i + 1 < n and pattern[i + 1] == 'k':
+                # \k<name> back reference
+                if i + 2 < n and pattern[i + 2] == '<':
+                    j = i + 3
+                    # Only scan valid identifier characters + backslash for \u
+                    while j < n and pattern[j] != '>' and pattern[j] not in '()/|':
+                        j += 1
+                    if j < n and pattern[j] == '>':
+                        ref_name = pattern[i + 3:j]
+                        backrefs.append(ref_name)
+                        can_quantify = True
+                        i = j + 1
+                        continue
+                    else:
+                        # Unterminated or malformed \k<...> — mark as bare \k
+                        has_bare_k = True
+                else:
+                    # \k without < — mark for deferred rejection
+                    has_bare_k = True
             can_quantify = True
             i += 2
             continue
@@ -381,26 +502,113 @@ def _check_re_pattern(pattern: str):
                 i = j
                 continue
             can_quantify = False
+            # Push new alternative scope for this group
+            _dup_stack.append([set(), set()])
             i += 1
             # Skip group modifiers: (?:, (?=, (?!
             if i < n and pattern[i] == '?':
                 i += 1
                 if i < n and pattern[i] in ':=!<':
                     if pattern[i] == '<' and i + 1 < n and pattern[i+1] not in '=!':
-                        # Named group (?<name>...) — skip name
-                        i += 1
+                        # Named group (?<name>...) — validate and skip name
+                        i += 1  # skip '<'
+                        name_start = i
                         while i < n and pattern[i] != '>':
                             i += 1
-                        i += 1  # skip >
+                        if i >= n:
+                            raise ValueError("Invalid regular expression: unterminated group name")
+                        group_name = pattern[name_start:i]
+                        if not group_name:
+                            raise ValueError("Invalid regular expression: empty group name")
+                        # Validate group name as IdentifierName
+                        j = 0
+                        char_pos = 0  # logical character position in name
+                        while j < len(group_name):
+                            gc = group_name[j]
+                            if gc == '\\':
+                                # Must be \u escape
+                                if j + 1 >= len(group_name) or group_name[j + 1] != 'u':
+                                    raise ValueError("Invalid regular expression: invalid escape in group name")
+                                j += 2  # skip \u
+                                # Decode the code point
+                                if j < len(group_name) and group_name[j] == '{':
+                                    # \u{HHHH+}
+                                    j += 1
+                                    hex_start = j
+                                    while j < len(group_name) and group_name[j] != '}':
+                                        j += 1
+                                    if j >= len(group_name):
+                                        raise ValueError("Invalid regular expression: unterminated unicode escape in group name")
+                                    hex_str = group_name[hex_start:j]
+                                    j += 1  # skip }
+                                    if not hex_str:
+                                        raise ValueError("Invalid regular expression: empty unicode escape in group name")
+                                    cp = int(hex_str, 16)
+                                    if cp > 0x10FFFF:
+                                        raise ValueError("Invalid regular expression: code point out of range in group name")
+                                else:
+                                    # \uHHHH — possibly a surrogate pair \uHHHH\uHHHH
+                                    if j + 4 > len(group_name):
+                                        raise ValueError("Invalid regular expression: invalid unicode escape in group name")
+                                    hex_str = group_name[j:j+4]
+                                    j += 4
+                                    cp = int(hex_str, 16)
+                                    # Check for surrogate pair
+                                    if 0xD800 <= cp <= 0xDBFF:
+                                        if j + 5 < len(group_name) and group_name[j] == '\\' and group_name[j+1] == 'u':
+                                            lo_hex = group_name[j+2:j+6]
+                                            lo = int(lo_hex, 16)
+                                            if 0xDC00 <= lo <= 0xDFFF:
+                                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                                                j += 6
+                                            else:
+                                                raise ValueError("Invalid regular expression: lone surrogate in group name")
+                                        else:
+                                            raise ValueError("Invalid regular expression: lone surrogate in group name")
+                                    elif 0xDC00 <= cp <= 0xDFFF:
+                                        raise ValueError("Invalid regular expression: lone surrogate in group name")
+                                # Validate the decoded code point
+                                if char_pos == 0:
+                                    if not (cp == ord('$') or cp == ord('_') or _is_id_start(cp)):
+                                        raise ValueError("Invalid regular expression: invalid start of group name")
+                                else:
+                                    if not (cp == ord('$') or cp == ord('_') or _is_id_continue(cp)):
+                                        raise ValueError("Invalid regular expression: invalid character in group name")
+                                char_pos += 1
+                                continue
+                            cp = ord(gc)
+                            if char_pos == 0:
+                                if not (gc == '$' or gc == '_' or _is_id_start(cp)):
+                                    raise ValueError(f"Invalid regular expression: invalid start of group name")
+                            else:
+                                if not (gc == '$' or gc == '_' or _is_id_continue(cp)):
+                                    raise ValueError(f"Invalid regular expression: invalid character in group name")
+                            char_pos += 1
+                            j += 1
+                        # Check for duplicate: same name in current alt is error
+                        cur_alt, all_alts = _dup_stack[-2]  # parent scope (name belongs to containing group)
+                        if group_name in cur_alt:
+                            raise ValueError(f"Invalid regular expression: duplicate group name '{group_name}'")
+                        cur_alt.add(group_name)
+                        all_group_names.add(group_name)
+                        i += 1  # skip '>'
                     else:
                         i += 1
             continue
         if c == ')':
             can_quantify = True
+            # Pop the alternative scope
+            if len(_dup_stack) > 1:
+                _dup_stack.pop()
             i += 1
             continue
         if c == '|':
             can_quantify = False
+            # Switch to a new alternative: merge current alt into all_alts, start fresh
+            if _dup_stack:
+                cur_alt, all_alts = _dup_stack[-1]
+                all_alts.update(cur_alt)
+                _dup_stack[-1] = [set(), all_alts]
             i += 1
             continue
         if c in '?*+':
@@ -429,6 +637,21 @@ def _check_re_pattern(pattern: str):
         can_quantify = True
         i += 1
 
+    # Validate backreferences against defined group names
+    if all_group_names:
+        if has_bare_k:
+            raise ValueError("Invalid regular expression: invalid named backreference")
+        for ref in backrefs:
+            if ref not in all_group_names:
+                raise ValueError(f"Invalid regular expression: undefined group name '{ref}'")
+    elif u_flag and (has_bare_k or backrefs):
+        # In /u mode, \k is always invalid unless it's a valid \k<name>
+        # referencing a defined named group
+        raise ValueError("Invalid regular expression: invalid escape in unicode mode")
+    elif has_bare_k and backrefs:
+        # Without u-flag and no groups: bare \k + well-formed backrefs is suspicious
+        raise ValueError("Invalid regular expression: invalid named backreference")
+
 
 class Parser:
     """Recursive-descent JavaScript parser producing AST nodes."""
@@ -439,8 +662,17 @@ class Parser:
         self.source = source
         self._line_cache: list[int] | None = None
         self._container_depth: int = 0  # incremented when parsing array/object literal elements
+        self._private_name_scopes: list[set[str]] = []  # stack of declared private names per class body
+        self._in_for_init: bool = False  # True when parsing for-of/in LHS expression (defers cover-init check)
 
     # ---- Helpers ----
+
+    def _check_private_name(self, name: str) -> None:
+        """Raise SyntaxError if private name is not declared in any containing class."""
+        for scope in reversed(self._private_name_scopes):
+            if name in scope:
+                return
+        raise self._error(f"Private field '{name}' must be declared in an enclosing class")
 
     def _line_col(self, pos: int) -> tuple[int, int]:
         """Compute 1-based line and 1-based column for a source position."""
@@ -530,8 +762,13 @@ class Parser:
         # let [ is always a declaration regardless of line breaks
         if t == ord('['):
             return True
-        # Other binding starts: {, identifier, 'let', 'yield', 'await'
-        if t in (ord('{'), Tok.IDENT, Tok.LET, Tok.YIELD, Tok.AWAIT, Tok.STATIC):
+        # let/yield/await are always grammatically valid BindingIdentifiers,
+        # so no ASI can apply between 'let' and these tokens (spec: no
+        # [no LineTerminator here] in LexicalDeclaration)
+        if t in (Tok.LET, Tok.YIELD, Tok.AWAIT):
+            return True
+        # Other binding starts: {, identifier, 'static'
+        if t in (ord('{'), Tok.IDENT, Tok.STATIC):
             # If there's a line break before the next token, it's ASI → not a decl
             return not got_lf
         return False
@@ -550,6 +787,8 @@ class Parser:
         In strict mode, Tok.LET and Tok.STATIC are proper keywords and cannot be identifiers."""
         t = self._tok()
         if t == Tok.IDENT:
+            if self.s.token.ident.is_reserved:
+                return None
             return self._get_ident_name()
         if not (self.s.cur_func.js_mode & JS_MODE_STRICT):
             if t == Tok.LET:
@@ -582,10 +821,25 @@ class Parser:
     def parse_program(self) -> Program:
         self._next()  # prime the lexer
         prog = Program()
+        # Detect "use strict" directive prologue at script level
+        if (self._tok() == Tok.STRING and
+                self.s.token.str_val.string == 'use strict' and
+                not self.s.token.str_val.has_escape):
+            self.s.cur_func.js_mode |= JS_MODE_STRICT
+        in_directive_prologue = True
         while self._tok() != Tok.EOF:
             stmt = self._parse_statement(declaration=True)
             if stmt is not None:
                 prog.body.append(stmt)
+                # Check for "use strict" in the directive prologue
+                if in_directive_prologue and not (self.s.cur_func.js_mode & JS_MODE_STRICT):
+                    if (type(stmt).__name__ == 'ExpressionStatement' and
+                            type(stmt.expression).__name__ == 'Literal' and
+                            isinstance(stmt.expression.value, str)):
+                        if stmt.expression.value == 'use strict' and not stmt.expression.has_escape:
+                            self.s.cur_func.js_mode |= JS_MODE_STRICT
+                    else:
+                        in_directive_prologue = False
         return prog
 
     # ---- Statements ----
@@ -605,9 +859,13 @@ class Parser:
             # if it starts a let-declaration or is just an identifier expression.
             if not (self.s.cur_func.js_mode & JS_MODE_STRICT) and not self._is_let_decl():
                 return self._parse_expression_statement()
+            if not declaration:
+                raise self._error("Lexical declaration cannot appear in a single-statement context")
             return self._parse_var_statement("let")
 
         if t == Tok.CONST:
+            if not declaration:
+                raise self._error("Lexical declaration cannot appear in a single-statement context")
             return self._parse_var_statement("const")
 
         if t == Tok.IF:
@@ -647,10 +905,19 @@ class Parser:
             return self._parse_class_declaration()
 
         if t == Tok.IMPORT:
-            return self._parse_import_declaration()
+            # import() and import.meta are expressions, not declarations
+            # Check next non-whitespace char after 'import' to distinguish
+            pos = self.s.pos
+            while pos < self.s.end and self.s.source[pos] in ' \t\n\r':
+                pos += 1
+            next_ch = self.s.source[pos] if pos < self.s.end else ''
+            if next_ch == '(' or next_ch == '.':
+                return self._parse_expression_statement()
+            # import declaration in script context is a SyntaxError
+            raise self._error("Cannot use import statement outside a module")
 
         if t == Tok.EXPORT:
-            return self._parse_export_declaration()
+            raise self._error("Unexpected token 'export'")
 
         if t == Tok.DEBUGGER:
             self._next()
@@ -674,12 +941,18 @@ class Parser:
 
         # Labeled statement check: IDENT followed by ':'
         if t == Tok.IDENT:
+            is_reserved = self.s.token.ident.is_reserved
             # Peek ahead for ':'
             save_pos = self.s.pos
             save_token = self.s.token
             name = self._get_ident_name()
             self._next()
             if self._tok() == ord(':'):
+                if is_reserved:
+                    # Strict-only reserved words with unicode escapes are allowed as labels in non-strict mode
+                    if not (name in _STRICT_RESERVED_WORDS and
+                            not (self.s.cur_func.js_mode & JS_MODE_STRICT)):
+                        raise self._error(f"'{name}' is a reserved word and cannot be used as a label")
                 self._next()
                 label = Identifier(name=name)
                 # Track label: peek if body is an iteration statement
@@ -941,12 +1214,10 @@ class Parser:
         # Static early error: var name conflicting with lexical name in same block
         lex_set = set(names)
         if lex_set:
-            for stmt in body:
-                if type(stmt).__name__ == 'VariableDeclaration' and stmt.kind == 'var':
-                    for decl in stmt.declarations:
-                        if type(decl.id).__name__ == 'Identifier' and decl.id.name in lex_set:
-                            raise self._error(
-                                f"Identifier '{decl.id.name}' has already been declared")
+            for vname in _var_declared_names(body):
+                if vname in lex_set:
+                    raise self._error(
+                        f"Identifier '{vname}' has already been declared")
         return BlockStatement(body=body)
 
     def _parse_var_statement(self, kind: str) -> VariableDeclaration:
@@ -973,12 +1244,24 @@ class Parser:
         init = None
         if self._eat(ord('=')):
             init = self._parse_assignment_no_in() if no_in else self._parse_assignment_expr()
+        # const declarations must have an initializer (unless in for-in/for-of header)
+        if kind == 'const' and init is None and not no_in:
+            raise self._error("Missing initializer in const declaration")
         return VariableDeclarator(id=target, init=init)
 
     def _parse_binding_pattern(self) -> Node:
         """Parse a binding target: identifier, array pattern, or object pattern."""
         t = self._tok()
         if t == Tok.IDENT:
+            if self.s.token.ident.is_reserved:
+                name = self._get_ident_name()
+                # Strict-only reserved words (like 'static') with unicode escapes
+                # are allowed as identifiers in non-strict mode
+                if (name in _STRICT_RESERVED_WORDS and
+                        not (self.s.cur_func.js_mode & JS_MODE_STRICT)):
+                    self._next()
+                    return Identifier(name=name)
+                raise self._error(f"'{name}' is a reserved word and cannot be used as an identifier")
             name = self._get_ident_name()
             self._next()
             # In strict mode, 'eval' and 'arguments' cannot be binding identifiers
@@ -1192,7 +1475,9 @@ class Parser:
         self._expect(ord('('))
         test = self._parse_expression()
         self._expect(ord(')'))
-        self._expect_semi()
+        # do-while has a special ASI rule: a semicolon is always auto-inserted
+        # after the ')' if one is not present (ES2023 §12.9.1, rule 3).
+        self._eat(ord(';'))
         return DoWhileStatement(test=test, body=body)
 
     def _parse_for(self) -> Node:
@@ -1275,6 +1560,11 @@ class Parser:
             declarations = [declarator]
             while self._eat(ord(',')):
                 declarations.append(self._parse_var_declarator(kind, no_in=True))
+            # const declarations must have initializers in regular for loops
+            if kind == 'const':
+                for d in declarations:
+                    if d.init is None:
+                        raise self._error("Missing initializer in const declaration")
             init = VariableDeclaration(declarations=declarations, kind=kind)
             self._expect(ord(';'))
             test = self._parse_expression() if self._tok() != ord(';') else None
@@ -1306,7 +1596,9 @@ class Parser:
             return ForStatement(init=None, test=test, update=update, body=body)
 
         # Parse expression / lhs
+        self._in_for_init = True
         init_expr = self._parse_expression_no_in()
+        self._in_for_init = False
         if self._tok() == Tok.IN:
             self._next()
             right = self._parse_expression()
@@ -1341,7 +1633,9 @@ class Parser:
                 self.s.cur_func.in_iteration -= 1
             self._check_single_stmt_body(body, loop_body=True)
             return ForOfStatement(left=init_expr, right=right, body=body)
-        # Regular for
+        # Regular for — validate deferred cover-initialized-name errors
+        if isinstance(init_expr, (ObjectExpression, ArrayExpression)) and _has_cover_initialized_name(init_expr):
+            raise self._error("Invalid shorthand property initializer")
         self._expect(ord(';'))
         test = self._parse_expression() if self._tok() != ord(';') else None
         self._expect(ord(';'))
@@ -1460,6 +1754,16 @@ class Parser:
                 param = self._parse_binding_pattern()
                 self._expect(ord(')'))
             body = self._parse_block()
+            if param is not None:
+                # Early error: duplicate names in CatchParameter
+                pnames = _binding_names(param)
+                if len(pnames) != len(set(pnames)):
+                    raise self._error("Duplicate binding in catch parameter")
+                # Early error: CatchParameter name conflicts with lexical names in catch body
+                pset = set(pnames)
+                for n in _lexically_declared_names(body.body):
+                    if n in pset:
+                        raise self._error(f"'{n}' has already been declared")
             handler = CatchClause(param=param, body=body)
         if self._eat(Tok.FINALLY):
             finalizer = self._parse_block()
@@ -1490,6 +1794,7 @@ class Parser:
             name = Identifier(name=_fn_name)
             self._next()
         params = self._parse_formal_params()
+        self._check_await_yield_params(params, is_async, generator)
         body = self._parse_function_body(is_async=is_async, is_generator=generator, params=params, fn_name=name)
         src = self.s.source[fn_start:self.s.last_pos]
         return FunctionDeclaration(id=name, params=params, body=body, generator=generator, async_=is_async, line=ln, col=cl, source_text=src)
@@ -1498,7 +1803,11 @@ class Parser:
         self._next()  # class
         name = None
         if self._tok() == Tok.IDENT:
-            name = Identifier(name=self._get_ident_name())
+            cn = self._get_ident_name()
+            # Class names are in strict context — reject strict-mode reserved words
+            if cn in _STRICT_RESERVED_WORDS:
+                raise self._error(f"'{cn}' is not a valid identifier in strict mode")
+            name = Identifier(name=cn)
             self._next()
         super_class = None
         if self._eat(Tok.EXTENDS):
@@ -1507,6 +1816,10 @@ class Parser:
         return ClassDeclaration(id=name, super_class=super_class, body=body)
 
     def _parse_class_body(self, has_extends: bool = False) -> ClassBody:
+        # Class bodies are always strict per spec §14.6
+        saved_mode = self.s.cur_func.js_mode
+        self.s.cur_func.js_mode |= JS_MODE_STRICT
+        self._private_name_scopes.append(set())
         self._expect(ord('{'))
         body: list[Node] = []
         while self._tok() != ord('}') and self._tok() != Tok.EOF:
@@ -1536,7 +1849,7 @@ class Parser:
                     save_tok = self.s.token
                     self._next()
                     next_t = self._tok()
-                    # 'get'/'set' as accessor only if next is identifier/string/number/[
+                    # 'get'/'set' as accessor only if next is identifier/string/number/[/#
                     # NOT if next is '(' (would mean get is the method name) or '=' or ';' (field)
                     if next_t not in (ord('('), ord('='), ord(';'), ord('}')) and not self.s.got_lf:
                         kind = pname
@@ -1559,7 +1872,13 @@ class Parser:
             if self._tok() == ord('['):
                 computed = True
                 self._next()
+                # Re-enable 'in' as binary operator inside computed property names
+                save_in = _BINARY_OPS.get(Tok.IN)
+                if save_in is None:
+                    _BINARY_OPS[Tok.IN] = (17, 18, "in")
                 key = self._parse_assignment_expr()
+                if save_in is None:
+                    _BINARY_OPS.pop(Tok.IN, None)
                 self._expect(ord(']'))
             elif self._tok() == Tok.IDENT:
                 key = Identifier(name=self._get_ident_name())
@@ -1569,6 +1888,11 @@ class Parser:
                 self._next()
             elif self._tok() == Tok.NUMBER:
                 key = self._parse_number_literal()
+            elif self._tok() == Tok.PRIVATE_NAME:
+                key = PrivateIdentifier(name=self._get_ident_name())
+                if self._private_name_scopes:
+                    self._private_name_scopes[-1].add(key.name)
+                self._next()
             elif Tok.NULL <= self._tok() <= Tok.AWAIT:
                 key = Identifier(name=Tok(self._tok()).name.lower())
                 self._next()
@@ -1578,6 +1902,10 @@ class Parser:
             # Check for constructor
             if isinstance(key, Identifier) and key.name == "constructor" and not is_static:
                 kind = "constructor"
+
+            # Static 'prototype' is a syntax error (§14.6.1)
+            if is_static and not computed and isinstance(key, Identifier) and key.name == "prototype":
+                raise self._error("Classes may not have a static property named 'prototype'")
 
             # Class field: key = expr; or key; (no params)
             if self._tok() == ord('=') or self._tok() == ord(';') or self._tok() == ord('}'):
@@ -1593,6 +1921,7 @@ class Parser:
                 continue
 
             params = self._parse_formal_params()
+            self._check_await_yield_params(params, is_async, generator)
             is_ctor = (kind == "constructor")
             mbody = self._parse_function_body(
                 is_async=is_async, is_generator=generator,
@@ -1604,6 +1933,8 @@ class Parser:
             body.append(md)
 
         self._expect(ord('}'))
+        self._private_name_scopes.pop()
+        self.s.cur_func.js_mode = saved_mode
         return ClassBody(body=body)
 
     def _parse_with(self) -> WithStatement:
@@ -1613,7 +1944,20 @@ class Parser:
         self._expect(ord('('))
         obj = self._parse_expression()
         self._expect(ord(')'))
+        # 14.11.1 Static Semantics: Early Errors
+        # Disallow FunctionDeclaration, GeneratorDeclaration, ClassDeclaration
+        t = self._tok()
+        if t == Tok.FUNCTION:
+            raise self._error("Function declaration not allowed in with statement body")
+        if t == Tok.CLASS:
+            raise self._error("Class declaration not allowed in with statement body")
         body = self._parse_statement()
+        # IsLabelledFunction check
+        node = body
+        while type(node).__name__ == 'LabeledStatement':
+            node = node.body
+        if type(node).__name__ == 'FunctionDeclaration':
+            raise self._error("Labelled function declaration not allowed in with statement body")
         return WithStatement(object=obj, body=body)
 
     def _parse_expression_statement(self) -> ExpressionStatement:
@@ -1752,11 +2096,12 @@ class Parser:
             # CoverInitializedName: {a = 1} is only valid in destructuring context.
             # Skip the check when inside another array/object literal (the outer container
             # will be the destructuring LHS, so it will be checked at that level).
-            if self._container_depth == 0 and _has_cover_initialized_name(left):
+            # Also skip when parsing for-of/in LHS (will be used as destructuring pattern).
+            if self._container_depth == 0 and not self._in_for_init and _has_cover_initialized_name(left):
                 raise self._error("Invalid shorthand property initializer")
         elif isinstance(left, ArrayExpression):
             # CoverInitializedName inside array: [{a = 1}] is only valid in destructuring.
-            if self._container_depth == 0 and _has_cover_initialized_name(left):
+            if self._container_depth == 0 and not self._in_for_init and _has_cover_initialized_name(left):
                 raise self._error("Invalid shorthand property initializer")
 
         return left
@@ -1775,14 +2120,32 @@ class Parser:
         t = self._tok()
         if (not delegate and (t == ord(';') or t == Tok.EOF or
                 t == ord('}') or t == ord(')') or t == ord(']') or
-                t == ord(',') or self.s.got_lf)):
+                t == ord(',') or t == ord(':') or self.s.got_lf)):
             return YieldExpression(argument=None, delegate=False)
         argument = self._parse_assignment_expr()
         return YieldExpression(argument=argument, delegate=delegate)
 
     def _parse_arrow_body(self, params: list[Node]) -> ArrowFunctionExpression:
+        # Early error: arrow functions always use strict parameter checking
+        # Duplicate param names are always a SyntaxError
+        all_names: list[str] = []
+        has_non_simple = False
+        for p in params:
+            pn = type(p).__name__
+            if pn in ('AssignmentPattern', 'ArrayPattern', 'ObjectPattern', 'RestElement'):
+                has_non_simple = True
+            all_names.extend(_binding_names(p))
+        if len(all_names) != len(set(all_names)):
+            raise self._error("Duplicate parameter name not allowed in arrow function")
         if self._tok() == ord('{'):
-            body = self._parse_function_body()
+            body = self._parse_function_body(is_arrow=True)
+            # Early error: non-simple params + "use strict" directive
+            if has_non_simple and body.body:
+                first = body.body[0]
+                if (type(first).__name__ == 'ExpressionStatement' and
+                    type(first.expression).__name__ == 'Literal' and
+                    first.expression.value == 'use strict'):
+                    raise self._error("Illegal 'use strict' directive in function with non-simple parameter list")
             return ArrowFunctionExpression(params=params, body=body, expression=False)
         else:
             expr = self._parse_assignment_expr()
@@ -1972,8 +2335,14 @@ class Parser:
                 expr = CallExpression(callee=expr, arguments=args, line=ln, col=cl)
             elif self._tok() == ord('.'):
                 ln, cl = self._lc(); self._next()
-                name = self._parse_property_name()
-                expr = MemberExpression(object=expr, property=Identifier(name=name), computed=False, line=ln, col=cl)
+                if self._tok() == Tok.PRIVATE_NAME:
+                    pname = self._get_ident_name()
+                    self._check_private_name(pname)
+                    self._next()
+                    expr = MemberExpression(object=expr, property=PrivateIdentifier(name=pname), computed=False, line=ln, col=cl)
+                else:
+                    name = self._parse_property_name()
+                    expr = MemberExpression(object=expr, property=Identifier(name=name), computed=False, line=ln, col=cl)
             elif self._tok() == ord('['):
                 ln, cl = self._lc(); self._next()
                 prop = self._parse_expression()
@@ -1995,14 +2364,20 @@ class Parser:
                     raise self._error(
                         "Tagged template literals are not permitted in optional chain positions")
                 else:
-                    name = self._parse_property_name()
-                    expr = MemberExpression(object=expr, property=Identifier(name=name), computed=False, optional=True)
+                    if self._tok() == Tok.PRIVATE_NAME:
+                        pname = self._get_ident_name()
+                        self._check_private_name(pname)
+                        self._next()
+                        expr = MemberExpression(object=expr, property=PrivateIdentifier(name=pname), computed=False, optional=True)
+                    else:
+                        name = self._parse_property_name()
+                        expr = MemberExpression(object=expr, property=Identifier(name=name), computed=False, optional=True)
             elif self._tok() == Tok.TEMPLATE:
                 if in_optional_chain:
                     # a?.b`hello` is a SyntaxError
                     raise self._error(
                         "Tagged template literals are not permitted in optional chain positions")
-                quasi = self._parse_template_literal()
+                quasi = self._parse_template_literal(tagged=True)
                 expr = TaggedTemplateExpression(tag=expr, quasi=quasi)
             else:
                 break
@@ -2016,23 +2391,40 @@ class Parser:
         # new.target meta-property
         if self._tok() == ord('.'):
             self._next()  # consume '.'
+            # 'target' must not contain Unicode escape sequences
+            if self.s.token.ident.has_escape:
+                raise self._error("'target' in new.target must not contain Unicode escape sequences")
             prop = self._ident_name()  # 'target'
             self._next()  # consume 'target'
+            # new.target is only valid inside functions (not at global scope)
+            # But in eval code, the runtime check handles this
+            # Walk through arrow functions (which inherit new.target from enclosing scope)
+            func = self.s.cur_func
+            while func is not None and func.is_arrow:
+                func = func.parent
+            if func is not None and func.parent is None and not func.is_eval:
+                raise self._error("new.target expression is not allowed here")
             return MetaProperty(meta='new', property=prop)
         if self._tok() == Tok.NEW:
             callee = self._parse_new_expr()
         else:
             callee = self._parse_primary_expr()
-            # Allow member access on the callee
-            while self._tok() == ord('.'):
-                self._next()
-                name = self._parse_property_name()
-                callee = MemberExpression(object=callee, property=Identifier(name=name), computed=False)
-            while self._tok() == ord('['):
-                self._next()
-                prop = self._parse_expression()
-                self._expect(ord(']'))
-                callee = MemberExpression(object=callee, property=prop, computed=True)
+            # Allow member access and tagged templates on the callee
+            while True:
+                if self._tok() == ord('.'):
+                    self._next()
+                    name = self._parse_property_name()
+                    callee = MemberExpression(object=callee, property=Identifier(name=name), computed=False)
+                elif self._tok() == ord('['):
+                    self._next()
+                    prop = self._parse_expression()
+                    self._expect(ord(']'))
+                    callee = MemberExpression(object=callee, property=prop, computed=True)
+                elif self._tok() == Tok.TEMPLATE:
+                    quasi = self._parse_template_literal(tagged=True)
+                    callee = TaggedTemplateExpression(tag=callee, quasi=quasi)
+                else:
+                    break
         args: list[Node] = []
         if self._tok() == ord('('):
             args = self._parse_arguments()
@@ -2094,6 +2486,12 @@ class Parser:
         t = self._tok()
 
         if t == Tok.IDENT:
+            if self.s.token.ident.is_reserved:
+                name = self._get_ident_name()
+                # Strict-only reserved words with unicode escapes are allowed in non-strict mode
+                if not (name in _STRICT_RESERVED_WORDS and
+                        not (self.s.cur_func.js_mode & JS_MODE_STRICT)):
+                    raise self._error(f"'{name}' is a reserved word and cannot be used as an identifier")
             ln, cl = self._lc()
             name = self._get_ident_name()
             fn_start = self.s.token.pos
@@ -2117,8 +2515,9 @@ class Parser:
 
         if t == Tok.STRING:
             val = self.s.token.str_val.string
+            has_esc = self.s.token.str_val.has_escape
             self._next()
-            return Literal(value=val)
+            return Literal(value=val, has_escape=has_esc)
 
         if t == Tok.TEMPLATE:
             return self._parse_template_literal()
@@ -2162,6 +2561,34 @@ class Parser:
             # super must be followed by ( or . or [ — bare super is invalid
             if self._tok() not in (ord('('), ord('.'), ord('['), Tok.QUESTION_MARK_DOT):
                 raise self._error("'super' keyword unexpected here")
+            # super property access: walk parent chain through arrows
+            # to find a method/constructor that allows super
+            nxt = self._tok()
+            if nxt in (ord('.'), ord('['), Tok.QUESTION_MARK_DOT):
+                scope = self.s.cur_func
+                allowed = False
+                while scope is not None:
+                    if scope.super_prop_allowed:
+                        allowed = True
+                        break
+                    if not scope.is_arrow:
+                        break  # non-arrow function boundary stops the search
+                    scope = scope.parent
+                if not allowed:
+                    raise self._error("'super' keyword unexpected here")
+            # super call: check for super_call_allowed similarly
+            elif nxt == ord('('):
+                scope = self.s.cur_func
+                allowed = False
+                while scope is not None:
+                    if scope.super_call_allowed:
+                        allowed = True
+                        break
+                    if not scope.is_arrow:
+                        break
+                    scope = scope.parent
+                if not allowed and self.s.cur_func.parent is None:
+                    raise self._error("'super' keyword unexpected here")
             return Super()
 
         if t == ord('/'):
@@ -2265,18 +2692,19 @@ class Parser:
                     self._next()
                     elements.append(None)  # elision
                     continue
+                is_spread = False
                 if self._tok() == Tok.ELLIPSIS:
                     self._next()
                     elements.append(SpreadElement(argument=self._parse_assignment_expr()))
-                    # If there's a trailing comma after spread, record it as a trailing None
-                    # so that pattern validation can detect the invalid trailing comma
-                    if self._tok() == ord(','):
-                        self._next()
-                        elements.append(None)
+                    is_spread = True
                 else:
                     elements.append(self._parse_assignment_expr())
                 if self._tok() != ord(']'):
                     self._expect(ord(','))
+                    if is_spread and self._tok() == ord(']'):
+                        # Trailing comma after spread: record sentinel for
+                        # destructuring validation (rest must be last element).
+                        elements.append(None)
         finally:
             self._container_depth -= 1
             if save_in is None:
@@ -2341,7 +2769,8 @@ class Parser:
                     generator = self._eat(ord('*'))
                     key, computed = self._parse_property_key()
                     params = self._parse_formal_params()
-                    body = self._parse_function_body(is_async=True, is_generator=generator)
+                    self._check_await_yield_params(params, True, generator)
+                    body = self._parse_function_body(is_async=True, is_generator=generator, super_prop_allowed=True)
                     value = FunctionExpression(params=params, body=body, generator=generator, async_=True)
                     return Property(key=key, value=value, kind="init", computed=computed, method=True)
                 else:
@@ -2360,19 +2789,19 @@ class Parser:
         # Method shorthand: { name(...) { ... } }
         if self._tok() == ord('(') and kind == "init" and not generator:
             params = self._parse_formal_params()
-            body = self._parse_function_body()
+            body = self._parse_function_body(super_prop_allowed=True)
             value = FunctionExpression(params=params, body=body)
             return Property(key=key, value=value, kind="init", computed=computed, method=True)
 
         if kind in ("get", "set"):
             params = self._parse_formal_params()
-            body = self._parse_function_body()
+            body = self._parse_function_body(super_prop_allowed=True)
             value = FunctionExpression(params=params, body=body)
             return Property(key=key, value=value, kind=kind, computed=computed, method=True)
 
         if generator:
             params = self._parse_formal_params()
-            body = self._parse_function_body(is_generator=True)
+            body = self._parse_function_body(is_generator=True, super_prop_allowed=True)
             value = FunctionExpression(params=params, body=body, generator=True)
             return Property(key=key, value=value, kind="init", computed=computed, method=True)
 
@@ -2386,6 +2815,14 @@ class Parser:
         # Note: { x = expr } is a CoverInitializedName, valid only in destructuring context.
         # We parse it here and raise SyntaxError later if not used as a destructuring target.
         if isinstance(key, Identifier):
+            # Reserved words like 'this' cannot be used as shorthand property identifiers
+            if key.name in ('this', 'super', 'null', 'true', 'false',
+                            'new', 'delete', 'typeof', 'void', 'in', 'instanceof',
+                            'if', 'else', 'while', 'do', 'for', 'break', 'continue',
+                            'return', 'switch', 'case', 'default', 'throw', 'try',
+                            'catch', 'finally', 'with', 'var', 'const', 'class',
+                            'function', 'debugger', 'import', 'export', 'extends'):
+                raise self._error(f"Unexpected token '{key.name}'")
             value_node: Node = key
             if self._eat(ord('=')):
                 default = self._parse_assignment_expr()
@@ -2439,6 +2876,7 @@ class Parser:
             name = Identifier(name=_fn_name)
             self._next()
         params = self._parse_formal_params()
+        self._check_await_yield_params(params, is_async, generator)
         body = self._parse_function_body(is_async=is_async, is_generator=generator, params=params, fn_name=name)
         src = self.s.source[fn_start:self.s.last_pos]
         return FunctionExpression(id=name, params=params, body=body, generator=generator, async_=is_async, line=ln, col=cl, source_text=src)
@@ -2447,13 +2885,63 @@ class Parser:
         self._next()  # class
         name = None
         if self._tok() == Tok.IDENT:
-            name = Identifier(name=self._get_ident_name())
+            cn = self._get_ident_name()
+            # Class names are in strict context — reject strict-mode reserved words
+            if cn in _STRICT_RESERVED_WORDS:
+                raise self._error(f"'{cn}' is not a valid identifier in strict mode")
+            name = Identifier(name=cn)
             self._next()
         super_class = None
         if self._eat(Tok.EXTENDS):
             super_class = self._parse_left_hand_side_expr()
         body = self._parse_class_body(has_extends=super_class is not None)
         return ClassExpression(id=name, super_class=super_class, body=body)
+
+    def _check_await_yield_params(self, params: list, is_async: bool, is_generator: bool) -> None:
+        """Check that 'await'/'yield' are not used as parameter names or
+        in default value expressions of async/generator functions."""
+        if not is_async and not is_generator:
+            return
+        for p in params:
+            pn = getattr(p, 'name', None)
+            if pn is None and type(p).__name__ == 'AssignmentPattern':
+                pn = getattr(p.left, 'name', None)
+            if pn is None and type(p).__name__ == 'RestElement':
+                pn = getattr(p.argument, 'name', None)
+            if is_async and pn == 'await':
+                raise self._error("'await' is not allowed as a parameter name in an async function")
+            if is_generator and pn == 'yield':
+                raise self._error("'yield' is not allowed as a parameter name in a generator function")
+            # Check default expressions for 'await'/'yield' used as identifiers
+            if type(p).__name__ == 'AssignmentPattern':
+                self._check_default_for_await_yield(p.right, is_async, is_generator)
+
+    def _check_default_for_await_yield(self, node, is_async: bool, is_generator: bool) -> None:
+        """Walk default expression AST looking for 'await'/'yield' used as identifiers."""
+        if node is None:
+            return
+        # Direct Identifier check
+        if type(node).__name__ == 'Identifier':
+            if is_async and node.name == 'await':
+                raise self._error("'await' is not allowed in default parameter expressions of an async function")
+            if is_generator and node.name == 'yield':
+                raise self._error("'yield' is not allowed in default parameter expressions of a generator function")
+            return
+        # Don't descend into nested function bodies (they have their own scope)
+        if type(node).__name__ in ('FunctionExpression', 'FunctionDeclaration', 'ArrowFunctionExpression', 'ClassExpression', 'ClassDeclaration'):
+            return
+        # Recurse into child nodes
+        for attr in ('left', 'right', 'argument', 'test', 'consequent', 'alternate',
+                     'object', 'property', 'callee', 'tag', 'expression', 'key', 'value'):
+            child = getattr(node, attr, None)
+            if child is not None:
+                self._check_default_for_await_yield(child, is_async, is_generator)
+        for attr in ('elements', 'arguments', 'params', 'properties', 'expressions', 'quasis'):
+            children = getattr(node, attr, None)
+            if children:
+                for child in children:
+                    if child is not None:
+                        self._check_default_for_await_yield(child, is_async, is_generator)
 
     def _parse_formal_params(self) -> list[Node]:
         self._expect(ord('('))
@@ -2509,12 +2997,14 @@ class Parser:
     def _parse_function_body(self, is_async: bool = False, is_generator: bool = False,
                              params: list | None = None, fn_name=None,
                              super_call_allowed: bool = False,
-                             super_prop_allowed: bool = False) -> BlockStatement:
+                             super_prop_allowed: bool = False,
+                             is_arrow: bool = False) -> BlockStatement:
         func_def = _StubFunctionDef()
         func_def.parent = self.s.cur_func
         func_def.js_mode = self.s.cur_func.js_mode
         func_def.super_call_allowed = super_call_allowed
         func_def.super_prop_allowed = super_prop_allowed
+        func_def.is_arrow = is_arrow
         if is_async:
             func_def.func_kind |= _JS_FUNC_ASYNC
         if is_generator:
@@ -2524,7 +3014,8 @@ class Parser:
         self._expect(ord('{'))
         # Detect "use strict" directive prologue
         if (self._tok() == Tok.STRING and
-                self.s.token.str_val.string == 'use strict'):
+                self.s.token.str_val.string == 'use strict' and
+                not self.s.token.str_val.has_escape):
             # Non-simple params (destructuring, defaults, rest) + "use strict" is illegal
             if params and not _has_simple_params(params):
                 raise self._error(
@@ -2566,7 +3057,7 @@ class Parser:
                 if (type(stmt).__name__ == 'ExpressionStatement' and
                         type(stmt.expression).__name__ == 'Literal' and
                         isinstance(stmt.expression.value, str)):
-                    if stmt.expression.value == 'use strict':
+                    if stmt.expression.value == 'use strict' and not stmt.expression.has_escape:
                         # Found "use strict" in directive prologue
                         # Non-simple params + "use strict" is illegal
                         if params and not _has_simple_params(params):
@@ -2595,13 +3086,14 @@ class Parser:
                                         raise self._error(
                                             f"Duplicate parameter name not allowed in strict mode: '{n}'")
                                     _seen_params2.add(n)
+                        func_def.js_mode |= JS_MODE_STRICT
                         break
                 else:
                     break  # Non-string statement ends the directive prologue
         self._expect(ord('}'))
         return BlockStatement(body=body)
 
-    def _parse_template_literal(self) -> TemplateLiteral:
+    def _parse_template_literal(self, tagged: bool = False) -> TemplateLiteral:
         """Parse a template literal `foo${expr}bar`."""
         quasis: list[TemplateElement] = []
         expressions: list[Node] = []
@@ -2610,6 +3102,11 @@ class Parser:
             cooked = self.s.token.str_val.string
             raw = self.s.token.str_val.raw
             sep = self.s.token.str_val.sep
+            has_invalid = self.s.token.str_val.has_invalid_escape
+            if has_invalid:
+                if not tagged:
+                    raise self._error("Invalid escape sequence in template literal")
+                cooked = None  # undefined cooked value for tagged templates
             if sep == '`':
                 # Last segment — this is the tail
                 quasis.append(TemplateElement(value=cooked, raw=raw, tail=True))
@@ -2644,7 +3141,10 @@ class Parser:
                 body.append(c)
                 self.s.advance()
                 if not self.s.at_end():
-                    body.append(self.s.source[self.s.pos])
+                    nc = self.s.source[self.s.pos]
+                    if nc in ('\n', '\r', '\u2028', '\u2029'):
+                        raise self._error("unterminated regexp")
+                    body.append(nc)
                     self.s.advance()
             elif c == '[':
                 in_class = True
@@ -2698,7 +3198,10 @@ class Parser:
                 i += 1
         # Validate the pattern — check for common early errors
         # Leading quantifier (nothing to quantify): ?, *, +, {n}
-        _check_re_pattern(pattern)
+        try:
+            _check_re_pattern(pattern, u_flag='u' in flag_str)
+        except ValueError as e:
+            raise self._error(f"invalid regular expression: {e}")
         self._next()  # advance to next token
         return Literal(value=None, regex={"pattern": pattern, "flags": flag_str})
 
