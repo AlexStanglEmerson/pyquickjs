@@ -54,6 +54,10 @@ class ParseError(Exception):
         super().__init__(f"SyntaxError: {msg} (line {line})")
 
 
+# Sentinel for trailing comma after spread in array literals (not a real elision).
+_TRAILING_COMMA_AFTER_SPREAD = object()
+
+
 # ---- Operator precedence table for Pratt parsing ----
 
 # Binary operators: maps token -> (left_binding_power, right_binding_power, op_string)
@@ -137,9 +141,10 @@ def _has_optional_chain(node: Node) -> bool:
             return True
         return _has_optional_chain(node.object)
     if isinstance(node, CallExpression):
-        # A call expression result is never a valid assignment target anyway,
-        # but if it involves optional chain, mark it accordingly
-        return True
+        # A call expression itself is not optional chain, but it may contain one
+        if getattr(node, 'optional', False):
+            return True
+        return _has_optional_chain(node.callee)
     return False
 
 
@@ -358,18 +363,18 @@ def _check_assignment_pattern_validity(node, strict: bool = False) -> str | None
     if t in ('ArrayExpression', 'ArrayPattern'):
         elems = node.elements
         for i, elem in enumerate(elems):
-            if elem is None:
+            if elem is None or elem is _TRAILING_COMMA_AFTER_SPREAD:
                 continue
             et = type(elem).__name__
             if et in ('SpreadElement', 'RestElement'):
                 # Rest must be last non-null element
-                rest_after = any(e is not None for e in elems[i+1:])
+                rest_after = any(e is not None and e is not _TRAILING_COMMA_AFTER_SPREAD for e in elems[i+1:])
                 if rest_after:
                     return "Rest element must be last element"
                 # RestElement cannot have an initializer directly in array at position < last
-                # Check for trailing comma after rest (None sentinel added by _parse_array_literal)
+                # Check for trailing comma after rest (sentinel added by _parse_array_literal)
                 if i < len(elems) - 1:
-                    # There are null elements after (trailing comma)
+                    # There are sentinel/null elements after (trailing comma)
                     return "Rest element must be last element"
                 # SpreadElement cannot wrap an AssignmentExpression initializer
                 arg_type = type(elem.argument).__name__
@@ -442,15 +447,45 @@ def _check_re_pattern(pattern: str, u_flag: bool = False):
     # Track bare \k (without proper <name>) for deferred rejection
     has_bare_k = False
 
+    # Count capturing groups in pattern for backreference validation
+    _num_groups = 0
+    _gi = 0
+    while _gi < n:
+        if pattern[_gi] == '\\':
+            _gi += 2  # skip escape
+        elif pattern[_gi] == '[':
+            _gi += 1
+            while _gi < n and pattern[_gi] != ']':
+                if pattern[_gi] == '\\':
+                    _gi += 2
+                else:
+                    _gi += 1
+            _gi += 1  # skip ]
+        elif pattern[_gi] == '(' and (_gi + 1 >= n or pattern[_gi + 1] != '?'):
+            _num_groups += 1
+            _gi += 1
+        elif pattern[_gi] == '(' and _gi + 2 < n and pattern[_gi + 1] == '?' and pattern[_gi + 2] == '<' and (_gi + 3 < n and pattern[_gi + 3] not in ('=', '!')):
+            _num_groups += 1
+            _gi += 1
+        else:
+            _gi += 1
+
+    # Allowed identity escapes in u-mode: SyntaxCharacter + /
+    _U_ALLOWED_ESCAPES = frozenset('^$\\.*+?()[]{}|/')
+
     while i < n:
         c = pattern[i]
         if c == '\\':
+            if i + 1 >= n:
+                can_quantify = True
+                i += 1
+                continue
+            nxt = pattern[i + 1]
             # Escape sequence — check for \k backreference
-            if i + 1 < n and pattern[i + 1] == 'k':
+            if nxt == 'k':
                 # \k<name> back reference
                 if i + 2 < n and pattern[i + 2] == '<':
                     j = i + 3
-                    # Only scan valid identifier characters + backslash for \u
                     while j < n and pattern[j] != '>' and pattern[j] not in '()/|':
                         j += 1
                     if j < n and pattern[j] == '>':
@@ -460,22 +495,111 @@ def _check_re_pattern(pattern: str, u_flag: bool = False):
                         i = j + 1
                         continue
                     else:
-                        # Unterminated or malformed \k<...> — mark as bare \k
                         has_bare_k = True
                 else:
-                    # \k without < — mark for deferred rejection
                     has_bare_k = True
+            # u-flag escape validation
+            if u_flag:
+                if nxt == 'u':
+                    # \u{XXXX} or \uHHHH — validate
+                    if i + 2 < n and pattern[i + 2] == '{':
+                        j = i + 3
+                        while j < n and pattern[j] != '}':
+                            if pattern[j] not in '0123456789abcdefABCDEF':
+                                raise ValueError("Invalid regular expression: invalid unicode escape")
+                            j += 1
+                        if j >= n:
+                            raise ValueError("Invalid regular expression: unterminated unicode escape")
+                        hex_str = pattern[i + 3:j]
+                        if not hex_str:
+                            raise ValueError("Invalid regular expression: empty unicode escape")
+                        cp = int(hex_str, 16)
+                        if cp > 0x10FFFF:
+                            raise ValueError("Invalid regular expression: unicode escape out of range")
+                        can_quantify = True
+                        i = j + 1
+                        continue
+                elif nxt == 'c':
+                    # \cX — X must be a letter
+                    if i + 2 < n and pattern[i + 2].isalpha():
+                        can_quantify = True
+                        i += 3
+                        continue
+                    raise ValueError("Invalid regular expression: invalid class control escape")
+                elif nxt in '123456789':
+                    # Backreference — only valid if within group count in u-mode
+                    # Read full decimal number
+                    _br_start = i + 1
+                    _br_end = _br_start + 1
+                    while _br_end < n and pattern[_br_end].isdigit():
+                        _br_end += 1
+                    _br_num = int(pattern[_br_start:_br_end])
+                    if _br_num > _num_groups:
+                        raise ValueError("Invalid regular expression: decimal escape in unicode mode")
+                elif nxt in 'dDsSwWbBnrtfv0pP':
+                    pass  # allowed escapes
+                elif nxt == 'x':
+                    pass  # \xHH — allowed
+                elif nxt in _U_ALLOWED_ESCAPES:
+                    pass  # SyntaxCharacter or /
+                elif nxt == '-':
+                    pass  # allowed inside character classes
+                else:
+                    raise ValueError(f"Invalid regular expression: invalid escape \\{nxt} in unicode mode")
             can_quantify = True
             i += 2
             continue
         if c == '[':
-            # Character class — skip to closing ]
+            # Character class — skip to closing ], with u-mode range validation
             can_quantify = True
             i += 1
+            if i < n and pattern[i] == '^':
+                i += 1  # skip negation
+            _CC_ESCAPES = frozenset('dDsSwW')
+            prev_is_class_escape = False
+            prev_was_char = False
+            in_range = False
             while i < n and pattern[i] != ']':
                 if pattern[i] == '\\':
-                    i += 1  # skip escape
-                i += 1
+                    if i + 1 < n:
+                        esc_ch = pattern[i + 1]
+                        is_class_esc = esc_ch in _CC_ESCAPES
+                        if u_flag and in_range and is_class_esc:
+                            # x-\d is invalid in u-mode (right side is multi-char set)
+                            raise ValueError("Invalid regular expression: invalid class range in unicode mode")
+                        prev_is_class_escape = is_class_esc
+                        prev_was_char = True
+                        in_range = False
+                        i += 2
+                    else:
+                        i += 1
+                elif pattern[i] == '-':
+                    # A dash at the very start or end of a class is a literal char
+                    if not prev_was_char and not prev_is_class_escape:
+                        # Literal dash (at start of class or after another dash)
+                        prev_was_char = True
+                        prev_is_class_escape = False
+                        in_range = False
+                        i += 1
+                    elif i + 1 < n and pattern[i + 1] == ']':
+                        # Dash before closing ] is literal
+                        prev_was_char = True
+                        prev_is_class_escape = False
+                        in_range = False
+                        i += 1
+                    else:
+                        # Range separator
+                        if u_flag and prev_is_class_escape:
+                            raise ValueError("Invalid regular expression: invalid class range in unicode mode")
+                        in_range = True
+                        prev_was_char = False
+                        prev_is_class_escape = False
+                        i += 1
+                else:
+                    in_range = False
+                    prev_is_class_escape = False
+                    prev_was_char = True
+                    i += 1
             i += 1  # skip ]
             continue
         if c == '(':
@@ -498,6 +622,25 @@ def _check_re_pattern(pattern: str, u_flag: bool = False):
                 # Check if followed by a quantifier (lookbehind is not quantifiable)
                 if j < n and pattern[j] in '?*+{':
                     raise ValueError(f"Nothing to repeat: quantifier after lookbehind assertion")
+                can_quantify = True
+                i = j
+                continue
+            # Check for lookahead assertions (?=...) and (?!...)
+            if i + 2 < n and pattern[i+1] == '?' and pattern[i+2] in ('=', '!'):
+                # In u-mode, lookahead assertions cannot be quantified
+                depth = 1
+                j = i + 3
+                while j < n and depth > 0:
+                    if pattern[j] == '\\':
+                        j += 2
+                        continue
+                    if pattern[j] == '(':
+                        depth += 1
+                    elif pattern[j] == ')':
+                        depth -= 1
+                    j += 1
+                if u_flag and j < n and pattern[j] in '?*+{':
+                    raise ValueError("Nothing to repeat: quantifier after assertion in unicode mode")
                 can_quantify = True
                 i = j
                 continue
@@ -623,13 +766,15 @@ def _check_re_pattern(pattern: str, u_flag: bool = False):
             continue
         if c == '{':
             # Braced quantifier: {n}, {n,}, {n,m}
-            if not can_quantify:
-                # Check if it's a valid quantifier
-                j = i + 1
-                while j < n and pattern[j].isdigit():
-                    j += 1
-                if j > i + 1 and j < n and pattern[j] in ',}':
-                    raise ValueError(f"Nothing to repeat: braced quantifier")
+            # Check if this is a valid quantifier form
+            j = i + 1
+            while j < n and pattern[j].isdigit():
+                j += 1
+            is_valid_quant = (j > i + 1 and j < n and pattern[j] in ',}')
+            if not can_quantify and is_valid_quant:
+                raise ValueError(f"Nothing to repeat: braced quantifier")
+            if u_flag and not is_valid_quant:
+                raise ValueError("Invalid regular expression: lone '{' in unicode mode")
             can_quantify = True
             i += 1
             continue
@@ -1856,7 +2001,7 @@ class Parser:
                     else:
                         self.s.pos = save_pos
                         self.s.token = save_tok
-                elif pname == "async":
+                elif pname == "async" and not self.s.token.ident.has_escape:
                     save_pos = self.s.pos
                     save_tok = self.s.token
                     self._next()
@@ -2019,6 +2164,7 @@ class Parser:
             return arg  # treat await expr as its argument (simplification)
 
         # Check for arrow function: (...) => or ident =>
+        left = None
         if self._tok() == Tok.IDENT:
             # Could be: x => body  OR  async () => body  OR  async x => body
             name = self._get_ident_name()
@@ -2034,7 +2180,9 @@ class Parser:
                 if self._tok() == ord('('):
                     arrow = self._try_parse_paren_arrow()
                     if arrow is not None:
-                        return arrow
+                        if self._tok() not in _ASSIGN_OPS:
+                            return arrow
+                        left = arrow
                 elif self._tok() == Tok.IDENT:
                     param_name = self._get_ident_name()
                     save_pos2 = self.s.pos
@@ -2046,17 +2194,26 @@ class Parser:
                     # Not an async arrow; restore to after 'async'
                     self.s.pos = save_pos2
                     self.s.token = save_tok2
-            # Not an arrow, restore
-            self.s.pos = save_pos
-            self.s.token = save_tok
+            # Not an arrow (or arrow used as invalid assignment target), restore
+            if left is None:
+                self.s.pos = save_pos
+                self.s.token = save_tok
 
         # Check for paren-arrow: (params) =>
-        if self._tok() == ord('('):
-            arrow = self._try_parse_paren_arrow()
-            if arrow is not None:
-                return arrow
-
-        left = self._parse_conditional_expr()
+        if left is None:
+            if self._tok() == ord('('):
+                arrow = self._try_parse_paren_arrow()
+                if arrow is not None:
+                    # If next token is `=`, the arrow is being used as an assignment
+                    # target which is invalid (AssignmentTargetType = invalid).
+                    # Don't return early — let it fall through to the assignment check.
+                    if self._tok() not in _ASSIGN_OPS:
+                        return arrow
+                    left = arrow
+                else:
+                    left = self._parse_conditional_expr()
+            else:
+                left = self._parse_conditional_expr()
 
         # Assignment operators
         t = self._tok()
@@ -2076,6 +2233,10 @@ class Parser:
                     raise self._error("Invalid assignment target: left-hand side must be an identifier or member expression")
             else:
                 # Simple assignment: LHS must be assignable (Identifier, MemberExpression, or destructuring pattern)
+                # Parenthesized ObjectExpression/ArrayExpression are NOT valid destructuring targets
+                # per spec: only bare ObjectLiteral/ArrayLiteral (not ParenthesizedExpression) can be destructuring
+                if isinstance(left, (ArrayExpression, ObjectExpression)) and getattr(left, 'parenthesized', False):
+                    raise self._error("Invalid left-hand side in assignment")
                 if not (isinstance(left, (Identifier, MemberExpression, ArrayExpression, ObjectExpression))):
                     raise self._error("Invalid left-hand side in assignment")
                 # Validate destructuring pattern
@@ -2169,7 +2330,18 @@ class Parser:
 
     def _parse_binary_expr(self, min_bp: int) -> Node:
         """Pratt parser for binary operators."""
-        left = self._parse_unary_expr()
+        # Handle '#field in expr' syntax (private field presence check)
+        if self._tok() == Tok.PRIVATE_NAME and Tok.IN in _BINARY_OPS:
+            pname = self._get_ident_name()
+            self._check_private_name(pname)
+            self._next()  # consume the PRIVATE_NAME token
+            left = PrivateIdentifier(name=pname)
+            # PrivateIdentifier MUST be followed by 'in' at sufficient bp
+            in_bp = _BINARY_OPS.get(Tok.IN)
+            if self._tok() != Tok.IN or in_bp is None or in_bp[0] < min_bp:
+                raise self._error("Private field '#%s' must be followed by 'in'" % pname)
+        else:
+            left = self._parse_unary_expr()
 
         while True:
             t = self._tok()
@@ -2704,7 +2876,7 @@ class Parser:
                     if is_spread and self._tok() == ord(']'):
                         # Trailing comma after spread: record sentinel for
                         # destructuring validation (rest must be last element).
-                        elements.append(None)
+                        elements.append(_TRAILING_COMMA_AFTER_SPREAD)
         finally:
             self._container_depth -= 1
             if save_in is None:
@@ -2823,6 +2995,17 @@ class Parser:
                             'catch', 'finally', 'with', 'var', 'const', 'class',
                             'function', 'debugger', 'import', 'export', 'extends'):
                 raise self._error(f"Unexpected token '{key.name}'")
+            # Strict mode reserved words cannot be used as shorthand identifiers
+            if (key.name in _STRICT_RESERVED_WORDS and
+                    self.s.cur_func.js_mode & JS_MODE_STRICT):
+                raise self._error(f"Unexpected strict mode reserved word '{key.name}'")
+            # yield is a keyword inside generators; await inside async functions
+            if (key.name == 'yield' and
+                    self.s.cur_func.func_kind & _JS_FUNC_GENERATOR):
+                raise self._error("Unexpected keyword 'yield'")
+            if (key.name == 'await' and
+                    self.s.cur_func.func_kind & _JS_FUNC_ASYNC):
+                raise self._error("Unexpected keyword 'await'")
             value_node: Node = key
             if self._eat(ord('=')):
                 default = self._parse_assignment_expr()

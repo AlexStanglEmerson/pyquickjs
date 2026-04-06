@@ -1139,6 +1139,11 @@ class JSParseState:
                 is_non_octal_decimal = True
                 self.advance()  # skip leading '0'
                 allow_sep = False
+            elif p1 == '_':
+                # 0_ is never valid: no grammar production allows
+                # NumericLiteralSeparator after a leading zero
+                self._error("numeric separator not allowed after leading zero")
+                return
             else:
                 # Bare '0' possibly followed by '.', 'e', 'E', 'n', or end
                 # Do NOT advance; let _scan_number_body consume the '0'
