@@ -39,12 +39,36 @@ from pyquickjs.ast_nodes import (
     ConditionalExpression, CallExpression, NewExpression, MemberExpression,
     SequenceExpression, TemplateLiteral, TemplateElement,
     TaggedTemplateExpression, YieldExpression, ClassExpression, ClassBody,
-    MethodDefinition, MetaProperty, Super,
+    MethodDefinition, MetaProperty, Super, ChainExpression,
+    PrivateIdentifier,
     # Patterns
     ArrayPattern, ObjectPattern, RestElement, AssignmentPattern,
 )
 
 # ---- Control flow signals ----
+
+# Sentinel for "empty completion" - statements like FunctionDeclaration do not
+# contribute a completion value. _exec_block should not update result for these.
+class _EmptyCompletion:
+    """Singleton sentinel for spec's 'empty' completion value."""
+    _instance = None
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    def __repr__(self):
+        return '<empty>'
+
+class _Hole:
+    """Sentinel for array elision (hole/empty slot). Not a JS value."""
+    _instance = None
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+_HOLE = _Hole()
+
+_EMPTY = _EmptyCompletion()
 
 class _ReturnSignal(Exception):
     __slots__ = ('value',)
@@ -52,20 +76,26 @@ class _ReturnSignal(Exception):
         self.value = value
 
 class _BreakSignal(Exception):
-    __slots__ = ('label',)
-    def __init__(self, label=None):
+    __slots__ = ('label', 'value')
+    def __init__(self, label=None, value=None):
         self.label = label
+        self.value = value  # UpdateEmpty completion value carrier
 
 class _ContinueSignal(Exception):
-    __slots__ = ('label',)
-    def __init__(self, label=None):
+    __slots__ = ('label', 'value')
+    def __init__(self, label=None, value=None):
         self.label = label
+        self.value = value  # UpdateEmpty completion value carrier
 
 class _ThrowSignal(Exception):
     """Represents a JS throw that hasn't been caught yet."""
     __slots__ = ('js_value',)
     def __init__(self, js_value):
         self.js_value = js_value
+
+class _OptionalChainShortCircuit(Exception):
+    """Raised when ?. encounters null/undefined to short-circuit the entire chain."""
+    __slots__ = ()
 
 class JSError(Exception):
     """Wrapper for JS Error objects thrown and propagated to Python."""
@@ -84,7 +114,7 @@ _SENTINEL = object()  # marks TDZ / not set
 class Environment:
     """A lexical scope environment (activation record)."""
 
-    __slots__ = ('_bindings', '_parent', '_is_function', '_var_scope', '_with_obj', '_consts', '_sloppy_consts')
+    __slots__ = ('_bindings', '_parent', '_is_function', '_var_scope', '_with_obj', '_consts', '_sloppy_consts', '_eval_var_configurable', '_in_default_param', '_annex_b_var_names', '_annex_b_var_scope')
 
     def __init__(self, parent: 'Environment | None' = None,
                  is_function: bool = False,
@@ -96,6 +126,10 @@ class Environment:
         self._with_obj = with_obj  # for `with` statement
         self._consts: set | None = None  # const binding names
         self._sloppy_consts: set | None = None  # NFE-style: silently ignore writes in sloppy mode
+        self._eval_var_configurable = False  # True when inside eval: var bindings are configurable
+        self._in_default_param = False  # True when evaluating non-arrow function default parameter expressions
+        self._annex_b_var_names = None  # set[str] | None — Annex B block-scoped fn names for eval
+        self._annex_b_var_scope = None  # Environment | None — var scope for Annex B propagation
 
         # Walk up to find the function/var scope
         if not is_function and parent is not None:
@@ -106,9 +140,41 @@ class Environment:
         scope = self._var_scope
         # A var declaration without an initializer (value=undefined) must not
         # overwrite an existing binding (e.g. a function parameter or prior assignment).
+        # Exception: NFE names (in _sloppy_consts) should be overridable by var
         if value is undefined and name in scope._bindings:
-            return
+            if not (scope._sloppy_consts and name in scope._sloppy_consts):
+                return
+            # var n; overrides NFE name n — remove from sloppy_consts
+            scope._sloppy_consts.discard(name)
         scope._bindings[name] = value
+        # Sync to globalThis at global scope — var-declared globals
+        # are non-configurable on the global object (spec 15.1.11 step 18d)
+        if scope._parent is None and 'globalThis' in scope._bindings:
+            global_obj = scope._bindings['globalThis']
+            if isinstance(global_obj, JSObject):
+                global_obj.props[name] = value
+                # Mark as non-configurable (like var bindings should be)
+                if global_obj._descriptors is None:
+                    global_obj._descriptors = {}
+                if name not in global_obj._descriptors:
+                    global_obj._descriptors[name] = {
+                        'value': value, 'writable': True,
+                        'enumerable': True, 'configurable': scope._eval_var_configurable,
+                    }
+                elif 'value' in global_obj._descriptors[name]:
+                    global_obj._descriptors[name]['value'] = value
+
+    def assign_var(self, name: str, value) -> None:
+        """Assign a var binding unconditionally (for for-of/for-in loop variables)."""
+        scope = self._var_scope
+        scope._bindings[name] = value
+        # Sync to globalThis at global scope
+        if scope._parent is None and 'globalThis' in scope._bindings:
+            global_obj = scope._bindings['globalThis']
+            if isinstance(global_obj, JSObject):
+                global_obj.props[name] = value
+                if global_obj._descriptors and name in global_obj._descriptors:
+                    global_obj._descriptors[name]['value'] = value
 
     def define_let(self, name: str, value) -> None:
         """Define a let/const binding in the current scope."""
@@ -136,7 +202,16 @@ class Environment:
                 # with-statement scope: check object first
                 obj = env._with_obj
                 if isinstance(obj, JSObject) and _obj_has_property(obj, name):
-                    return _obj_get_property(obj, name)
+                    # Check @@unscopables (HasBinding step 6-8)
+                    if not _with_is_unscopable(obj, name):
+                        # Per spec GetBindingValue §9.1.1.2.6: re-check HasProperty
+                        # (the unscopables getter may have deleted the binding)
+                        if not _obj_has_property(obj, name):
+                            if self._is_strict():
+                                raise _ThrowSignal(make_error('ReferenceError',
+                                    f"'{name}' is not defined"))
+                            return undefined
+                        return _obj_get_property(obj, name)
                 elif isinstance(obj, dict) and name in obj:
                     return obj[name]
             if name in env._bindings:
@@ -150,6 +225,46 @@ class Environment:
                     if isinstance(global_obj, JSObject) and global_obj._descriptors and name in global_obj._descriptors:
                         return _obj_get_property(global_obj, name)
                 return val
+            # At global scope, also check globalThis for properties added via Object.defineProperty
+            if env._parent is None and 'globalThis' in env._bindings:
+                global_obj = env._bindings.get('globalThis')
+                if isinstance(global_obj, JSObject) and (name in global_obj.props or (global_obj._descriptors and name in global_obj._descriptors)):
+                    return _obj_get_property(global_obj, name)
+            env = env._parent
+        raise _ThrowSignal(make_error('ReferenceError',
+            f"'{name}' is not defined"))
+
+    def get_with_base(self, name: str):
+        """Look up a name and return (value, with_base_obj_or_None)."""
+        env = self
+        while env is not None:
+            if env._with_obj is not None:
+                obj = env._with_obj
+                if isinstance(obj, JSObject) and _obj_has_property(obj, name):
+                    if not _with_is_unscopable(obj, name):
+                        # Per spec GetBindingValue: re-check HasProperty
+                        if not _obj_has_property(obj, name):
+                            if self._is_strict():
+                                raise _ThrowSignal(make_error('ReferenceError',
+                                    f"'{name}' is not defined"))
+                            return undefined, None
+                        return _obj_get_property(obj, name), obj
+                elif isinstance(obj, dict) and name in obj:
+                    return obj[name], None
+            if name in env._bindings:
+                val = env._bindings[name]
+                if val is _SENTINEL:
+                    raise _ThrowSignal(make_error('ReferenceError',
+                        f"Cannot access '{name}' before initialization"))
+                if env._parent is None and 'globalThis' in env._bindings:
+                    global_obj = env._bindings.get('globalThis')
+                    if isinstance(global_obj, JSObject) and global_obj._descriptors and name in global_obj._descriptors:
+                        return _obj_get_property(global_obj, name), None
+                return val, None
+            if env._parent is None and 'globalThis' in env._bindings:
+                global_obj = env._bindings.get('globalThis')
+                if isinstance(global_obj, JSObject) and (name in global_obj.props or (global_obj._descriptors and name in global_obj._descriptors)):
+                    return _obj_get_property(global_obj, name), None
             env = env._parent
         raise _ThrowSignal(make_error('ReferenceError',
             f"'{name}' is not defined"))
@@ -161,12 +276,23 @@ class Environment:
             if env._with_obj is not None:
                 obj = env._with_obj
                 if isinstance(obj, JSObject) and _obj_has_property(obj, name):
-                    _obj_set_property(obj, name, value)
-                    return
+                    if not _with_is_unscopable(obj, name):
+                        # Per spec SetMutableBinding §9.1.1.2.5: re-check HasProperty
+                        # (the unscopables getter may have deleted the binding)
+                        if not _obj_has_property(obj, name):
+                            if self._is_strict():
+                                raise _ThrowSignal(make_error('ReferenceError',
+                                    f'{name} is not defined'))
+                            # sloppy: spec still calls Set(bindingObject, N, V, S)
+                        _obj_set_property(obj, name, value, self._is_strict())
+                        return
                 elif isinstance(obj, dict) and name in obj:
                     obj[name] = value
                     return
             if name in env._bindings:
+                if env._bindings[name] is _SENTINEL:
+                    raise _ThrowSignal(make_error('ReferenceError',
+                        f"Cannot access '{name}' before initialization"))
                 if env._consts and name in env._consts:
                     raise _ThrowSignal(make_error('TypeError',
                         f'Assignment to constant variable.'))
@@ -185,16 +311,21 @@ class Environment:
                     if isinstance(global_obj, JSObject) and (
                             (global_obj._descriptors and name in global_obj._descriptors) or
                             name in global_obj.props):
-                        _obj_set_property(global_obj, name, value)
+                        _obj_set_property(global_obj, name, value, env._is_strict())
                         # Sync back to bindings from props (for non-descriptor case)
                         if name in global_obj.props:
                             env._bindings[name] = global_obj.props[name]
                         return
-                    elif isinstance(global_obj, JSObject):
-                        # Keep global_obj.props in sync for future defineProperty calls
-                        global_obj.props[name] = value
                 env._bindings[name] = value
                 return
+            # At global scope, check globalThis for properties not in _bindings
+            if env._parent is None and 'globalThis' in env._bindings:
+                global_obj = env._bindings.get('globalThis')
+                if isinstance(global_obj, JSObject) and (name in global_obj.props or (global_obj._descriptors and name in global_obj._descriptors)):
+                    _obj_set_property(global_obj, name, value, env._is_strict())
+                    if name in global_obj.props:
+                        env._bindings[name] = global_obj.props[name]
+                    return
             env = env._parent
         # In non-strict mode, fall through to global (create implicit global)
         # In strict mode, throw ReferenceError
@@ -206,6 +337,16 @@ class Environment:
         while env._parent is not None:
             env = env._parent
         env._bindings[name] = value
+        # Also sync to globalThis.props so getOwnPropertyDescriptor can find it
+        if 'globalThis' in env._bindings:
+            global_obj = env._bindings['globalThis']
+            if isinstance(global_obj, JSObject):
+                global_obj.props[name] = value
+                # Per ES5+, implicit global assignments create {writable:true, enumerable:true, configurable:true}
+                if global_obj._descriptors is None:
+                    global_obj._descriptors = {}
+                if name not in global_obj._descriptors:
+                    global_obj._descriptors[name] = {'value': value, 'writable': True, 'enumerable': True, 'configurable': True}
 
     def set_local(self, name: str, value) -> None:
         """Set a binding in the current scope only (for with statements)."""
@@ -214,8 +355,21 @@ class Environment:
     def has_binding(self, name: str) -> bool:
         env = self
         while env is not None:
+            if env._with_obj is not None:
+                obj = env._with_obj
+                if isinstance(obj, JSObject) and _obj_has_property(obj, name):
+                    # Don't call _with_is_unscopable here to avoid side effects.
+                    # has_binding is used for reference resolution checks and
+                    # must not trigger getters. Return True conservatively;
+                    # the actual unscopables check happens in get/set.
+                    return True
             if name in env._bindings:
                 return True
+            # At global scope, also check globalThis
+            if env._parent is None and 'globalThis' in env._bindings:
+                global_obj = env._bindings.get('globalThis')
+                if isinstance(global_obj, JSObject) and (name in global_obj.props or (global_obj._descriptors and name in global_obj._descriptors)):
+                    return True
             env = env._parent
         return False
 
@@ -248,6 +402,15 @@ def register_proto(name: str, proto: 'JSObject') -> None:
     """Register a built-in prototype so new instances can use it."""
     _PROTOS[name] = proto
 
+_WELL_KNOWN_SYMBOLS: dict[str, 'JSSymbol'] = {}
+
+def register_well_known_symbol(description: str, sym: 'JSSymbol') -> None:
+    """Register a well-known symbol so it can be used in the interpreter."""
+    _WELL_KNOWN_SYMBOLS[description] = sym
+    # Store the internal key (e.g. '@@iterator') on the symbol for fast lookup
+    short_name = description.split('.', 1)[1] if '.' in description else description
+    sym._well_known_key = '@@' + short_name
+
 
 def _def_method(obj: 'JSObject', name: str, fn: 'JSObject') -> None:
     """Set a non-enumerable method on an object (for built-in prototypes)."""
@@ -277,7 +440,7 @@ class JSObject:
                  # for WeakRef
                  '_weak_target',
                  # for RegExp
-                 '_regex', '_regex_flags',
+                 '_regex', '_regex_flags', '_dup_group_info',
                  # for Symbol
                  '_symbol_desc',
                  # for generators
@@ -294,11 +457,29 @@ class JSObject:
                  '_date_ms',
                  # for ArrayBuffer
                  '_ab_data',
+                 # [[ErrorData]] slot marker (for Error.isError)
+                 '_error_data',
+                 # for Iterator internal slots
+                 '_iter_source', '_iter_idx', '_iter_kind', '_iter_done',
+                 # for WeakMap/WeakSet
+                 '_weakmap_data', '_weakset_data', '_weakset_keys',
+                 # for mapped arguments
+                 '_mapped_env', '_mapped_params',
+                 # for private class fields/methods
+                 '_private_fields',
+                 # marker: prototype was set by constructor (for ArrayBuffer etc.)
+                 '_nt_proto_set',
                  )
 
-    def __init__(self, proto=None, class_name='Object'):
+    _DEFAULT_PROTO = None  # Set after builtins are initialized
+
+    def __init__(self, proto=_SENTINEL, class_name='Object'):
         self.props: dict[str, Any] = {}
-        self.proto = proto
+        # Use Object.prototype as default if available and no proto specified
+        if proto is _SENTINEL:
+            self.proto = JSObject._DEFAULT_PROTO
+        else:
+            self.proto = proto
         self.class_name = class_name
         self.extensible = True
         self._call: Callable | None = None
@@ -310,6 +491,7 @@ class JSObject:
         self._non_enum: set[str] | None = None  # non-enumerable property names
         self._regex = None
         self._regex_flags = None
+        self._dup_group_info = None
         self._symbol_desc = None
         self._gen_iter = None
         self._map_data = None
@@ -326,6 +508,18 @@ class JSObject:
         self._date_ms = None
         self._ab_data = None
         self._weak_target = None
+        self._error_data = False
+        self._iter_source = None
+        self._iter_idx = None
+        self._iter_kind = None
+        self._iter_done = False
+        self._weakmap_data = None
+        self._weakset_data = None
+        self._weakset_keys = None
+        self._mapped_env = None
+        self._mapped_params = None
+        self._private_fields = None
+        self._nt_proto_set = False
 
     def has_own(self, key: str) -> bool:
         return key in self.props or (
@@ -353,10 +547,548 @@ class JSObject:
         return f'[object {self.class_name}]'
 
 
+# --- Proxy trap dispatch helpers ---
+
+def _is_proxy(obj) -> bool:
+    """Check if obj is a Proxy (including revoked proxies)."""
+    return isinstance(obj, JSObject) and obj.class_name == 'Proxy'
+
+
+def _proxy_key_to_js(key: str):
+    """Convert an internal property key to the JS value for trap arguments.
+    Converts @@sym_N back to Symbol objects, returns string keys as-is."""
+    if key.startswith('@@sym_') or (key.startswith('@@') and not key.startswith('@@array_data') and not key.startswith('@@ta_') and not key.startswith('@@iter')):
+        sym = _key_to_symbol(key)
+        if sym is not None:
+            return sym
+    return key
+
+
+def _proxy_get_trap(proxy: JSObject, key: str, receiver=None):
+    """Invoke the 'get' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'get\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'get') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key), receiver if receiver is not None else proxy])
+        # Invariant checks against target descriptor
+        if isinstance(target, JSObject) and target._descriptors and key in target._descriptors:
+            target_desc = target._descriptors[key]
+            if target_desc.get('configurable') is False:
+                if 'value' in target_desc and target_desc.get('writable') is False:
+                    if not js_strict_equal(result, target_desc['value']):
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'get' on proxy: property '{key}' is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value"))
+                if 'get' in target_desc and target_desc['get'] is undefined:
+                    if result is not undefined:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'get' on proxy: property '{key}' is a non-configurable accessor property on the proxy target and does not have a getter function, but the trap did not return 'undefined'"))
+        return result
+    # No trap — forward to target.[[Get]](P, Receiver)
+    actual_receiver = receiver if receiver is not None else proxy
+    if _is_proxy(target):
+        return _proxy_get_trap(target, key, actual_receiver)
+    if isinstance(target, JSFunction):
+        return target.interp._get_property(target, key)
+    return _obj_get_property(target, key, actual_receiver) if isinstance(target, JSObject) else undefined
+
+
+def _proxy_set_trap(proxy: JSObject, key: str, value, receiver=None) -> bool:
+    """Invoke the 'set' trap on a Proxy. Returns True if set was successful."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'set\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'set') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key), value, receiver if receiver is not None else proxy])
+        bool_result = js_is_truthy(result)
+        if not bool_result:
+            return False
+        # Invariant checks
+        if isinstance(target, JSObject) and target._descriptors and key in target._descriptors:
+            target_desc = target._descriptors[key]
+            if target_desc.get('configurable') is False:
+                if 'value' in target_desc and target_desc.get('writable') is False:
+                    if not js_strict_equal(value, target_desc['value']):
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"))
+                if 'set' in target_desc and target_desc['set'] is undefined:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable accessor property without a setter"))
+        return True
+    # No trap — forward to target.[[Set]](P, V, Receiver)
+    actual_receiver = receiver if receiver is not None else proxy
+    if _is_proxy(target):
+        return _proxy_set_trap(target, key, value, actual_receiver)
+    if isinstance(target, JSFunction):
+        target.interp._set_property(target, key, value)
+    elif isinstance(target, JSObject):
+        _obj_set_property(target, key, value, receiver=actual_receiver)
+    return True
+
+
+def _proxy_has_trap(proxy: JSObject, key: str) -> bool:
+    """Invoke the 'has' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'has\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'has') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key)])
+        bool_result = bool(result) if not isinstance(result, bool) else result
+        # Invariant checks
+        if not bool_result and isinstance(target, JSObject):
+            if target._descriptors and key in target._descriptors:
+                target_desc = target._descriptors[key]
+                if target_desc.get('configurable') is False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'has' on proxy: property '{key}' is a non-configurable own property of the proxy target but the proxy did not return true"))
+            if not target.extensible and (key in target.props or (target._descriptors and key in target._descriptors)):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"'has' on proxy: property '{key}' is an own property of a non-extensible proxy target but the proxy did not return true"))
+        return bool_result
+    # No trap — forward to target.[[HasProperty]](P)
+    if _is_proxy(target):
+        return _proxy_has_trap(target, key)
+    if isinstance(target, JSFunction):
+        sp = getattr(target, '_static_props', None)
+        if sp and key in sp:
+            return True
+        if key in ('length', 'name', 'prototype', 'call', 'apply', 'bind', 'caller', 'arguments'):
+            return True
+        return False
+    return _obj_has_property(target, key) if isinstance(target, JSObject) else False
+
+
+def _proxy_delete_trap(proxy: JSObject, key: str) -> bool:
+    """Invoke the 'deleteProperty' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'deleteProperty\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'deleteProperty') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key)])
+        bool_result = bool(result) if not isinstance(result, bool) else result
+        # Invariant checks
+        if bool_result and isinstance(target, JSObject):
+            if target._descriptors and key in target._descriptors:
+                target_desc = target._descriptors[key]
+                if target_desc.get('configurable') is False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'deleteProperty' on proxy: property '{key}' is a non-configurable own property of the proxy target"))
+            if not target.extensible and (key in target.props or (target._descriptors and key in target._descriptors)):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"'deleteProperty' on proxy: property '{key}' is an own property of a non-extensible proxy target"))
+        return bool_result
+    # No trap — forward to target.[[Delete]](P)
+    if _is_proxy(target):
+        return _proxy_delete_trap(target, key)
+    if isinstance(target, JSFunction):
+        # Check for non-configurable own properties
+        desc = None
+        if target._descriptors and key in target._descriptors:
+            desc = target._descriptors[key]
+        elif key == 'prototype' and not getattr(target, '_no_prototype', False):
+            desc = {'value': target.prototype, 'writable': True, 'enumerable': False, 'configurable': False}
+        elif key == 'length':
+            desc = {'value': target.length, 'writable': False, 'enumerable': False, 'configurable': True}
+        elif key == 'name':
+            desc = {'value': target.name, 'writable': False, 'enumerable': False, 'configurable': True}
+        elif target._static_props and key in target._static_props:
+            desc = {'value': target._static_props[key], 'writable': True, 'enumerable': True, 'configurable': True}
+        if desc is not None and desc.get('configurable') is False:
+            return False
+        # Delete the property — mark as deleted in _descriptors for virtual props
+        if target._descriptors is None:
+            target._descriptors = {}
+        if key in ('length', 'name', 'prototype') or (target._descriptors and key in target._descriptors):
+            target._descriptors[key] = {'_deleted': True}
+        if target._static_props and key in target._static_props:
+            del target._static_props[key]
+        return True
+    return _obj_delete_property(target, key) if isinstance(target, JSObject) else True
+
+
+def _proxy_ownkeys_trap(proxy: JSObject) -> list:
+    """Invoke the 'ownKeys' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'ownKeys\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'ownKeys') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        from pyquickjs.builtins import _array_to_list as _atl
+        result = _call_value(trap, handler, [target])
+        # Result must be an Object (array-like)
+        if not isinstance(result, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError',
+                "'ownKeys' on proxy: trap returned a non-object"))
+        if isinstance(result, JSObject) and result._is_array:
+            keys = _atl(result)
+        elif isinstance(result, JSObject):
+            # Iterate using length property
+            length = result.props.get('length', 0)
+            if isinstance(length, (int, float)):
+                keys = [result.props.get(str(i), undefined) for i in range(int(length))]
+            else:
+                keys = []
+        else:
+            keys = []
+        # Each key must be String or Symbol
+        for k in keys:
+            if not isinstance(k, str) and not isinstance(k, JSSymbol):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"'ownKeys' on proxy: trap returned non-string/symbol key '{k}'"))
+        # Check for duplicates
+        seen = set()
+        for k in keys:
+            k_str = _symbol_to_key(k) if isinstance(k, JSSymbol) else k
+            if k_str in seen:
+                raise _ThrowSignal(make_error('TypeError',
+                    "'ownKeys' on proxy: trap returned duplicate key"))
+            seen.add(k_str)
+        # Invariant: non-extensible target must have all keys reported
+        if isinstance(target, JSObject) and not target.extensible:
+            target_keys = set(k for k in target.props.keys() if not k.startswith('@@'))
+            if target._descriptors:
+                target_keys.update(target._descriptors.keys())
+            for tk in target_keys:
+                if tk not in seen:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'ownKeys' on proxy: trap result did not include '{tk}'"))
+            # Step 21: no extra keys allowed for non-extensible target
+            for sk in seen:
+                if sk not in target_keys:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'ownKeys' on proxy: trap returned extra key '{sk}' for non-extensible target"))
+        # Invariant: all non-configurable keys must be in result
+        if isinstance(target, JSObject) and target._descriptors:
+            for dk, dv in target._descriptors.items():
+                if dv.get('configurable') is False:
+                    if dk not in seen:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'ownKeys' on proxy: trap result did not include non-configurable key '{dk}'"))
+        return [str(k) if not isinstance(k, JSSymbol) else _symbol_to_key(k) for k in keys]
+    # No trap — forward to target.[[OwnPropertyKeys]]()
+    if _is_proxy(target):
+        return _proxy_ownkeys_trap(target)
+    from pyquickjs.builtins import _get_all_own_keys
+    return _get_all_own_keys(target)
+
+
+def _proxy_get_own_prop_desc_trap(proxy: JSObject, key: str):
+    """Invoke the 'getOwnPropertyDescriptor' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'getOwnPropertyDescriptor\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'getOwnPropertyDescriptor') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key)])
+        # result must be Object or undefined
+        if result is not undefined and not isinstance(result, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError',
+                f"'getOwnPropertyDescriptor' on proxy: trap returned neither object nor undefined for property '{key}'"))
+        if isinstance(target, JSObject):
+            target_desc = None
+            if target._descriptors and key in target._descriptors:
+                target_desc = target._descriptors[key]
+            elif key in target.props:
+                target_desc = {'value': target.props[key], 'writable': True, 'enumerable': True, 'configurable': True}
+            if result is undefined:
+                if target_desc is not None and target_desc.get('configurable') is False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'getOwnPropertyDescriptor' on proxy: property '{key}' is a non-configurable own property of the proxy target but the proxy returned undefined"))
+                if not target.extensible and target_desc is not None:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'getOwnPropertyDescriptor' on proxy: property '{key}' is an own property of a non-extensible proxy target but the proxy returned undefined"))
+            elif isinstance(result, JSObject) and target_desc is not None:
+                # Check configurable mismatch
+                result_configurable = result.props.get('configurable', undefined)
+                if result_configurable is False and target_desc.get('configurable') is not False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'getOwnPropertyDescriptor' on proxy: property '{key}' is reported non-configurable but the property on the proxy target is configurable"))
+                if target_desc.get('configurable') is False:
+                    if result_configurable is not False:
+                        pass  # configurable mismatch already checked above
+                    result_writable = result.props.get('writable', undefined)
+                    if result_writable is False and target_desc.get('writable') is True:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'getOwnPropertyDescriptor' on proxy: property '{key}' is reported non-configurable and non-writable but the property on the proxy target is writable"))
+            elif isinstance(result, JSObject) and target_desc is None:
+                result_configurable = result.props.get('configurable', undefined)
+                if result_configurable is False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'getOwnPropertyDescriptor' on proxy: property '{key}' is reported as non-configurable but does not exist on the proxy target"))
+                if not target.extensible:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'getOwnPropertyDescriptor' on proxy: property '{key}' does not exist on a non-extensible proxy target"))
+        return result
+    # No trap — forward to target.[[GetOwnProperty]](P)
+    if _is_proxy(target):
+        return _proxy_get_own_prop_desc_trap(target, key)
+    if isinstance(target, JSFunction):
+        # Check explicit descriptors (including deleted markers)
+        if target._descriptors and key in target._descriptors:
+            desc = target._descriptors[key]
+            if desc.get('_deleted'):
+                return undefined
+            return _descriptor_to_js_inline(desc)
+        # Synthesize descriptors for well-known function properties
+        if key == 'length':
+            return _descriptor_to_js_inline({'value': target.length, 'writable': False, 'enumerable': False, 'configurable': True})
+        if key == 'name':
+            return _descriptor_to_js_inline({'value': target.name, 'writable': False, 'enumerable': False, 'configurable': True})
+        if key == 'prototype' and not getattr(target, '_no_prototype', False):
+            _build_function_prototype(target)
+            return _descriptor_to_js_inline({'value': target.prototype, 'writable': True, 'enumerable': False, 'configurable': False})
+        # Check static props
+        if target._static_props and key in target._static_props:
+            return _descriptor_to_js_inline({'value': target._static_props[key], 'writable': True, 'enumerable': True, 'configurable': True})
+        return undefined
+    if isinstance(target, JSObject):
+        if target._descriptors and key in target._descriptors:
+            return _descriptor_to_js_inline(target._descriptors[key])
+        if key in target.props:
+            is_enum = not (target._non_enum and key in target._non_enum)
+            desc = JSObject()
+            desc.props['value'] = target.props[key]
+            desc.props['writable'] = True
+            desc.props['enumerable'] = is_enum
+            desc.props['configurable'] = False if (key == 'length' and getattr(target, '_is_array', False) and not target.props.get('@@ta_type')) else True
+            return desc
+    return undefined
+
+
+def _descriptor_to_js_inline(desc_dict):
+    """Convert an internal descriptor dict to a JS descriptor object."""
+    result = JSObject()
+    for k in ('value', 'writable', 'enumerable', 'configurable', 'get', 'set'):
+        if k in desc_dict:
+            result.props[k] = desc_dict[k]
+    return result
+
+
+def _proxy_define_property_trap(proxy: JSObject, key: str, desc) -> bool:
+    """Invoke the 'defineProperty' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'defineProperty\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'defineProperty') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, _proxy_key_to_js(key), desc])
+        bool_result = bool(result) if not isinstance(result, bool) else result
+        if bool_result and isinstance(target, JSObject):
+            # Get descriptor info from the desc argument
+            if isinstance(desc, JSObject):
+                py_desc = {}
+                for k in ('value', 'writable', 'enumerable', 'configurable', 'get', 'set'):
+                    if k in desc.props:
+                        py_desc[k] = desc.props[k]
+                desc_configurable = py_desc.get('configurable', undefined)
+            elif isinstance(desc, dict):
+                py_desc = dict(desc)
+                desc_configurable = py_desc.get('configurable', undefined)
+            else:
+                py_desc = {}
+                desc_configurable = undefined
+            # Get target's existing descriptor
+            target_desc = None
+            if target._descriptors and key in target._descriptors:
+                target_desc = target._descriptors[key]
+            elif key in target.props:
+                target_desc = {'value': target.props[key], 'writable': True, 'enumerable': True, 'configurable': True}
+            # Step 19: if target_desc exists, check IsCompatiblePropertyDescriptor
+            if target_desc is not None:
+                _is_target_configurable = target_desc.get('configurable', True)
+                if not _is_target_configurable:
+                    # Target property is non-configurable — strict checks
+                    # Can't make it configurable
+                    if desc_configurable is True:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'defineProperty' on proxy: trap returned truish for defining property '{key}' as configurable when target property is non-configurable"))
+                    # Can't change enumerable
+                    if 'enumerable' in py_desc and py_desc['enumerable'] != target_desc.get('enumerable', True):
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'defineProperty' on proxy: trap returned truish for redefining non-configurable property '{key}'"))
+                    # Check data vs accessor mismatch
+                    target_is_accessor = 'get' in target_desc or 'set' in target_desc
+                    desc_is_accessor = 'get' in py_desc or 'set' in py_desc
+                    if target_is_accessor != desc_is_accessor:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'defineProperty' on proxy: trap returned truish for redefining non-configurable property '{key}'"))
+                    if not target_is_accessor:
+                        # Data property checks
+                        target_writable = target_desc.get('writable', True)
+                        if not target_writable:
+                            # Non-configurable, non-writable: can't change value
+                            if 'value' in py_desc:
+                                tv = target_desc.get('value', undefined)
+                                dv = py_desc['value']
+                                # SameValue check
+                                if tv is not dv:
+                                    if not (isinstance(tv, float) and isinstance(dv, float) and tv != tv and dv != dv):
+                                        raise _ThrowSignal(make_error('TypeError',
+                                            f"'defineProperty' on proxy: trap returned truish for property '{key}' which is non-configurable and non-writable in the proxy target but the trap tried to redefine it"))
+                            # Non-configurable writable->non-writable check
+                            if 'writable' in py_desc and py_desc['writable'] is True:
+                                raise _ThrowSignal(make_error('TypeError',
+                                    f"'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' as writable when target has it as non-writable"))
+                        else:
+                            # Non-configurable but writable: can't make it non-writable
+                            if 'writable' in py_desc and py_desc['writable'] is False:
+                                raise _ThrowSignal(make_error('TypeError',
+                                    f"'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' which cannot be non-writable, unless there is a corresponding non-configurable, non-writable own property on the proxy target"))
+            # Invariant: cannot define non-configurable on missing/configurable target prop
+            if desc_configurable is False:
+                if target_desc is None:
+                    if not target.extensible:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"'defineProperty' on proxy: trap returned truish for adding property '{key}' that is non-configurable to a non-extensible target"))
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' which is either non-existent or configurable in the proxy target"))
+                elif target_desc.get('configurable') is not False:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'defineProperty' on proxy: trap returned truish for defining non-configurable property '{key}' which is either non-existent or configurable in the proxy target"))
+            # Invariant: cannot add property to non-extensible target
+            if target_desc is None and not target.extensible:
+                raise _ThrowSignal(make_error('TypeError',
+                    f"'defineProperty' on proxy: trap returned truish for adding property '{key}' to a non-extensible target"))
+        return bool_result
+    # No trap — forward to target.[[DefineOwnProperty]](P, Desc)
+    if _is_proxy(target):
+        return _proxy_define_property_trap(target, key, desc)
+    if isinstance(target, (JSObject, JSFunction)):
+        try:
+            if isinstance(desc, JSObject):
+                # Convert JS descriptor object to Python dict
+                py_desc = {}
+                for k in ('value', 'writable', 'enumerable', 'configurable', 'get', 'set'):
+                    if k in desc.props:
+                        py_desc[k] = desc.props[k]
+            elif isinstance(desc, dict):
+                py_desc = desc
+            else:
+                py_desc = {}
+            if isinstance(target, JSFunction):
+                _fn_define_own_property(target, key, py_desc)
+            else:
+                _obj_define_property(target, key, py_desc)
+        except _ThrowSignal:
+            return False
+    return True
+
+
+def _proxy_get_prototype_trap(proxy: JSObject):
+    """Invoke the 'getPrototypeOf' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'getPrototypeOf\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'getPrototypeOf') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target])
+        # Invariant: result must be Object or null
+        if not isinstance(result, (JSObject, JSFunction, _Null)) and result is not null:
+            raise _ThrowSignal(make_error('TypeError',
+                "'getPrototypeOf' on proxy: trap returned neither object nor null"))
+        # Invariant: if target is not extensible, result must match target's prototype
+        if isinstance(target, JSObject) and not target.extensible:
+            target_proto = target.proto
+            if result is not target_proto:
+                raise _ThrowSignal(make_error('TypeError',
+                    "'getPrototypeOf' on proxy: proxy target is non-extensible but the trap did not return its actual prototype"))
+        return result
+    # No trap — forward to target.[[GetPrototypeOf]]()
+    if _is_proxy(target):
+        return _proxy_get_prototype_trap(target)
+    if isinstance(target, JSFunction):
+        proto = getattr(target, '_proto', _SENTINEL)
+        if proto is not _SENTINEL:
+            return proto
+        return None  # Function.prototype (will be looked up later)
+    return target.proto if isinstance(target, JSObject) else null
+
+
+def _proxy_set_prototype_trap(proxy: JSObject, proto) -> bool:
+    """Invoke the 'setPrototypeOf' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'setPrototypeOf\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'setPrototypeOf') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target, proto if proto is not None else null])
+        return bool(result)
+    # No trap — forward to target.[[SetPrototypeOf]](V)
+    if _is_proxy(target):
+        return _proxy_set_prototype_trap(target, proto)
+    if isinstance(target, JSObject):
+        target.proto = proto
+    return True
+
+
+def _proxy_is_extensible_trap(proxy: JSObject) -> bool:
+    """Invoke the 'isExtensible' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'isExtensible\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'isExtensible') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target])
+        bool_result = bool(result)
+        # Invariant: result must match target.[[IsExtensible]]()
+        target_extensible = target.extensible if isinstance(target, JSObject) else True
+        if bool_result != target_extensible:
+            raise _ThrowSignal(make_error('TypeError',
+                "'isExtensible' on proxy: proxy and target extensibility mismatch"))
+        return bool_result
+    # No trap — forward to target.[[IsExtensible]]()
+    if _is_proxy(target):
+        return _proxy_is_extensible_trap(target)
+    return target.extensible if isinstance(target, JSObject) else True
+
+
+def _proxy_prevent_extensions_trap(proxy: JSObject) -> bool:
+    """Invoke the 'preventExtensions' trap on a Proxy."""
+    handler = proxy._proxy_handler
+    target = proxy._proxy_target
+    if handler is None:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot perform \'preventExtensions\' on a proxy that has been revoked'))
+    trap = _obj_get_property(handler, 'preventExtensions') if isinstance(handler, (JSObject, JSFunction)) else undefined
+    if trap is not undefined and trap is not None and trap is not null:
+        result = _call_value(trap, handler, [target])
+        bool_result = bool(result)
+        # Invariant: if trap returns true, target must actually be non-extensible
+        if bool_result:
+            target_extensible = target.extensible if isinstance(target, JSObject) else True
+            if target_extensible:
+                raise _ThrowSignal(make_error('TypeError',
+                    "'preventExtensions' on proxy: trap returned truish but the proxy target is extensible"))
+        return bool_result
+    # No trap — forward to target.[[PreventExtensions]]()
+    if _is_proxy(target):
+        return _proxy_prevent_extensions_trap(target)
+    if isinstance(target, JSObject):
+        target.extensible = False
+    return True
+
+
 def _obj_has_property(obj: JSObject, key: str) -> bool:
     """Check if obj (or its prototype chain) has key."""
+    if _is_proxy(obj):
+        return _proxy_has_trap(obj, key)
     o = obj
     while o is not None:
+        if _is_proxy(o) and o is not obj:
+            return _proxy_has_trap(o, key)
         if o.has_own(key):
             return True
         o = o.proto
@@ -365,11 +1097,136 @@ def _obj_has_property(obj: JSObject, key: str) -> bool:
 
 def _obj_get_property(obj: JSObject, key: str, this=None):
     """Get a property from the prototype chain."""
+    if _is_proxy(obj):
+        return _proxy_get_trap(obj, key, this)
+    if isinstance(obj, JSFunction):
+        # Delegate to prototype chain walk which already handles JSFunction
+        o = obj
+        while o is not None:
+            if _is_proxy(o) and o is not obj:
+                return _proxy_get_trap(o, key, this if this is not None else obj)
+            if isinstance(o, JSFunction):
+                if o._descriptors and key in o._descriptors:
+                    desc = o._descriptors[key]
+                    if 'get' in desc:
+                        getter = desc['get']
+                        actual_this = this if this is not None else obj
+                        if isinstance(getter, JSFunction):
+                            return getter.interp.call_function(getter, actual_this, [])
+                        if callable(getter):
+                            return getter(actual_this)
+                        if isinstance(getter, JSObject) and getter._call:
+                            return getter._call(actual_this, [])
+                    return desc.get('value', undefined)
+                sp = getattr(o, '_static_props', None)
+                if sp and key in sp:
+                    return sp[key]
+                if key == 'length':
+                    return o.length
+                if key == 'name':
+                    return o.name
+                if key == 'prototype':
+                    if o.prototype is not None:
+                        return o.prototype
+                    return _build_function_prototype(o)
+                o = o._proto if o._proto is not _SENTINEL else _PROTOS.get('Function')
+                continue
+            if isinstance(o, JSObject):
+                if key in o.props:
+                    if o._descriptors and key in o._descriptors:
+                        desc = o._descriptors[key]
+                        if 'get' in desc or 'set' in desc:
+                            if 'get' in desc:
+                                getter = desc['get']
+                                actual_this = this if this is not None else obj
+                                if isinstance(getter, JSFunction):
+                                    return getter.interp.call_function(getter, actual_this, [])
+                                if callable(getter):
+                                    return getter(actual_this)
+                                if isinstance(getter, JSObject) and getter._call:
+                                    return getter._call(actual_this, [])
+                            return undefined
+                    return o.props[key]
+                if o._descriptors and key in o._descriptors:
+                    desc = o._descriptors[key]
+                    if 'get' in desc:
+                        getter = desc['get']
+                        actual_this = this if this is not None else obj
+                        if isinstance(getter, JSFunction):
+                            return getter.interp.call_function(getter, actual_this, [])
+                        if callable(getter):
+                            return getter(actual_this)
+                        if isinstance(getter, JSObject) and getter._call:
+                            return getter._call(actual_this, [])
+                    return desc.get('value', undefined)
+                o = o.proto
+            else:
+                break
+        return undefined
     if key == '__proto__':
-        return obj.proto
+        # Check if there is an own data property '__proto__' (e.g. from JSON.parse)
+        # If not, fall through to standard getter (returns proto)
+        if '__proto__' not in obj.props:
+            return obj.proto
+    # TypedArray indexed read
+    if isinstance(obj, JSObject) and obj.props.get('@@ta_type') is not None:
+        try:
+            idx = int(key)
+            if str(idx) == key and idx >= 0:
+                return _typed_array_get(obj, idx)
+        except (ValueError, TypeError):
+            pass
+    # Arguments exotic [[Get]]: mapped args read from env binding
+    _pmap = obj._mapped_params
+    if _pmap is not None and key in _pmap:
+        return obj._mapped_env._bindings.get(_pmap[key], undefined)
     o = obj
     while o is not None:
+        if _is_proxy(o) and o is not obj:
+            return _proxy_get_trap(o, key, this if this is not None else obj)
+        if isinstance(o, JSFunction):
+            # JSFunction in prototype chain — check static props and descriptors
+            sp = getattr(o, '_static_props', None)
+            if sp and key in sp:
+                return sp[key]
+            if o._descriptors and key in o._descriptors:
+                desc = o._descriptors[key]
+                if 'get' in desc:
+                    getter = desc['get']
+                    actual_this = this if this is not None else obj
+                    if isinstance(getter, JSFunction):
+                        return getter.interp.call_function(getter, actual_this, [])
+                    if callable(getter):
+                        return getter(actual_this)
+                    if isinstance(getter, JSObject) and getter._call:
+                        return getter._call(actual_this, [])
+                return desc.get('value', undefined)
+            if key == 'length':
+                return o.length
+            if key == 'name':
+                return o.name
+            if key == 'prototype':
+                if o.prototype is not None:
+                    return o.prototype
+                return _build_function_prototype(o)
+            o = o._proto if o._proto is not _SENTINEL else _PROTOS.get('Function')
+            continue
         if key in o.props:
+            # Check if there's a descriptor that should override
+            if o._descriptors and key in o._descriptors:
+                desc = o._descriptors[key]
+                if 'get' in desc or 'set' in desc:
+                    # Accessor descriptor takes precedence
+                    if 'get' in desc:
+                        getter = desc['get']
+                        actual_this = this if this is not None else obj
+                        if isinstance(getter, JSFunction):
+                            return getter.interp.call_function(getter, actual_this, [])
+                        if callable(getter):
+                            return getter(actual_this)
+                        if isinstance(getter, JSObject) and getter._call:
+                            return getter._call(actual_this, [])
+                    return undefined
             return o.props[key]
         if o._descriptors and key in o._descriptors:
             desc = o._descriptors[key]
@@ -387,11 +1244,86 @@ def _obj_get_property(obj: JSObject, key: str, this=None):
     return undefined
 
 
-def _obj_set_property(obj: JSObject, key: str, value) -> None:
+def _with_is_unscopable(obj: JSObject, name: str) -> bool:
+    """Check if *name* is blocked by @@unscopables on *obj* (spec HasBinding step 6-8)."""
+    unscopables = _obj_get_property(obj, '@@unscopables')
+    if isinstance(unscopables, JSObject):
+        val = _obj_get_property(unscopables, name)
+        return js_is_truthy(val)
+    return False
+
+
+def _super_set_property(base, key: str, value, strict: bool, receiver) -> None:
+    """OrdinarySet with separate base (for lookup) and receiver (for creation).
+    Used for super[key] = value where base = GetSuperBase, receiver = this."""
+    # Walk base's proto chain to find descriptor
+    cur = base
+    while cur is not None and isinstance(cur, JSObject):
+        if cur._descriptors and key in cur._descriptors:
+            desc = cur._descriptors[key]
+            if 'set' in desc or 'get' in desc:
+                # Accessor descriptor
+                s = desc.get('set')
+                if s is not None and s is not undefined:
+                    if isinstance(s, JSFunction):
+                        s.interp.call_function(s, receiver, [value])
+                        return
+                    if callable(s):
+                        s(receiver, value)
+                        return
+                    if isinstance(s, JSObject) and s._call:
+                        s._call(receiver, [value])
+                        return
+                if strict:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"Cannot set property '{key}' of object which has only a getter"))
+                return
+            if not desc.get('writable', False):
+                if strict:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"Cannot assign to read only property '{key}' of object"))
+                return
+            # Writable data descriptor found — create/update on receiver
+            break
+        if key in cur.props:
+            break  # Plain prop found — create/update on receiver
+        cur = cur.proto
+    # Set on receiver (this)
+    if isinstance(receiver, JSObject):
+        _obj_set_property(receiver, key, value, strict)
+    elif strict:
+        raise _ThrowSignal(make_error('TypeError',
+            f"Cannot create property '{key}' on {js_typeof(receiver)} '{js_to_string(receiver)}'"))
+
+def _obj_set_property(obj: JSObject, key: str, value, strict: bool = False, receiver=None) -> None:
     """Set a property, respecting non-writable descriptors."""
+    actual_this = receiver if receiver is not None else obj
+    if _is_proxy(obj):
+        result = _proxy_set_trap(obj, key, value)
+        if not result and strict:
+            raise _ThrowSignal(make_error('TypeError', f"'set' on proxy: trap returned falsish for property '{key}'"))
+        return
+    # Arguments exotic [[Set]]: update env binding for mapped args
+    _pmap = obj._mapped_params
+    if _pmap is not None and key in _pmap:
+        # Still mapped — check descriptor for writable if present
+        if obj._descriptors and key in obj._descriptors:
+            d = obj._descriptors[key]
+            if not d.get('writable', True):
+                if strict:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"Cannot assign to read only property '{key}' of object"))
+                return
+            d['value'] = value
+        obj.props[key] = value
+        obj._mapped_env._bindings[_pmap[key]] = value
+        return
     if key == '__proto__':
         # __proto__ setter: mutate the actual prototype chain
+        # Per spec (B.2.2.1.2): if not extensible, silently fail
         if isinstance(value, JSObject) or value is None:
+            if not obj.extensible:
+                return  # silently fail for non-extensible objects
             obj.proto = value
         return
     if obj._descriptors and key in obj._descriptors:
@@ -399,51 +1331,401 @@ def _obj_set_property(obj: JSObject, key: str, value) -> None:
         if 'set' in desc:
             s = desc['set']
             if isinstance(s, JSFunction):
-                s.interp.call_function(s, obj, [value])
+                s.interp.call_function(s, actual_this, [value])
                 return
             if callable(s):
-                s(obj, value)
+                s(actual_this, value)
                 return
             if isinstance(s, JSObject) and s._call:
-                s._call(obj, [value])
+                s._call(actual_this, [value])
                 return
+            # No setter in accessor descriptor — throw in strict, silently fail in sloppy
+            if strict:
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot set property '{key}' of object which has only a getter"))
+            return
         if not desc.get('writable', False):
+            if strict:
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot assign to read only property '{key}' of object"))
             return  # silently fail in sloppy mode
         desc['value'] = value
         obj.props[key] = value  # keep props in sync with descriptor value
         return
-    # Check extensibility: if the property doesn't exist and the object is non-extensible, throw
+    # Check extensibility: if the property doesn't exist and the object is non-extensible
     if not obj.extensible and key not in obj.props:
-        raise _ThrowSignal(make_error('TypeError',
-            f"Cannot add property {key!r}, object is not extensible"))
+        if strict:
+            raise _ThrowSignal(make_error('TypeError',
+                f"Cannot add property {key!r}, object is not extensible"))
+        return  # silently fail in sloppy mode
+    # Check prototype chain for non-writable data properties
+    if key not in obj.props:
+        proto = obj.proto
+        while proto is not None:
+            if isinstance(proto, JSObject):
+                if _is_proxy(proto):
+                    # Proxy on prototype chain: forward [[Set]] with receiver = obj
+                    result = _proxy_set_trap(proto, key, value, obj)
+                    if not result and strict:
+                        raise _ThrowSignal(make_error('TypeError', f"'set' on proxy: trap returned falsish for property '{key}'"))
+                    return
+                # TypedArray on prototype chain: canonical numeric index keys
+                # are intercepted by IntegerIndexedElementSet
+                ta_type = proto.props.get('@@ta_type')
+                if ta_type is not None:
+                    try:
+                        n = float(key)
+                        if str(n) == key or key in ('NaN', 'Infinity', '-Infinity'):
+                            return  # silently fail (TypedArray rejects)
+                    except (ValueError, TypeError):
+                        pass
+                    return
+                if proto._descriptors and key in proto._descriptors:
+                    pdesc = proto._descriptors[key]
+                    if 'set' in pdesc or 'get' in pdesc:
+                        # Accessor on prototype: call setter if present
+                        s = pdesc.get('set')
+                        if s is not None and s is not undefined:
+                            if isinstance(s, JSFunction):
+                                s.interp.call_function(s, obj, [value])
+                                return
+                            if callable(s):
+                                s(obj, value)
+                                return
+                            if isinstance(s, JSObject) and s._call:
+                                s._call(obj, [value])
+                                return
+                        if strict:
+                            raise _ThrowSignal(make_error('TypeError',
+                                f"Cannot set property '{key}' of object which has only a getter"))
+                        return
+                    if not pdesc.get('writable', False):
+                        if strict:
+                            raise _ThrowSignal(make_error('TypeError',
+                                f"Cannot assign to read only property '{key}' of object"))
+                        return
+                    break  # writable data property on proto — allow creating own
+                if key in proto.props:
+                    break  # plain prop on proto — allow creating own
+                proto = proto.proto
+            elif isinstance(proto, JSFunction):
+                # Check static props/descriptors on function
+                if proto._descriptors and key in proto._descriptors:
+                    pdesc = proto._descriptors[key]
+                    if not pdesc.get('writable', False) and 'set' not in pdesc and 'get' not in pdesc:
+                        if strict:
+                            raise _ThrowSignal(make_error('TypeError',
+                                f"Cannot assign to read only property '{key}' of object"))
+                        return
+                break
+            else:
+                break
     obj.props[key] = value
+    # Array exotic [[Set]]: update length and @@array_data
+    if obj._is_array:
+        if key == 'length':
+            raw = js_to_uint32(value)
+            num = js_to_number(value)
+            if raw != num:
+                raise _ThrowSignal(make_error('RangeError', 'Invalid array length'))
+            new_len = raw
+            data = obj.props.get('@@array_data')
+            if data is not None:
+                old_len = len(data)
+                if new_len < old_len:
+                    del data[new_len:]
+                    for i in range(new_len, old_len):
+                        obj.props.pop(str(i), None)
+                elif new_len > old_len:
+                    if new_len <= _MAX_DENSE_ARRAY_LEN:
+                        data.extend([undefined] * (new_len - old_len))
+                    else:
+                        # Switch to sparse
+                        del obj.props['@@array_data']
+            obj.props['length'] = new_len
+        else:
+            try:
+                idx = int(key)
+                # Valid array index: 0 <= idx < 2^32-1 (indices at 2^32-1 are regular props)
+                if str(idx) == key and 0 <= idx < 0xFFFFFFFF:
+                    cur_len = obj.props.get('length', 0)
+                    if isinstance(cur_len, (int, float)):
+                        cur_len = int(cur_len)
+                    else:
+                        cur_len = 0
+                    if idx >= cur_len:
+                        obj.props['length'] = idx + 1
+                    data = obj.props.get('@@array_data')
+                    if data is not None:
+                        new_data_len = idx + 1
+                        if new_data_len <= _MAX_DENSE_ARRAY_LEN:
+                            if idx >= len(data):
+                                data.extend([undefined] * (idx - len(data) + 1))
+                            data[idx] = value
+                        else:
+                            # Switch to sparse
+                            del obj.props['@@array_data']
+                            obj.props[key] = value
+                    else:
+                        obj.props[key] = value
+            except (ValueError, TypeError):
+                pass
 
 
 def _obj_delete_property(obj: JSObject, key: str) -> bool:
     """Delete an own property. Returns True if deleted."""
+    if _is_proxy(obj):
+        return _proxy_delete_trap(obj, key)
+    # Array 'length' is non-configurable per spec
+    if key == 'length' and obj._is_array:
+        return False
     if obj._descriptors and key in obj._descriptors:
         desc = obj._descriptors[key]
-        if not desc.get('configurable', True):
+        if not desc.get('configurable', False):
             return False
         del obj._descriptors[key]
+        if key in obj.props:
+            del obj.props[key]
+        # Arguments exotic: unmap on delete
+        _pmap = obj._mapped_params
+        if _pmap is not None and key in _pmap:
+            del _pmap[key]
         return True
     if key in obj.props:
         del obj.props[key]
+        # Arguments exotic: unmap on delete
+        _pmap = obj._mapped_params
+        if _pmap is not None and key in _pmap:
+            del _pmap[key]
         return True
     return True  # property didn't exist
 
 
+def _fn_define_own_property(fn, key: str, desc: dict) -> None:
+    """Define a property with a descriptor on a JSFunction, with validation."""
+    if fn._descriptors is None:
+        fn._descriptors = {}
+    existing = fn._descriptors.get(key, None)
+    # Treat deleted markers as non-existent
+    if existing is not None and existing.get('_deleted'):
+        existing = None
+    # Synthesize default descriptor from static_props if exists
+    if existing is None and fn._static_props and key in fn._static_props:
+        existing = {
+            'value': fn._static_props[key],
+            'writable': True, 'enumerable': True, 'configurable': True,
+        }
+    # Also check well-known function own properties
+    if existing is None:
+        if key == 'length':
+            existing = {'value': fn.length, 'writable': False, 'enumerable': False, 'configurable': True}
+        elif key == 'name':
+            existing = {'value': fn.name, 'writable': False, 'enumerable': False, 'configurable': True}
+        elif key == 'prototype' and not getattr(fn, '_no_prototype', False):
+            _build_function_prototype(fn)
+            existing = {'value': fn.prototype, 'writable': True, 'enumerable': False, 'configurable': False}
+    if existing is None:
+        # New property: check extensibility
+        extensible = getattr(fn, 'extensible', True)
+        if not extensible:
+            raise _ThrowSignal(make_error('TypeError',
+                f"Cannot define property {key}, object is not extensible"))
+        is_accessor = 'get' in desc or 'set' in desc
+        if is_accessor:
+            defaults = {'configurable': False, 'enumerable': False}
+        else:
+            defaults = {'configurable': False, 'writable': False, 'enumerable': False}
+        fn._descriptors[key] = {**defaults, **desc}
+    else:
+        # Existing property: validate changes
+        is_configurable = existing.get('configurable', False)
+        if not is_configurable:
+            if desc.get('configurable', False):
+                raise _ThrowSignal(make_error('TypeError', f"Cannot redefine property: {key}"))
+            if 'enumerable' in desc and desc['enumerable'] != existing.get('enumerable', False):
+                raise _ThrowSignal(make_error('TypeError', f"Cannot redefine property: {key}"))
+            is_accessor_existing = 'get' in existing or 'set' in existing
+            is_accessor_new = 'get' in desc or 'set' in desc
+            is_data_existing = 'value' in existing or 'writable' in existing
+            if is_accessor_existing and not is_accessor_new and ('value' in desc or 'writable' in desc):
+                raise _ThrowSignal(make_error('TypeError', f"Cannot redefine property: {key}"))
+            if is_data_existing and not is_accessor_existing and is_accessor_new:
+                raise _ThrowSignal(make_error('TypeError', f"Cannot redefine property: {key}"))
+            if is_accessor_existing:
+                if 'get' in desc and desc['get'] is not existing.get('get'):
+                    raise _ThrowSignal(make_error('TypeError', f"Cannot redefine property: {key}"))
+                if 'set' in desc and desc['set'] is not existing.get('set'):
+                    raise _ThrowSignal(make_error('TypeError', f"Cannot redefine property: {key}"))
+            else:
+                if not existing.get('writable', False):
+                    if 'writable' in desc and desc['writable']:
+                        raise _ThrowSignal(make_error('TypeError', f"Cannot redefine property: {key}"))
+                    if 'value' in desc:
+                        old_val = existing.get('value', undefined)
+                        new_val = desc['value']
+                        if old_val is not new_val:
+                            if not (isinstance(old_val, float) and isinstance(new_val, float) and old_val != old_val and new_val != new_val):
+                                raise _ThrowSignal(make_error('TypeError', f"Cannot redefine property: {key}"))
+        fn._descriptors[key] = {**existing, **desc}
+        # Clean up conflicting data/accessor keys after merge
+        merged = fn._descriptors[key]
+        if 'get' in merged or 'set' in merged:
+            merged.pop('value', None)
+            merged.pop('writable', None)
+        elif 'value' in merged or 'writable' in merged:
+            merged.pop('get', None)
+            merged.pop('set', None)
+    # Also update static_props for value descriptors
+    if 'value' in desc and 'get' not in desc and 'set' not in desc:
+        if fn._static_props is None:
+            fn._static_props = {}
+        fn._static_props[key] = desc['value']
+    elif 'get' in desc or 'set' in desc:
+        if fn._static_props is None:
+            fn._static_props = {}
+        if key not in fn._static_props:
+            fn._static_props[key] = undefined
+
+
 def _obj_define_property(obj: JSObject, key: str, desc: dict) -> None:
-    """Define a property with a descriptor."""
+    """Define a property with a descriptor, implementing [[DefineOwnProperty]] validation."""
+    # Array length special handling (ArraySetLength)
+    if key == 'length' and getattr(obj, '_is_array', False) and 'value' in desc:
+        new_len = desc['value']
+        # Per spec: ToUint32 first (step 3), then ToNumber (step 4) — valueOf may be called twice
+        uint32 = js_to_uint32(new_len)
+        n = js_to_number(new_len)
+        if uint32 != n:
+            raise _ThrowSignal(make_error('RangeError', 'Invalid array length'))
+        desc = {**desc, 'value': uint32}
     if obj._descriptors is None:
         obj._descriptors = {}
-    existing = obj._descriptors.get(key, {})
-    obj._descriptors[key] = {**existing, **desc}
+    existing = obj._descriptors.get(key, None)
+    # If no explicit descriptor but the property exists in props, synthesize
+    # a default data descriptor (writable/enumerable/configurable all True,
+    # matching the semantics of a plain property assignment).
+    if existing is None and key in obj.props:
+        non_enum = obj._non_enum
+        existing = {
+            'value': obj.props[key],
+            'writable': True,
+            'enumerable': not (non_enum and key in non_enum),
+            'configurable': False if (key == 'length' and getattr(obj, '_is_array', False) and '@@ta_type' not in obj.props) else True,
+        }
+    if existing is None:
+        # New property: check extensibility
+        if not obj.extensible:
+            raise _ThrowSignal(make_error('TypeError',
+                f"Cannot define property {key}, object is not extensible"))
+        # ECMAScript defaults are all False when using defineProperty
+        is_accessor = 'get' in desc or 'set' in desc
+        if is_accessor:
+            defaults = {'configurable': False, 'enumerable': False}
+        else:
+            defaults = {'configurable': False, 'writable': False, 'enumerable': False}
+        obj._descriptors[key] = {**defaults, **desc}
+    else:
+        # Existing property: validate changes against configurable/writable
+        is_configurable = existing.get('configurable', False)
+        if not is_configurable:
+            # Non-configurable: reject configurable change to true
+            if desc.get('configurable', False):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot redefine property: {key}"))
+            # Non-configurable: reject enumerable change
+            if 'enumerable' in desc and desc['enumerable'] != existing.get('enumerable', False):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot redefine property: {key}"))
+            is_accessor_existing = 'get' in existing or 'set' in existing
+            is_accessor_new = 'get' in desc or 'set' in desc
+            is_data_existing = 'value' in existing or 'writable' in existing
+            # Reject accessor-to-data or data-to-accessor change on non-configurable
+            if is_accessor_existing and not is_accessor_new and ('value' in desc or 'writable' in desc):
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot redefine property: {key}"))
+            if is_data_existing and not is_accessor_existing and is_accessor_new:
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot redefine property: {key}"))
+            if is_accessor_existing:
+                # Non-configurable accessor: reject getter/setter change
+                if 'get' in desc and desc['get'] is not existing.get('get'):
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"Cannot redefine property: {key}"))
+                if 'set' in desc and desc['set'] is not existing.get('set'):
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"Cannot redefine property: {key}"))
+            else:
+                # Non-configurable data property
+                if not existing.get('writable', False):
+                    # Non-writable + non-configurable: reject value and writable changes
+                    if 'writable' in desc and desc['writable']:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"Cannot redefine property: {key}"))
+                    if 'value' in desc:
+                        # Only reject if value is actually different
+                        old_val = existing.get('value', undefined)
+                        new_val = desc['value']
+                        # SameValue check
+                        if old_val is not new_val:
+                            if not (isinstance(old_val, float) and isinstance(new_val, float) and old_val != old_val and new_val != new_val):
+                                raise _ThrowSignal(make_error('TypeError',
+                                    f"Cannot redefine property: {key}"))
+        obj._descriptors[key] = {**existing, **desc}
+        # Clean up conflicting data/accessor keys after merge
+        merged = obj._descriptors[key]
+        if 'get' in merged or 'set' in merged:
+            # Accessor descriptor: remove data keys
+            merged.pop('value', None)
+            merged.pop('writable', None)
+        elif 'value' in merged or 'writable' in merged:
+            # Data descriptor: remove accessor keys
+            merged.pop('get', None)
+            merged.pop('set', None)
     # Also update props for simple value descriptors
     if 'value' in desc and 'get' not in desc and 'set' not in desc:
         obj.props[key] = desc['value']
-    elif key in obj.props and ('get' in desc or 'set' in desc):
-        del obj.props[key]
+        # Keep @@array_data in sync for dense arrays
+        arr_data = obj.props.get('@@array_data')
+        if arr_data is not None and key.isdigit():
+            idx = int(key)
+            if 0 <= idx < len(arr_data):
+                arr_data[idx] = desc['value']
+            elif idx >= 0 and idx == len(arr_data):
+                arr_data.append(desc['value'])
+    elif 'get' in desc or 'set' in desc:
+        # Accessor property: keep placeholder in props for insertion order
+        if key not in obj.props:
+            obj.props[key] = undefined
+    # Arguments exotic [[DefineOwnProperty]] (spec §9.4.4.2)
+    _pmap = obj._mapped_params
+    if _pmap is not None and key in _pmap:
+        is_accessor_desc = 'get' in desc or 'set' in desc
+        if is_accessor_desc:
+            # Converting to accessor: unmap
+            del _pmap[key]
+        else:
+            if 'value' in desc:
+                # Update the env binding to match
+                obj._mapped_env._bindings[_pmap[key]] = desc['value']
+            if 'writable' in desc and not desc['writable']:
+                # Capture the current env binding value into the descriptor
+                # before unmapping, so the frozen value reflects the live binding.
+                cur_val = obj._mapped_env._bindings.get(_pmap[key], undefined)
+                if obj._descriptors and key in obj._descriptors:
+                    obj._descriptors[key]['value'] = cur_val
+                obj.props[key] = cur_val
+                # Making non-writable: unmap (after capturing value)
+                del _pmap[key]
+    # Array exotic: defining numeric index updates length
+    if obj._is_array:
+        try:
+            idx = int(key)
+            if str(idx) == key and idx >= 0:
+                length = obj.props.get('length', 0)
+                if isinstance(length, (int, float)) and idx >= int(length):
+                    obj.props['length'] = idx + 1
+        except (ValueError, TypeError):
+            pass
 
 
 # ---- Sentinel for undefined ----
@@ -477,13 +1759,17 @@ _symbol_counter = 0
 _symbol_registry: dict[str, 'JSSymbol'] = {}
 
 class JSSymbol:
-    __slots__ = ('description', '_id', '__weakref__')
+    __slots__ = ('description', '_id', '_well_known_key', '_registered', '__weakref__')
     _counter = 0
+    _id_to_symbol: dict = {}  # reverse lookup: _id -> JSSymbol
 
     def __init__(self, description=None):
         JSSymbol._counter += 1
         self._id = JSSymbol._counter
         self.description = description
+        self._well_known_key = None
+        self._registered = False
+        JSSymbol._id_to_symbol[self._id] = self
 
     def __repr__(self):
         if self.description is not None:
@@ -502,8 +1788,44 @@ class JSSymbol:
 
 
 def _symbol_to_key(sym: 'JSSymbol') -> str:
-    """Convert a JSSymbol to a property key string (@@sym_{id})."""
+    """Convert a JSSymbol to a property key string (@@sym_{id} or @@wellknown)."""
+    if sym._well_known_key is not None:
+        return sym._well_known_key
     return f'@@sym_{sym._id}'
+
+
+def _key_to_symbol(key: str):
+    """Convert an internal @@sym_{id} key back to its JSSymbol, or None."""
+    if key.startswith('@@sym_'):
+        try:
+            sym_id = int(key[6:])
+            return JSSymbol._id_to_symbol.get(sym_id)
+        except ValueError:
+            pass
+    # Well-known symbols
+    for desc, sym in _WELL_KNOWN_SYMBOLS.items():
+        if sym._well_known_key == key:
+            return sym
+    return None
+
+
+def _set_function_name_key(fn, key, prefix=''):
+    """SetFunctionName per spec: set fn.name from a property key (string or Symbol), with optional prefix."""
+    if isinstance(key, JSSymbol):
+        desc = key.description
+        name = f'[{desc}]' if desc else ''
+    else:
+        name = str(key) if not isinstance(key, str) else key
+    if prefix:
+        name = f'{prefix} {name}'
+    fn.name = name
+
+
+def _to_property_key(key) -> str:
+    """Convert a property key (string, number, Symbol, etc.) to internal string form."""
+    if isinstance(key, JSSymbol):
+        return _symbol_to_key(key)
+    return js_to_string(key)
 
 
 # ---- BigInt ----
@@ -515,12 +1837,114 @@ class JSBigInt:
         return f'{self.value}n'
     def __str__(self):
         return str(self.value)
+    def __int__(self):
+        return self.value
+    def __index__(self):
+        return self.value
     def __hash__(self):
         return hash(self.value)
     def __eq__(self, other):
         if isinstance(other, JSBigInt):
             return self.value == other.value
         return NotImplemented
+
+
+def _is_anonymous_function_def(node) -> bool:
+    """ES2015+ IsAnonymousFunctionDefinition: returns True if node is a
+    FunctionExpression, ArrowFunctionExpression, or ClassExpression without a name."""
+    t = type(node).__name__
+    if t == 'FunctionExpression':
+        return node.id is None
+    if t == 'ArrowFunctionExpression':
+        return True
+    if t == 'ClassExpression':
+        return node.id is None
+    # ParenthesizedExpression / cover grammar: unwrap single paren
+    # (function(){}) is still anonymous, (0, function(){}) is NOT
+    if t == 'ParenthesizedExpression':
+        return _is_anonymous_function_def(node.expression)
+    return False
+
+
+def _set_function_name(value, name: str) -> None:
+    """ES2015+ SetFunctionName: if value is an anonymous function/class, set its name."""
+    if isinstance(value, JSFunction) and not value.name:
+        # Don't override if the function/class has an explicit 'name' static property
+        if value._static_props and 'name' in value._static_props:
+            return
+        value.name = name
+    elif isinstance(value, JSObject) and value.class_name == 'Function' and not value.name:
+        value.name = name
+
+
+def _collect_binding_names(pattern) -> list[str]:
+    """Collect all binding identifier names from a parameter/destructuring pattern."""
+    t = type(pattern).__name__
+    if t == 'Identifier':
+        return [pattern.name]
+    if t == 'AssignmentPattern':
+        return _collect_binding_names(pattern.left)
+    if t == 'ArrayPattern':
+        names = []
+        for elem in pattern.elements:
+            if elem is not None:
+                names.extend(_collect_binding_names(elem))
+        return names
+    if t == 'ObjectPattern':
+        names = []
+        for prop in pattern.properties:
+            pt = type(prop).__name__
+            if pt == 'RestElement':
+                names.extend(_collect_binding_names(prop.argument))
+            elif hasattr(prop, 'value') and prop.value is not None:
+                names.extend(_collect_binding_names(prop.value))
+            elif hasattr(prop, 'key'):
+                names.extend(_collect_binding_names(prop.key))
+        return names
+    if t == 'RestElement':
+        return _collect_binding_names(pattern.argument)
+    return []
+
+
+def _collect_eval_var_names(stmts: list) -> set[str]:
+    """Collect all top-level var-declared names from eval code AST body.
+    Does not descend into nested functions."""
+    names: set[str] = set()
+    for stmt in stmts:
+        t = type(stmt).__name__
+        if t == 'VariableDeclaration' and stmt.kind == 'var':
+            for decl in stmt.declarations:
+                names.update(_collect_binding_names(decl.id))
+        elif t == 'FunctionDeclaration':
+            if hasattr(stmt, 'id') and stmt.id and hasattr(stmt.id, 'name'):
+                names.add(stmt.id.name)
+        elif t in ('BlockStatement', 'IfStatement', 'WhileStatement',
+                    'DoWhileStatement', 'ForStatement', 'LabeledStatement',
+                    'SwitchStatement', 'TryStatement', 'WithStatement'):
+            # Walk block-level statements for var hoisting (var leaks through blocks)
+            if t == 'BlockStatement':
+                names.update(_collect_eval_var_names(stmt.body))
+            elif t == 'IfStatement':
+                if stmt.consequent:
+                    names.update(_collect_eval_var_names([stmt.consequent]))
+                if stmt.alternate:
+                    names.update(_collect_eval_var_names([stmt.alternate]))
+            elif t == 'LabeledStatement':
+                names.update(_collect_eval_var_names([stmt.body]))
+            elif t in ('WhileStatement', 'DoWhileStatement', 'ForStatement'):
+                if hasattr(stmt, 'body') and stmt.body:
+                    names.update(_collect_eval_var_names([stmt.body]))
+            elif t == 'SwitchStatement':
+                for case in (stmt.cases or []):
+                    names.update(_collect_eval_var_names(case.consequent))
+            elif t == 'TryStatement':
+                if stmt.block:
+                    names.update(_collect_eval_var_names(stmt.block.body))
+                if stmt.handler and stmt.handler.body:
+                    names.update(_collect_eval_var_names(stmt.handler.body.body))
+                if stmt.finalizer:
+                    names.update(_collect_eval_var_names(stmt.finalizer.body))
+    return names
 
 
 # ---- JS function wrapper ----
@@ -530,7 +1954,9 @@ class JSFunction:
                  'is_async', 'this_mode', 'home_obj', '_bound_this',
                  '_bound_args', '_bound_target', 'prototype', 'length', 'interp',
                  '_static_props', '_descriptors', '_instance_fields', '_super_ctor',
-                 'source_text')
+                 'source_text', '_proto', 'is_class_ctor', '_no_prototype',
+                 '_private_fields', '_private_brand', '_private_methods',
+                 '_private_instance_fields', 'is_declaration')
 
     def __init__(self, name: str, params: list, body, env: Environment,
                  is_arrow: bool = False, is_generator: bool = False,
@@ -555,12 +1981,63 @@ class JSFunction:
         self._instance_fields = []
         self._super_ctor = None
         self.source_text = ''
+        self._proto = _SENTINEL  # [[Prototype]] — _SENTINEL means default (Function.prototype)
+        self.is_class_ctor = False
+        self._no_prototype = is_arrow or is_async  # arrows/async have no .prototype
+        self._private_fields = None
+        self._private_brand = None
+        self._private_methods = None
+        self._private_instance_fields = []
+        self.is_declaration = False
 
     def __repr__(self):
         return f'[Function: {self.name or "(anonymous)"}]'
 
     def __str__(self):
         return f'function {self.name or ""}() {{ [native code] }}'
+
+
+def _fn_is_strict(fn: 'JSFunction') -> bool:
+    """Return True if fn is a strict mode function.
+    Generators and async functions are always strict for caller/arguments."""
+    if fn.is_generator:
+        return True
+    if fn.env is not None and fn.env._is_strict():
+        return True
+    body = fn.body
+    if hasattr(body, 'body') and body.body:
+        for stmt in body.body:
+            if (type(stmt).__name__ == 'ExpressionStatement' and
+                    type(stmt.expression).__name__ == 'Literal' and
+                    isinstance(stmt.expression.value, str)):
+                if stmt.expression.value == 'use strict' and not getattr(stmt.expression, 'has_escape', False):
+                    return True
+            else:
+                break
+    return False
+
+
+def _has_use_strict_directive(body_stmts) -> bool:
+    """Check if a statement list has 'use strict' in its directive prologue."""
+    if not body_stmts:
+        return False
+    for stmt in body_stmts:
+        if (type(stmt).__name__ == 'ExpressionStatement' and
+                type(stmt.expression).__name__ == 'Literal' and
+                isinstance(stmt.expression.value, str)):
+            if stmt.expression.value == 'use strict' and not getattr(stmt.expression, 'has_escape', False):
+                return True
+        else:
+            break
+    return False
+
+
+def _fn_has_non_simple_params(fn: 'JSFunction') -> bool:
+    """Return True if fn has non-simple parameters (defaults, rest, destructuring)."""
+    for p in fn.params:
+        if isinstance(p, (AssignmentPattern, RestElement, ArrayPattern, ObjectPattern)):
+            return True
+    return False
 
 
 def _count_params(params: list) -> int:
@@ -573,6 +2050,17 @@ def _count_params(params: list) -> int:
             break
         n += 1
     return n
+
+
+def _collect_simple_param_names(params: list) -> list[str] | None:
+    """Return list of simple (Identifier) param names, or None if params are non-simple."""
+    names: list[str] = []
+    for p in params:
+        if isinstance(p, Identifier):
+            names.append(p.name)
+        else:
+            return None  # non-simple params → no mapping
+    return names
 
 
 # ---- Generator state ----
@@ -626,6 +2114,10 @@ def make_error(klass: str, msg: str) -> JSObject:
     obj.props['message'] = msg
     obj.props['name'] = klass
     obj.props['stack'] = f'{klass}: {msg}'
+    # stack is non-enumerable per spec
+    if obj._non_enum is None:
+        obj._non_enum = set()
+    obj._non_enum.add('stack')
     # Set prototype for instanceof checks
     proto = _PROTOS.get(klass) or _PROTOS.get('Error')
     if proto is not None:
@@ -696,6 +2188,14 @@ def js_to_number(val) -> float | int:
     if isinstance(val, int) and not isinstance(val, bool):
         return val
     if isinstance(val, float):
+        # Only convert float→int if in safe integer range to preserve IEEE 754 overflow
+        # Never convert -0.0 to int (would lose sign)
+        if not math.isinf(val) and not math.isnan(val) and abs(val) <= 2**53:
+            if val == 0.0 and math.copysign(1.0, val) < 0:
+                return val  # preserve -0.0
+            i = int(val)
+            if float(i) == val:
+                return i
         return val
     if isinstance(val, str):
         s = val.strip()
@@ -712,15 +2212,27 @@ def js_to_number(val) -> float | int:
                 return int(s, 8)
             if s.startswith('0b') or s.startswith('0B'):
                 return int(s, 2)
+            # Reject strings that Python accepts as infinity but JS does not
+            # (e.g., "inf", "INFINITY", "Inf"). JS only allows exact "Infinity".
+            slow = s.lower()
+            if 'infinity' in slow or slow == 'inf' or slow == '+inf' or slow == '-inf':
+                return math.nan
             f = float(s)
-            i = int(f)
-            if float(i) == f:
-                return i
+            if f == 0.0 and math.copysign(1.0, f) < 0:
+                return f  # preserve -0.0
+            if not math.isinf(f) and not math.isnan(f) and abs(f) <= 2**53:
+                i = int(f)
+                if float(i) == f:
+                    return i
             return f
         except ValueError:
             return math.nan
     if isinstance(val, JSBigInt):
-        return float(val.value)  # BigInt→Number: convert via float64
+        raise _ThrowSignal(make_error('TypeError',
+            'Cannot convert a BigInt value to a number'))
+    if isinstance(val, JSSymbol):
+        raise _ThrowSignal(make_error('TypeError',
+            'Cannot convert a Symbol value to a number'))
     if isinstance(val, JSObject):
         prim = js_to_primitive(val, 'number')
         return js_to_number(prim)
@@ -764,6 +2276,8 @@ def js_to_string(val) -> str:
         raise _ThrowSignal(make_error('TypeError',
             'Cannot convert a Symbol value to a string'))
     if isinstance(val, JSFunction):
+        if val.source_text:
+            return val.source_text
         params = ', '.join(_param_name(p) for p in val.params)
         return f'function {val.name or ""}({params}) {{ [native code] }}'
     if isinstance(val, JSObject):
@@ -786,20 +2300,82 @@ def _param_name(p) -> str:
 
 def js_to_primitive(val, hint='default'):
     """ToPrimitive abstract operation."""
-    if isinstance(val, JSObject):
-        # Try valueOf first for 'number' hint, toString first for 'string'
+    if isinstance(val, JSObject) or isinstance(val, JSFunction):
+        # Step 1: Check for Symbol.toPrimitive (GetMethod spec — throw if non-callable)
+        if isinstance(val, JSObject):
+            exotic_to_prim = _obj_get_property(val, '@@toPrimitive')
+        else:
+            exotic_to_prim = (val._static_props or {}).get('@@toPrimitive', undefined)
+        if exotic_to_prim is not undefined and exotic_to_prim is not null:
+            if not isinstance(exotic_to_prim, JSFunction) and \
+               not (isinstance(exotic_to_prim, JSObject) and exotic_to_prim._call is not None) and \
+               not callable(exotic_to_prim):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Symbol.toPrimitive is not callable'))
+            result = _call_value(exotic_to_prim, val, [hint])
+            if isinstance(result, (JSObject, JSFunction)):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Cannot convert object to primitive value'))
+            return result
+        # Step 2: Fall back to valueOf/toString based on hint
         if hint == 'string':
             methods = ['toString', 'valueOf']
         else:
             methods = ['valueOf', 'toString']
         for m in methods:
-            fn = _obj_get_property(val, m)
-            if fn is not undefined:
-                result = _call_value(fn, val, [])
-                if not isinstance(result, JSObject):
-                    return result
+            if isinstance(val, JSFunction):
+                # For JSFunction, check _static_props first, then fall through
+                fn_prop = (val._static_props or {}).get(m, undefined)
+                if fn_prop is undefined or fn_prop is null:
+                    # Default behavior: valueOf returns this, toString returns source
+                    if m == 'valueOf':
+                        continue  # valueOf returns the function object itself (not primitive)
+                    if m == 'toString':
+                        return js_to_string(val)
+                    continue
+                fn = fn_prop
+            else:
+                fn = _obj_get_property(val, m)
+            # Skip if non-callable (null, undefined, non-function objects)
+            if fn is undefined or fn is null:
+                continue
+            if not isinstance(fn, JSFunction) and not (isinstance(fn, JSObject) and fn._call is not None) and not callable(fn):
+                continue
+            result = _call_value(fn, val, [])
+            if not isinstance(result, (JSObject, JSFunction)):
+                return result
         raise _ThrowSignal(make_error('TypeError',
             'Cannot convert object to primitive value'))
+    return val
+
+
+def _js_to_object(val):
+    """ECMAScript ToObject: wrap primitives in their corresponding wrapper objects."""
+    if val is undefined or val is null:
+        raise _ThrowSignal(make_error('TypeError', 'Cannot convert undefined or null to object'))
+    if isinstance(val, (JSObject, JSFunction)):
+        return val
+    proto_name = None
+    data_key = None
+    if isinstance(val, bool):
+        proto_name = 'Boolean'
+        data_key = '@@boolData'
+    elif isinstance(val, (int, float)) and not isinstance(val, bool):
+        proto_name = 'Number'
+        data_key = '@@numData'
+    elif isinstance(val, str):
+        proto_name = 'String'
+        data_key = '@@strData'
+    elif isinstance(val, JSSymbol):
+        proto_name = 'Symbol'
+        data_key = '@@symData'
+    elif isinstance(val, JSBigInt):
+        proto_name = 'BigInt'
+        data_key = '@@bigintData'
+    if proto_name:
+        wrapper = JSObject(proto=_PROTOS.get(proto_name))
+        wrapper.props[data_key] = val
+        return wrapper
     return val
 
 
@@ -854,6 +2430,36 @@ def js_strict_equal(a, b) -> bool:
     return a is b
 
 
+def js_same_value_zero(a, b) -> bool:
+    """SameValueZero comparison (used by Map/Set for key equality).
+
+    Like strict equality except NaN === NaN is true."""
+    if type(a) != type(b):
+        if isinstance(a, (int, float)) and not isinstance(a, bool) and \
+           isinstance(b, (int, float)) and not isinstance(b, bool):
+            if math.isnan(a) and math.isnan(b):
+                return True
+            return a == b
+        return False
+    if a is undefined and b is undefined:
+        return True
+    if a is null and b is null:
+        return True
+    if isinstance(a, bool):
+        return a == b
+    if isinstance(a, (int, float)) and not isinstance(a, bool):
+        if math.isnan(a) and math.isnan(b):
+            return True
+        return a == b
+    if isinstance(a, str):
+        return a == b
+    if isinstance(a, JSBigInt):
+        return a.value == b.value
+    if isinstance(a, JSSymbol):
+        return a is b
+    return a is b
+
+
 def js_abstract_equal(a, b) -> bool:
     """Abstract equality (==)."""
     # Same type
@@ -894,12 +2500,20 @@ def js_abstract_equal(a, b) -> bool:
     if isinstance(a, JSBigInt) and isinstance(b, str):
         try:
             b_stripped = b.strip()
+            if not b_stripped:
+                return a.value == 0
+            if b_stripped == '-0':
+                return a.value == 0
             return a.value == int(b_stripped)
         except Exception:
             return False
     if isinstance(b, JSBigInt) and isinstance(a, str):
         try:
             a_stripped = a.strip()
+            if not a_stripped:
+                return b.value == 0
+            if a_stripped == '-0':
+                return b.value == 0
             return b.value == int(a_stripped)
         except Exception:
             return False
@@ -911,23 +2525,63 @@ def js_abstract_equal(a, b) -> bool:
     return False
 
 
-def js_less_than(a, b) -> bool | type(undefined):
+def js_less_than(a, b, left_first=True) -> bool | type(undefined):
     """Abstract relational comparison. Returns undefined if NaN involved."""
-    px = js_to_primitive(a, 'number')
-    py = js_to_primitive(b, 'number')
+    if left_first:
+        px = js_to_primitive(a, 'number')
+        py = js_to_primitive(b, 'number')
+    else:
+        py = js_to_primitive(b, 'number')
+        px = js_to_primitive(a, 'number')
     if isinstance(px, str) and isinstance(py, str):
         return px < py
+    # Convert booleans to numbers before BigInt comparisons (spec ToNumeric)
+    if isinstance(px, bool):
+        px = 1 if px else 0
+    if isinstance(py, bool):
+        py = 1 if py else 0
     if isinstance(px, JSBigInt) and isinstance(py, JSBigInt):
         return px.value < py.value
+    # BigInt vs String comparison
+    if isinstance(px, JSBigInt) and isinstance(py, str):
+        try:
+            py_s = py.strip()
+            ny = 0 if not py_s else int(py_s, 0)
+        except (ValueError, OverflowError):
+            return undefined
+        return px.value < ny
+    if isinstance(py, JSBigInt) and isinstance(px, str):
+        try:
+            px_s = px.strip()
+            nx = 0 if not px_s else int(px_s, 0)
+        except (ValueError, OverflowError):
+            return undefined
+        return nx < py.value
     # BigInt vs number comparison
     if isinstance(px, JSBigInt) and isinstance(py, (int, float)) and not isinstance(py, bool):
-        if math.isnan(py) if isinstance(py, float) else False:
-            return undefined
-        return float(px.value) < float(py)
+        if isinstance(py, float):
+            if math.isnan(py):
+                return undefined
+            if math.isinf(py):
+                # BigInt < +Infinity is always true; BigInt < -Infinity is always false
+                return py > 0
+            # Compare without precision loss: use Fraction or int comparison
+            if py == int(py):
+                return px.value < int(py)
+            # py is a non-integer float: compare BigInt (integer) vs float
+            return float(px.value) < py
+        return px.value < py
     if isinstance(py, JSBigInt) and isinstance(px, (int, float)) and not isinstance(px, bool):
-        if math.isnan(px) if isinstance(px, float) else False:
-            return undefined
-        return float(px) < float(py.value)
+        if isinstance(px, float):
+            if math.isnan(px):
+                return undefined
+            if math.isinf(px):
+                # +Infinity < BigInt is always false; -Infinity < BigInt is always true
+                return px < 0
+            if px == int(px):
+                return int(px) < py.value
+            return px < float(py.value)
+        return px < py.value
     nx = js_to_number(px)
     ny = js_to_number(py)
     if math.isnan(nx) or math.isnan(ny):
@@ -936,45 +2590,56 @@ def js_less_than(a, b) -> bool | type(undefined):
 
 
 def js_number_to_display(val) -> str:
-    """Format a number like JS toString()."""
+    """Format a number like JS toString() (ECMAScript Number::toString)."""
     if isinstance(val, float):
         if math.isnan(val):
             return 'NaN'
         if math.isinf(val):
             return 'Infinity' if val > 0 else '-Infinity'
-        # Use Python's shortest-repr, which gives the shortest round-trip decimal
         s = repr(val)
-        # Check if it's in scientific notation (e.g. '1.968e+19')
-        if 'e' in s or 'E' in s:
-            # Try to convert to integer form if abs(val) < 1e21
-            if abs(val) < 1e21:
-                # Parse the scientific notation and expand it
-                # e.g. '1.968610959516923e+19' -> '19686109595169230000'
-                from decimal import Decimal
-                try:
-                    d = Decimal(s)
-                    int_str = format(d, 'f')
-                    # Remove trailing .0 or .000
-                    if '.' in int_str:
-                        int_str = int_str.rstrip('0').rstrip('.')
-                    return int_str
-                except Exception:
-                    pass
+        if 'e' not in s and 'E' not in s:
+            # Python gave a decimal representation - clean up integer floats
+            i = int(val)
+            if float(i) == val:
+                return str(i)
+            return s
+        # Scientific notation: parse mantissa and exponent
+        s_lower = s.lower()
+        e_pos = s_lower.index('e')
+        mantissa_str = s[:e_pos]   # e.g. '1', '1.5', '-1.23'
+        exp = int(s[e_pos+1:])     # e.g. 20, -7
+        neg = mantissa_str.startswith('-')
+        m_digits = mantissa_str.lstrip('-').replace('.', '')  # e.g. '1', '15', '123'
+        k = len(m_digits.rstrip('0') or m_digits)  # significant digits (strip trailing 0)
+        m_digits = m_digits[:k]  # trim to significant digits
+        # JS spec exponent n: value = mantissa(1..10) × 10^exp = s × 10^(n-k)
+        # mantissa(1..10) × 10^exp = (mantissa × 10^(k-1)) × 10^(exp-(k-1))
+        # So n-k = exp-(k-1), n = exp+1
+        n = exp + 1
+        prefix = '-' if neg else ''
+        if k <= n <= 21:
+            # Integer form: s followed by (n-k) zeros
+            return prefix + m_digits + '0' * (n - k)
+        elif 0 < n < k:
+            # Decimal: m_digits[:n] . m_digits[n:]
+            return prefix + m_digits[:n] + '.' + m_digits[n:]
+        elif -6 < n <= 0:
+            # 0.000...s form
+            return prefix + '0.' + '0' * (-n) + m_digits
+        else:
+            # Scientific: d.dddEn (no leading 0 in exponent)
+            if k == 1:
+                m_js = m_digits
             else:
-                # scientific notation for large values
-                # convert to JS format: remove leading zeros, etc.
-                return s.replace('e+', 'e+').replace('E+', 'e+').replace('E-', 'e-')
-        # Non-scientific: check if it's an integer float
-        i = int(val)
-        if float(i) == val:
-            return str(i)
-        return s
+                m_js = m_digits[0] + '.' + m_digits[1:]
+            sign = '+' if exp >= 0 else ''
+            return prefix + m_js + 'e' + sign + str(exp)
     return str(val)
 
 
 def js_add(a, b):
     """+ operator: string concatenation or numeric addition."""
-    if isinstance(a, (JSObject,)) or isinstance(b, (JSObject,)):
+    if isinstance(a, (JSObject, JSFunction)) or isinstance(b, (JSObject, JSFunction)):
         pa = js_to_primitive(a)
         pb = js_to_primitive(b)
         return js_add(pa, pb)
@@ -986,7 +2651,11 @@ def js_add(a, b):
     nb = js_to_number(b)
     result = na + nb
     if isinstance(na, int) and isinstance(nb, int):
-        return result
+        # JS numbers are IEEE 754 doubles; if result exceeds safe integer
+        # range, convert through float to match IEEE 754 rounding.
+        if -9007199254740991 <= result <= 9007199254740991:
+            return result
+        return int(float(result))
     return float(result)
 
 
@@ -997,21 +2666,74 @@ def js_instanceof(val, constructor) -> bool:
     if not isinstance(constructor, (JSFunction, JSObject)):
         raise _ThrowSignal(make_error('TypeError',
             'Right-hand side of instanceof is not callable'))
+    # Check for Symbol.hasInstance on the constructor (ES2015+ spec)
+    has_instance_sym = _WELL_KNOWN_SYMBOLS.get('Symbol.hasInstance')
+    if has_instance_sym is not None:
+        hi_key = _symbol_to_key(has_instance_sym)
+        hi_fn = undefined
+        if isinstance(constructor, JSObject):
+            hi_fn = _obj_get_property(constructor, hi_key)
+        elif isinstance(constructor, JSFunction):
+            hi_fn = (constructor._static_props or {}).get(hi_key, undefined)
+        if hi_fn is not undefined:
+            result = _call_value(hi_fn, constructor, [val])
+            return bool(js_is_truthy(result))
+    # ES spec: RHS must be callable (have [[Call]]) if no Symbol.hasInstance
+    if isinstance(constructor, JSObject) and constructor._call is None and constructor._construct is None:
+        raise _ThrowSignal(make_error('TypeError',
+            'Right-hand side of instanceof is not callable'))
+    # OrdinaryHasInstance step 3: If Type(O) is not Object, return false.
+    if not isinstance(val, (JSObject, JSFunction)):
+        return False
+
     # Get constructor.prototype
     if isinstance(constructor, JSFunction):
         proto = constructor.prototype
         if proto is None:
             proto = _build_function_prototype(constructor)
     elif isinstance(constructor, JSObject):
-        proto = constructor.props.get('prototype', undefined)
+        proto = _obj_get_property(constructor, 'prototype')
     else:
         return False
 
+    if not isinstance(proto, JSObject):
+        raise _ThrowSignal(make_error('TypeError',
+            "Function has non-object prototype '{}' in instanceof check".format(
+                js_typeof(proto))))
+
+    if isinstance(val, JSFunction):
+        # Walk the JSFunction's actual prototype chain
+        # Generator functions: _proto = GeneratorFunction.prototype → Function.prototype → Object.prototype
+        fn_obj = val
+        fn_proto_chain = getattr(fn_obj, '_proto', _SENTINEL)
+        if fn_proto_chain is not _SENTINEL and fn_proto_chain is not None:
+            # Walk _proto chain
+            cur = fn_proto_chain
+            while cur is not None:
+                if cur is proto:
+                    return True
+                if isinstance(cur, JSObject):
+                    cur = cur.proto
+                else:
+                    break
+        # Also check Function.prototype and Object.prototype
+        fn_proto = _PROTOS.get('Function')
+        obj_proto = _PROTOS.get('Object')
+        if proto is fn_proto or proto is obj_proto:
+            return True
+        return False
     if not isinstance(val, JSObject):
         return False
 
     obj = val
     while obj is not None:
+        if _is_proxy(obj):
+            obj = _proxy_get_prototype_trap(obj)
+            if isinstance(obj, _Null) or obj is null:
+                return False
+            if obj is proto:
+                return True
+            continue
         if obj is proto:
             return True
         obj = obj.proto
@@ -1020,24 +2742,50 @@ def js_instanceof(val, constructor) -> bool:
 
 def js_in(key, obj) -> bool:
     """in operator: checks if key is a property of obj."""
-    if not isinstance(obj, JSObject):
+    if not isinstance(obj, (JSObject, JSFunction)):
         raise _ThrowSignal(make_error('TypeError',
             "Cannot use 'in' operator to search for '{}' in {}".format(
                 key, js_typeof(obj))))
-    key_str = js_to_string(key)
+    if isinstance(key, JSSymbol):
+        key_str = _symbol_to_key(key)
+    else:
+        key_str = js_to_string(key)
+    if isinstance(obj, JSFunction):
+        # Check function's own properties and static props
+        if key_str == 'prototype':
+            if obj._no_prototype:
+                pass  # fall through to static_props / descriptors / proto chain
+            else:
+                return True
+        if key_str in ('length', 'name', 'caller', 'arguments'):
+            return True
+        sp = getattr(obj, '_static_props', None)
+        if sp and key_str in sp:
+            return True
+        if obj._descriptors and key_str in obj._descriptors:
+            return True
+        # Walk prototype chain
+        proto = obj._proto if obj._proto is not _SENTINEL else _PROTOS.get('Function')
+        while proto is not None:
+            if isinstance(proto, JSObject):
+                if _obj_has_property(proto, key_str):
+                    return True
+                break
+            proto = None
+        return False
     return _obj_has_property(obj, key_str)
 
 
 def _get_iterator(val, interpreter: 'Interpreter'):
     """Get an iterator from a value (for for-of loops)."""
     if isinstance(val, JSObject):
-        # Check for Symbol.iterator
-        sym_iter = val.props.get('@@iterator')
-        if sym_iter is not None:
+        # Check for Symbol.iterator (check prototype chain, not just own props)
+        sym_iter = _obj_get_property(val, '@@iterator')
+        if sym_iter is not undefined and sym_iter is not None:
             it = _call_value(sym_iter, val, [])
             return it
-        # Array-like
-        if val._is_array or 'length' in val.props:
+        # Array-like (not actual arrays — those must use @@iterator)
+        if not val._is_array and 'length' in val.props:
             return _array_iterator(val, interpreter)
         # Check for built-in iteration (Map, Set, Generator, etc.)
         if val._gen_iter is not None:
@@ -1047,13 +2795,40 @@ def _get_iterator(val, interpreter: 'Interpreter'):
         if val._set_data is not None:
             return _set_values_iterator(val)
     if isinstance(val, str):
+        # Check String.prototype[@@iterator] first (custom iterators override)
+        str_proto = _PROTOS.get('String')
+        if str_proto is not None:
+            sym_iter = _obj_get_property(str_proto, '@@iterator')
+            if sym_iter is not undefined and sym_iter is not None:
+                it = _call_value(sym_iter, val, [])
+                return it
         return _string_iterator(val)
+    # Autobox primitives: check prototype's Symbol.iterator
+    if isinstance(val, bool):
+        proto = _PROTOS.get('Boolean')
+    elif isinstance(val, (int, float)):
+        proto = _PROTOS.get('Number')
+    else:
+        proto = None
+    if proto is not None:
+        sym_iter = _obj_get_property(proto, '@@iterator')
+        if sym_iter is not undefined and sym_iter is not None:
+            it = _call_value(sym_iter, val, [])
+            return it
     raise _ThrowSignal(make_error('TypeError',
         f'{js_typeof(val)} is not iterable'))
 
 
 def _array_iterator(arr: JSObject, interp: 'Interpreter'):
     """Create an array iterator object."""
+    proto = _PROTOS.get('ArrayIterator')
+    if proto is not None:
+        obj = JSObject(proto=proto, class_name='Array Iterator')
+        obj._iter_source = arr
+        obj._iter_idx = [0]
+        obj._iter_kind = 'value'
+        return obj
+    # Fallback (before builtins registered)
     obj = JSObject(class_name='Array Iterator')
     items = _array_to_list(arr)
     idx = [0]
@@ -1070,15 +2845,40 @@ def _array_iterator(arr: JSObject, interp: 'Interpreter'):
 
 
 def _make_iter_result(value, done: bool) -> JSObject:
-    obj = JSObject()
+    obj = JSObject(proto=_PROTOS.get('Object'))
     obj.props['value'] = value
     obj.props['done'] = done
     return obj
 
 
+def _string_to_code_points(s: str) -> list[str]:
+    """Split a string into code points, combining surrogate pairs."""
+    result = []
+    i = 0
+    while i < len(s):
+        cp = ord(s[i])
+        if 0xD800 <= cp <= 0xDBFF and i + 1 < len(s):
+            lo = ord(s[i + 1])
+            if 0xDC00 <= lo <= 0xDFFF:
+                result.append(s[i] + s[i + 1])
+                i += 2
+                continue
+        result.append(s[i])
+        i += 1
+    return result
+
+
 def _string_iterator(s: str):
+    proto = _PROTOS.get('StringIterator')
+    if proto is not None:
+        obj = JSObject(proto=proto, class_name='String Iterator')
+        obj._iter_source = _string_to_code_points(s)
+        obj._iter_idx = [0]
+        obj._iter_kind = 'value'
+        return obj
+    # Fallback (before builtins registered)
     obj = JSObject(class_name='String Iterator')
-    chars = list(s)  # handles surrogate pairs as single chars in Python 3
+    chars = _string_to_code_points(s)
     idx = [0]
     def next_fn(this, args):
         if idx[0] < len(chars):
@@ -1093,6 +2893,14 @@ def _string_iterator(s: str):
 
 
 def _map_values_iterator(map_obj: JSObject):
+    proto = _PROTOS.get('MapIterator')
+    if proto is not None and map_obj._map_list is not None:
+        obj = JSObject(proto=proto, class_name='Map Iterator')
+        obj._iter_source = map_obj._map_list
+        obj._iter_idx = [0]
+        obj._iter_kind = 'key+value'
+        return obj
+    # Fallback for old-style _map_data
     obj = JSObject(class_name='Map Iterator')
     items = list(map_obj._map_data.items()) if map_obj._map_data else []
     idx = [0]
@@ -1108,6 +2916,14 @@ def _map_values_iterator(map_obj: JSObject):
 
 
 def _set_values_iterator(set_obj: JSObject):
+    proto = _PROTOS.get('SetIterator')
+    if proto is not None and set_obj._set_list is not None:
+        obj = JSObject(proto=proto, class_name='Set Iterator')
+        obj._iter_source = set_obj._set_list
+        obj._iter_idx = [0]
+        obj._iter_kind = 'value'
+        return obj
+    # Fallback for old-style _set_data
     obj = JSObject(class_name='Set Iterator')
     items = list(set_obj._set_data) if set_obj._set_data else []
     idx = [0]
@@ -1128,41 +2944,103 @@ def _iterate_to_next(iterator) -> tuple:
         raise _ThrowSignal(make_error('TypeError', 'iterator has no next method'))
     result = _call_value(next_fn, iterator, [])
     if isinstance(result, JSObject):
-        value = result.props.get('value', undefined)
-        done = result.props.get('done', False)
-        return value, bool(done)
+        done = _obj_get_property(result, 'done')
+        if done is undefined:
+            done = False
+        if bool(done):
+            return undefined, True
+        value = _obj_get_property(result, 'value')
+        return value, False
     return undefined, True
 
 
-def _array_to_list(arr: JSObject) -> list:
-    """Convert array object to Python list."""
-    arr_list = arr.props.get('@@array_data')
-    if arr_list is not None:
-        return arr_list
-    length = arr.props.get('length', 0)
-    if isinstance(length, int):
+def _iterator_close(iterator, suppress_error=False) -> None:
+    """Call iterator.return() if present (IteratorClose per spec 7.4.6).
+    If suppress_error is True, exceptions from return() are suppressed
+    (used when already in an abrupt completion path — step 5 says
+    'If completion is a throw completion, return Completion(completion)').
+    Also validates return value is Object (step 9)."""
+    if not isinstance(iterator, JSObject):
+        return
+    if suppress_error:
+        try:
+            ret_fn = _obj_get_property(iterator, 'return')
+        except _ThrowSignal:
+            return  # Per spec step 5: forward original throw completion
+        if ret_fn is not None and ret_fn is not undefined:
+            try:
+                _call_value(ret_fn, iterator, [])
+            except _ThrowSignal:
+                pass  # Per spec step 5: forward original throw completion
+    else:
+        ret_fn = _obj_get_property(iterator, 'return')
+        if ret_fn is not None and ret_fn is not undefined:
+            inner_result = _call_value(ret_fn, iterator, [])
+            # Step 9: If Type(innerResult.[[value]]) is not Object, throw TypeError
+            if not isinstance(inner_result, (JSObject, JSFunction)):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Iterator result is not an object'))
+
+
+def _array_to_list(arr) -> list:
+    """Convert array-like object to Python list (CreateListFromArrayLike)."""
+    if isinstance(arr, JSObject):
+        arr_list = arr.props.get('@@array_data')
+        if arr_list is not None:
+            return arr_list
+        # Read length through property chain to trigger getters
+        length = _obj_get_property(arr, 'length')
+        length = js_to_number(length) if length is not undefined else 0
+        if length != length:  # NaN
+            length = 0
+        length = int(length)
+        if length < 0:
+            length = 0
         result = []
         for i in range(length):
-            result.append(arr.props.get(str(i), undefined))
+            result.append(_obj_get_property(arr, str(i)))
+        return result
+    if isinstance(arr, JSFunction):
+        # JSFunction as array-like: read length through interpreter property chain
+        length = arr.interp._get_property(arr, 'length')
+        length = js_to_number(length) if length is not undefined else 0
+        if length != length:  # NaN
+            length = 0
+        length = int(length)
+        if length < 0:
+            length = 0
+        result = []
+        for i in range(length):
+            result.append(arr.interp._get_property(arr, str(i)))
         return result
     return []
 
+
+# Arrays above this length use sparse representation (no @@array_data list).
+_MAX_DENSE_ARRAY_LEN = 1_000_000
 
 def make_array(items: list) -> JSObject:
     """Create a JS array from a Python list."""
     proto = _PROTOS.get('Array')
     obj = JSObject(proto=proto, class_name='Array')
     obj._is_array = True
-    data = list(items)
-    obj.props['@@array_data'] = data
-    obj.props['length'] = len(data)
-    # length is non-enumerable on arrays
+    n = len(items)
+    if n <= _MAX_DENSE_ARRAY_LEN:
+        # Replace _HOLE with undefined in the dense data list
+        data = [undefined if v is _HOLE else v for v in items]
+        obj.props['@@array_data'] = data
+        for i, v in enumerate(items):
+            if v is not _HOLE:
+                obj.props[str(i)] = v if v is not _HOLE else undefined
+    else:
+        # Sparse: only store non-undefined elements as string keys
+        for i, v in enumerate(items):
+            if v is not undefined:
+                obj.props[str(i)] = v
+    obj.props['length'] = n
     if obj._non_enum is None:
         obj._non_enum = set()
     obj._non_enum.add('length')
-    # Also set indexed props for compatibility
-    for i, v in enumerate(data):
-        obj.props[str(i)] = v
     return obj
 
 
@@ -1179,7 +3057,19 @@ def _array_set_item(arr: JSObject, idx: int, value) -> None:
     data = arr.props.get('@@array_data')
     if data is not None:
         if idx >= len(data):
-            data.extend([undefined] * (idx - len(data) + 1))
+            new_len = idx + 1
+            if new_len <= _MAX_DENSE_ARRAY_LEN:
+                data.extend([undefined] * (idx - len(data) + 1))
+                data[idx] = value
+                arr.props[str(idx)] = value
+                arr.props['length'] = len(data)
+                return
+            else:
+                # Switch to sparse
+                del arr.props['@@array_data']
+                arr.props[str(idx)] = value
+                arr.props['length'] = new_len
+                return
         data[idx] = value
         arr.props[str(idx)] = value
         arr.props['length'] = len(data)
@@ -1255,8 +3145,37 @@ def _typed_array_set(arr: JSObject, idx: int, value) -> None:
     if is_bigint:
         if isinstance(value, JSBigInt):
             n = int(value)
+        elif isinstance(value, bool):
+            n = 1 if value else 0
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert a Number to a BigInt'))
+        elif isinstance(value, str):
+            s = value.strip()
+            try:
+                n = int(s, 0) if s else 0
+            except ValueError:
+                raise _ThrowSignal(make_error('TypeError', f'Cannot convert {value!r} to a BigInt'))
+        elif value is undefined:
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert undefined to a BigInt'))
+        elif value is null:
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert null to a BigInt'))
+        elif isinstance(value, JSSymbol):
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert a Symbol to a BigInt'))
         else:
-            n = int(js_to_number(value))
+            # Object: ToPrimitive
+            prim = js_to_primitive(value, 'number')
+            if isinstance(prim, JSBigInt):
+                n = int(prim)
+            elif isinstance(prim, (int, float)):
+                raise _ThrowSignal(make_error('TypeError', 'Cannot convert a Number to a BigInt'))
+            elif isinstance(prim, str):
+                s = prim.strip()
+                try:
+                    n = int(s, 0) if s else 0
+                except ValueError:
+                    raise _ThrowSignal(make_error('TypeError', f'Cannot convert {prim!r} to a BigInt'))
+            else:
+                raise _ThrowSignal(make_error('TypeError', f'Cannot convert to a BigInt'))
         bits = bpe * 8
         n = n & ((1 << bits) - 1)
         if fmt == 'q' and n >= (1 << 63):
@@ -1264,6 +3183,9 @@ def _typed_array_set(arr: JSObject, idx: int, value) -> None:
         coerced = n
     elif is_float:
         coerced = float(js_to_number(value))
+        # Float16: handle overflow (values > 65504 or < -65504 → ±Infinity)
+        if fmt == 'e' and _math.isfinite(coerced) and abs(coerced) > 65504:
+            coerced = _math.copysign(_math.inf, coerced)
     elif is_clamped:
         v = js_to_number(value)
         if _math.isnan(v):
@@ -1284,19 +3206,48 @@ def _typed_array_set(arr: JSObject, idx: int, value) -> None:
     _struct.pack_into('<' + fmt, ab_data, offset, coerced)
 
 
-def _make_native_fn(name: str, fn: Callable) -> JSObject:
+def _invoke_callable(fn, this_val, args):
+    """Call fn (JSFunction or JSObject with _call) with the given this and args."""
+    if isinstance(fn, JSFunction):
+        if fn.interp is not None:
+            return fn.interp.call_function(fn, this_val, args)
+        raise _ThrowSignal(make_error('TypeError', 'Cannot call function without interpreter'))
+    if isinstance(fn, JSObject) and fn._call is not None:
+        return fn._call(this_val, args)
+    raise _ThrowSignal(make_error('TypeError', 'Not a callable'))
+
+
+def _make_native_fn(name: str, fn: Callable, length: int = 0) -> JSObject:
     """Wrap a Python callable as a JSObject with _call."""
-    obj = JSObject(class_name='Function')
+    # Use Function.prototype as [[Prototype]] if already registered (lazy)
+    fn_proto = _PROTOS.get('Function')
+    obj = JSObject(class_name='Function', proto=fn_proto)
     obj.name = name
+    obj.length = length
     obj._call = fn
-    obj._construct = fn
+    # Do NOT set _construct — built-in non-constructor functions should not be new-able.
+    # Callers that need constructors should set obj._construct explicitly.
+    # Store name and length in _descriptors so they respect configurable/writable
+    obj._descriptors = {
+        'length': {'value': length, 'writable': False, 'enumerable': False, 'configurable': True},
+        'name': {'value': name, 'writable': False, 'enumerable': False, 'configurable': True},
+    }
     return obj
 
 
 def _build_function_prototype(fn: JSFunction) -> JSObject:
     """Build and cache the default prototype object for a function."""
     if fn.prototype is None:
-        proto = JSObject(proto=_PROTOS.get('Object'))
+        # Generator functions' .prototype inherits from %GeneratorPrototype%
+        if getattr(fn, 'is_generator', False):
+            parent_proto = _PROTOS.get('Generator') or _PROTOS.get('Object')
+        else:
+            parent_proto = _PROTOS.get('Object')
+        proto = JSObject(proto=parent_proto)
+        # constructor is non-enumerable, writable, configurable per ECMAScript spec
+        proto._descriptors = {
+            'constructor': {'value': fn, 'writable': True, 'enumerable': False, 'configurable': True}
+        }
         proto.props['constructor'] = fn
         fn.prototype = proto
     return fn.prototype
@@ -1336,6 +3287,16 @@ class Interpreter:
         else:
             frame = f'    at {fname}:{line}:{col}'
         stack = err.props.get('stack', '')
+        # If no stack yet, initialize with error description so it's not lost
+        if not stack:
+            name = err.props.get('name', '')
+            msg = err.props.get('message', '')
+            if name and msg:
+                stack = f'{name}: {msg}'
+            elif msg:
+                stack = str(msg)
+            elif name:
+                stack = str(name)
         # Check if this exact frame is already present
         if frame in stack:
             return
@@ -1363,7 +3324,7 @@ class Interpreter:
         if t == 'BlockStatement':
             return self._exec_block(node, env)
         if t == 'EmptyStatement':
-            return undefined
+            return _EMPTY
         if t == 'ExpressionStatement':
             return self.eval(node.expression, env)
         if t == 'VariableDeclaration':
@@ -1435,7 +3396,13 @@ class Interpreter:
         if t == 'ThisExpression':
             try:
                 return env.get('this')
-            except _ThrowSignal:
+            except _ThrowSignal as ts:
+                err = ts.args[0] if ts.args else None
+                msg = ''
+                if isinstance(err, JSObject):
+                    msg = err.props.get('message', '')
+                if 'before initialization' in str(msg):
+                    raise  # TDZ — re-throw ReferenceError
                 return undefined
         if t == 'MetaProperty':
             # new.target or import.meta
@@ -1545,6 +3512,15 @@ class Interpreter:
             return hook(val, node.delegate)
         if t == 'ClassExpression':
             return self._eval_class_expr(node, env)
+        if t == 'ChainExpression':
+            old_chain = getattr(self, '_in_optional_chain', False)
+            self._in_optional_chain = True
+            try:
+                return self.eval(node.expression, env)
+            except _OptionalChainShortCircuit:
+                return undefined
+            finally:
+                self._in_optional_chain = old_chain
         if t == 'SpreadElement':
             # spread without context — evaluate the argument
             return self.eval(node.argument, env)
@@ -1557,15 +3533,14 @@ class Interpreter:
 
     def _exec_program(self, node: Program, env: Environment) -> Any:
         # Detect top-level 'use strict' directive
-        if (node.body and
-                type(node.body[0]).__name__ == 'ExpressionStatement' and
-                type(node.body[0].expression).__name__ == 'Literal' and
-                node.body[0].expression.value == 'use strict'):
+        if _has_use_strict_directive(node.body):
             env.set_strict()
         self._hoist_declarations(node.body, env)
         result = undefined
         for stmt in node.body:
-            result = self.exec(stmt, env)
+            v = self.exec(stmt, env)
+            if v is not _EMPTY:
+                result = v
         return result
 
     def _exec_block(self, node: BlockStatement, env: Environment,
@@ -1574,27 +3549,126 @@ class Interpreter:
             block_env = Environment(parent=env)
         else:
             block_env = env
-        self._hoist_declarations(node.body, block_env)
-        result = undefined
-        for stmt in node.body:
-            result = self.exec(stmt, block_env)
+        self._hoist_declarations(node.body, block_env, is_block=new_scope)
+        result = _EMPTY
+        try:
+            for stmt in node.body:
+                v = self.exec(stmt, block_env)
+                if v is not _EMPTY:
+                    result = v
+        except (_BreakSignal, _ContinueSignal) as e:
+            # UpdateEmpty: carry the last completion value if signal has no value
+            if e.value is None and result is not _EMPTY and result is not undefined:
+                e.value = result
+            raise
         return result
 
-    def _hoist_declarations(self, stmts: list, env: Environment) -> None:
-        """Hoist function declarations and var declarations."""
+    def _in_annex_b_eval(self, env: Environment) -> bool:
+        """Check if we're inside an eval scope with Annex B processing."""
+        e = env
+        while e is not None:
+            if getattr(e, '_annex_b_var_names', None) is not None:
+                return True
+            e = e._parent
+        return False
+
+    def _hoist_declarations(self, stmts: list, env: Environment,
+                            is_block: bool = False) -> None:
+        """Hoist function declarations and var declarations.
+        Also pre-create let/const bindings as TDZ (_SENTINEL) for temporal dead zone."""
         for stmt in stmts:
             t = type(stmt).__name__
             if t == 'FunctionDeclaration':
                 if stmt.id:
                     fn = self._make_function(stmt, env)
-                    env.define_var(stmt.id.name, fn)
+                    if is_block and (stmt.generator or stmt.async_):
+                        # Generator, async, and async-generator declarations in blocks
+                        # are always lexically scoped per spec (no Annex B treatment)
+                        env.define_let(stmt.id.name, fn)
+                    elif is_block and env._is_strict():
+                        # In strict mode, block-level function declarations are block-scoped
+                        env.define_let(stmt.id.name, fn)
+                    elif is_block and self._in_annex_b_eval(env):
+                        # In sloppy eval code, block functions are block-scoped (let-like),
+                        # and Annex B propagation at runtime copies to var scope
+                        env.define_let(stmt.id.name, fn)
+                    else:
+                        env.define_var(stmt.id.name, fn)
             elif t == 'VariableDeclaration' and stmt.kind == 'var':
                 for decl in stmt.declarations:
                     self._hoist_var_pattern(decl.id, env)
+            elif t == 'VariableDeclaration' and stmt.kind in ('let', 'const'):
+                for decl in stmt.declarations:
+                    self._hoist_let_pattern(decl.id, env, stmt.kind)
             elif t in ('ExportNamedDeclaration', 'ExportDefaultDeclaration'):
                 inner = getattr(stmt, 'declaration', None)
                 if inner:
                     self._hoist_declarations([inner], env)
+            else:
+                # Recurse into nested statements to find var declarations
+                self._hoist_vars_nested(stmt, env)
+
+    def _hoist_vars_nested(self, node, env: Environment) -> None:
+        """Recursively find and hoist var declarations inside nested statements."""
+        t = type(node).__name__
+        if t == 'BlockStatement':
+            for s in node.body:
+                st = type(s).__name__
+                if st == 'VariableDeclaration' and s.kind == 'var':
+                    for decl in s.declarations:
+                        self._hoist_var_pattern(decl.id, env)
+                elif st != 'FunctionDeclaration':
+                    self._hoist_vars_nested(s, env)
+        elif t == 'IfStatement':
+            if node.consequent:
+                self._hoist_vars_nested(node.consequent, env)
+            if node.alternate:
+                self._hoist_vars_nested(node.alternate, env)
+        elif t in ('WhileStatement', 'DoWhileStatement'):
+            if node.body:
+                self._hoist_vars_nested(node.body, env)
+        elif t == 'ForStatement':
+            if node.init and type(node.init).__name__ == 'VariableDeclaration' and node.init.kind == 'var':
+                for decl in node.init.declarations:
+                    self._hoist_var_pattern(decl.id, env)
+            if node.body:
+                self._hoist_vars_nested(node.body, env)
+        elif t in ('ForInStatement', 'ForOfStatement'):
+            if node.left and type(node.left).__name__ == 'VariableDeclaration' and node.left.kind == 'var':
+                for decl in node.left.declarations:
+                    self._hoist_var_pattern(decl.id, env)
+            if node.body:
+                self._hoist_vars_nested(node.body, env)
+        elif t == 'TryStatement':
+            if node.block:
+                self._hoist_vars_nested(node.block, env)
+            if node.handler and node.handler.body:
+                self._hoist_vars_nested(node.handler.body, env)
+            if node.finalizer:
+                self._hoist_vars_nested(node.finalizer, env)
+        elif t == 'SwitchStatement':
+            for case in node.cases:
+                for s in case.consequent:
+                    st = type(s).__name__
+                    if st == 'VariableDeclaration' and s.kind == 'var':
+                        for decl in s.declarations:
+                            self._hoist_var_pattern(decl.id, env)
+                    elif st != 'FunctionDeclaration':
+                        self._hoist_vars_nested(s, env)
+        elif t == 'LabeledStatement':
+            if node.body:
+                st = type(node.body).__name__
+                if st == 'VariableDeclaration' and node.body.kind == 'var':
+                    for decl in node.body.declarations:
+                        self._hoist_var_pattern(decl.id, env)
+                else:
+                    self._hoist_vars_nested(node.body, env)
+        elif t == 'WithStatement':
+            if node.body:
+                self._hoist_vars_nested(node.body, env)
+        elif t == 'VariableDeclaration' and node.kind == 'var':
+            for decl in node.declarations:
+                self._hoist_var_pattern(decl.id, env)
 
     def _hoist_var_pattern(self, pattern, env: Environment) -> None:
         t = type(pattern).__name__
@@ -1615,11 +3689,62 @@ class Interpreter:
                     val = v if type(v).__name__ != 'AssignmentPattern' else v.left
                     self._hoist_var_pattern(val, env)
 
+    def _hoist_let_pattern(self, pattern, env: Environment, kind: str) -> None:
+        """Pre-create let/const bindings as TDZ (_SENTINEL) for temporal dead zone."""
+        t = type(pattern).__name__
+        if t == 'Identifier':
+            if pattern.name not in env._bindings:
+                env._bindings[pattern.name] = _SENTINEL
+                if kind == 'const':
+                    if env._consts is None:
+                        env._consts = set()
+                    env._consts.add(pattern.name)
+        elif t == 'ArrayPattern':
+            for elem in pattern.elements:
+                if elem:
+                    et = type(elem).__name__
+                    if et == 'RestElement':
+                        self._hoist_let_pattern(elem.argument, env, kind)
+                    elif et == 'AssignmentPattern':
+                        self._hoist_let_pattern(elem.left, env, kind)
+                    else:
+                        self._hoist_let_pattern(elem, env, kind)
+        elif t == 'ObjectPattern':
+            for prop in pattern.properties:
+                if type(prop).__name__ == 'RestElement':
+                    self._hoist_let_pattern(prop.argument, env, kind)
+                else:
+                    v = prop.value if type(prop).__name__ == 'Property' else prop
+                    val = v if type(v).__name__ != 'AssignmentPattern' else v.left
+                    self._hoist_let_pattern(val, env, kind)
+
     def _exec_var_decl(self, node: VariableDeclaration, env: Environment) -> Any:
         for decl in node.declarations:
+            # For var declarations with simple identifiers, capture the with-object
+            # reference BEFORE evaluating the initializer (spec: binding identifier
+            # is resolved as a reference first, then initializer runs, then PutValue).
+            with_target = None
+            if decl.init and type(decl.id).__name__ == 'Identifier' and node.kind == 'var':
+                scope = env
+                while scope is not None:
+                    if scope._with_obj is not None:
+                        wobj = scope._with_obj
+                        if isinstance(wobj, JSObject) and _obj_has_property(wobj, decl.id.name):
+                            if not _with_is_unscopable(wobj, decl.id.name):
+                                with_target = wobj
+                                break
+                    if decl.id.name in scope._bindings:
+                        break
+                    scope = scope._parent
             init = self.eval(decl.init, env) if decl.init else undefined
-            self._bind_pattern(decl.id, init, env, node.kind)
-        return undefined
+            # ES2015+ SetFunctionName for simple identifier bindings
+            if decl.init and type(decl.id).__name__ == 'Identifier' and _is_anonymous_function_def(decl.init):
+                _set_function_name(init, decl.id.name)
+            if with_target is not None:
+                _obj_set_property(with_target, decl.id.name, init, env._is_strict())
+            else:
+                self._bind_pattern(decl.id, init, env, node.kind)
+        return _EMPTY  # VariableStatement/LexicalDeclaration: NormalCompletion(empty)
 
     def _bind_pattern(self, pattern, value, env: Environment, kind: str) -> None:
         """Bind a destructuring pattern to a value in the environment."""
@@ -1641,30 +3766,22 @@ class Interpreter:
             self._bind_object_pattern(pattern, value, env, kind)
         elif t == 'AssignmentPattern':
             if value is undefined:
+                # Create TDZ binding before evaluating default (for self-referential params like x = x)
+                if type(pattern.left).__name__ == 'Identifier' and kind in ('let', 'const'):
+                    env._bindings[pattern.left.name] = _SENTINEL
                 value = self.eval(pattern.right, env)
+                # ES2015+ SetFunctionName for default parameter values
+                # Only if Initializer IsAnonymousFunctionDefinition
+                if type(pattern.left).__name__ == 'Identifier' and _is_anonymous_function_def(pattern.right):
+                    _set_function_name(value, pattern.left.name)
             self._bind_pattern(pattern.left, value, env, kind)
         else:
             raise _ThrowSignal(make_error('SyntaxError',
                 f'Invalid binding pattern type: {t}'))
 
     def _bind_array_pattern(self, pattern: ArrayPattern, value, env: Environment, kind: str) -> None:
-        # Get iterator
-        if isinstance(value, JSObject) and value._is_array:
-            items = _array_to_list(value)
-            idx = 0
-            for elem in pattern.elements:
-                if elem is None:
-                    idx += 1
-                    continue
-                et = type(elem).__name__
-                if et == 'RestElement':
-                    rest_items = items[idx:]
-                    self._bind_pattern(elem.argument, make_array(rest_items), env, kind)
-                    break
-                item = items[idx] if idx < len(items) else undefined
-                self._bind_pattern(elem, item, env, kind)
-                idx += 1
-        elif isinstance(value, str):
+        # Fast path for strings
+        if isinstance(value, str):
             chars = list(value)
             idx = 0
             for elem in pattern.elements:
@@ -1679,27 +3796,56 @@ class Interpreter:
                 item = chars[idx] if idx < len(chars) else undefined
                 self._bind_pattern(elem, item, env, kind)
                 idx += 1
-        else:
-            # Try iterator protocol
-            it = _get_iterator(value, self)
-            for i, elem in enumerate(pattern.elements):
+            return
+        # Iterator protocol
+        it = _get_iterator(value, self)
+        last_done = False
+        has_rest = False
+        iter_threw = False  # Track if next() itself threw
+        try:
+            for elem in pattern.elements:
                 if elem is None:
-                    _iterate_to_next(it)
+                    try:
+                        _, last_done = _iterate_to_next(it)
+                    except _ThrowSignal:
+                        last_done = True
+                        raise
                     continue
                 et = type(elem).__name__
                 if et == 'RestElement':
+                    has_rest = True
                     rest_items = []
                     while True:
-                        v, done = _iterate_to_next(it)
-                        if done:
+                        try:
+                            v, d = _iterate_to_next(it)
+                        except _ThrowSignal:
+                            last_done = True
+                            raise
+                        last_done = d
+                        if d:
                             break
                         rest_items.append(v)
                     self._bind_pattern(elem.argument, make_array(rest_items), env, kind)
                     break
-                item, done = _iterate_to_next(it)
-                if done:
+                try:
+                    item, last_done = _iterate_to_next(it)
+                except _ThrowSignal:
+                    last_done = True
+                    raise
+                if last_done:
                     item = undefined
                 self._bind_pattern(elem, item, env, kind)
+        except _ThrowSignal:
+            if not last_done:
+                _iterator_close(it, suppress_error=True)
+            raise
+        except _ReturnSignal:
+            if not last_done:
+                _iterator_close(it, suppress_error=False)
+            raise
+        # IteratorClose: if iterator not exhausted and RestElement didn't consume all
+        if not last_done and not has_rest:
+            _iterator_close(it)
 
     def _bind_object_pattern(self, pattern: ObjectPattern, value, env: Environment, kind: str) -> None:
         if value is null or value is undefined:
@@ -1709,16 +3855,24 @@ class Interpreter:
         for prop in pattern.properties:
             pt = type(prop).__name__
             if pt == 'RestElement':
-                # Rest: collect remaining keys
+                # Rest: collect remaining enumerable own properties
                 rest_obj = JSObject()
                 if isinstance(value, JSObject):
-                    for k, v in value.props.items():
-                        if not k.startswith('@@') and k not in used_keys:
-                            rest_obj.props[k] = v
+                    all_keys = set(k for k in value.props if not k.startswith('@@'))
+                    if value._descriptors:
+                        all_keys.update(k for k in value._descriptors if not k.startswith('@@'))
+                    for k in all_keys:
+                        if k in used_keys:
+                            continue
+                        if value._descriptors:
+                            desc = value._descriptors.get(k)
+                            if desc and not desc.get('enumerable', True):
+                                continue
+                        rest_obj.props[k] = _obj_get_property(value, k)
                 self._bind_pattern(prop.argument, rest_obj, env, kind)
             elif pt == 'Property':
                 key = self._eval_property_key(prop.key, prop.computed, env)
-                key_str = js_to_string(key)
+                key_str = _to_property_key(key)
                 used_keys.add(key_str)
                 val = self._get_value_property(value, key_str)
                 # prop.value may be the binding pattern (possibly with default)
@@ -1733,6 +3887,40 @@ class Interpreter:
             return key_node.value
         return self.eval(key_node, env)
 
+    def _eval_assign_target_ref(self, target, env: Environment):
+        """Pre-evaluate an assignment target to get a reference.
+        Returns a tuple (kind, ref_data) that can later be used with _put_assign_ref."""
+        t = type(target).__name__
+        if t == 'Identifier':
+            return ('ident', target.name)
+        elif t == 'MemberExpression':
+            obj = self.eval(target.object, env)
+            if target.computed:
+                key_val = self.eval(target.property, env)
+                # Don't convert to string yet — defer ToPropertyKey to PutValue
+                return ('member_raw', (obj, key_val, env._is_strict()))
+            else:
+                key = target.property.name
+                return ('member', (obj, key, env._is_strict()))
+        else:
+            # Pattern or complex: return marker to use full _assign_to
+            return ('pattern', target)
+
+    def _put_assign_ref(self, ref, value, env: Environment) -> None:
+        """Complete assignment using a pre-evaluated reference from _eval_assign_target_ref."""
+        kind, data = ref
+        if kind == 'ident':
+            env.set(data, value)
+        elif kind == 'member':
+            obj, key, strict = data
+            self._set_property(obj, key, value, strict)
+        elif kind == 'member_raw':
+            obj, key_val, strict = data
+            key = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else js_to_string(key_val)
+            self._set_property(obj, key, value, strict)
+        else:
+            self._assign_to(data, value, env)
+
     def _assign_to_elem(self, elem, item, env: Environment) -> None:
         """Assign a destructure element (from ArrayExpression as pattern) its value."""
         t = type(elem).__name__
@@ -1740,6 +3928,10 @@ class Interpreter:
             # default: b = /regex/ → if item is undefined use default
             if item is undefined:
                 item = self.eval(elem.right, env)
+                # SetFunctionName for destructuring assignment defaults
+                lt = type(elem.left).__name__
+                if lt == 'Identifier' and _is_anonymous_function_def(elem.right):
+                    _set_function_name(item, elem.left.name)
             self._assign_to(elem.left, item, env)
         elif t == 'SpreadElement':
             # rest: ...x = rest_array
@@ -1749,25 +3941,96 @@ class Interpreter:
 
     def _bind_array_pattern_from_expr(self, node, value, env: Environment) -> None:
         """Destructuring assignment from ArrayExpression used as a pattern."""
-        if isinstance(value, JSObject) and value._is_array:
-            items = _array_to_list(value)
-        elif isinstance(value, str):
-            items = list(value)
-        else:
-            items = []
-        idx = 0
-        for elem in node.elements:
-            if elem is None:
-                idx += 1
-                continue
-            et = type(elem).__name__
-            if et == 'SpreadElement':
-                rest = make_array(items[idx:])
-                self._assign_to(elem.argument, rest, env)
-                break
-            item = items[idx] if idx < len(items) else undefined
-            self._assign_to_elem(elem, item, env)
-            idx += 1
+        it = _get_iterator(value, self)
+        last_done = False
+        has_rest = False
+        try:
+            for elem in node.elements:
+                if elem is None:
+                    try:
+                        _, last_done = _iterate_to_next(it)
+                    except _ThrowSignal:
+                        last_done = True
+                        raise
+                    continue
+                et = type(elem).__name__
+                if et == 'SpreadElement':
+                    has_rest = True
+                    # Per spec (AssignmentRestElement):
+                    # If target is not a destructuring pattern, evaluate the
+                    # reference BEFORE iterating.
+                    rest_target = elem.argument
+                    rest_tt = type(rest_target).__name__
+                    rest_is_pattern = rest_tt in ('ArrayExpression', 'ObjectExpression',
+                                                   'ArrayPattern', 'ObjectPattern')
+                    rest_ref = None
+                    if not rest_is_pattern:
+                        rest_ref = self._eval_assign_target_ref(rest_target, env)
+                    rest_items = []
+                    while True:
+                        try:
+                            v, d = _iterate_to_next(it)
+                        except _ThrowSignal:
+                            last_done = True
+                            raise
+                        last_done = d
+                        if d:
+                            break
+                        rest_items.append(v)
+                    if rest_ref is not None:
+                        self._put_assign_ref(rest_ref, make_array(rest_items), env)
+                    else:
+                        self._assign_to(rest_target, make_array(rest_items), env)
+                    break
+
+                # Determine if this is a simple target (not a destructuring pattern)
+                actual_target = elem
+                default_expr = None
+                if et == 'AssignmentExpression' and elem.operator == '=':
+                    actual_target = elem.left
+                    default_expr = elem.right
+                    et = type(actual_target).__name__
+
+                is_pattern = et in ('ArrayExpression', 'ObjectExpression',
+                                     'ArrayPattern', 'ObjectPattern')
+                if not is_pattern:
+                    # Spec: evaluate reference BEFORE calling IteratorStep
+                    ref = self._eval_assign_target_ref(actual_target, env)
+                    try:
+                        item, last_done = _iterate_to_next(it)
+                    except _ThrowSignal:
+                        last_done = True
+                        raise
+                    if last_done:
+                        item = undefined
+                    if default_expr is not None and item is undefined:
+                        item = self.eval(default_expr, env)
+                        if et == 'Identifier' and _is_anonymous_function_def(default_expr):
+                            _set_function_name(item, actual_target.name)
+                    self._put_assign_ref(ref, item, env)
+                else:
+                    # Pattern target: get value first, then recursively destructure
+                    try:
+                        item, last_done = _iterate_to_next(it)
+                    except _ThrowSignal:
+                        last_done = True
+                        raise
+                    if last_done:
+                        item = undefined
+                    if default_expr is not None and item is undefined:
+                        item = self.eval(default_expr, env)
+                    self._assign_to(actual_target, item, env)
+        except _ThrowSignal:
+            if not last_done:
+                _iterator_close(it, suppress_error=True)
+            raise
+        except _ReturnSignal:
+            if not last_done:
+                _iterator_close(it, suppress_error=False)
+            raise
+        # IteratorClose: if iterator not exhausted and no rest consumed all
+        if not last_done and not has_rest:
+            _iterator_close(it)
 
     def _bind_object_pattern_from_expr(self, node, value, env: Environment) -> None:
         """Destructuring assignment from ObjectExpression used as a pattern."""
@@ -1777,66 +4040,175 @@ class Interpreter:
         for prop in node.properties:
             pt = type(prop).__name__
             if pt == 'SpreadElement':
-                # rest: ...rest
+                # rest: ...rest — collect remaining enumerable own properties
                 rest_obj = JSObject()
                 if isinstance(value, JSObject):
-                    for k, v in value.props.items():
-                        if not k.startswith('@@'):
-                            rest_obj.props[k] = v
+                    all_keys = set(k for k in value.props if not k.startswith('@@'))
+                    if value._descriptors:
+                        all_keys.update(k for k in value._descriptors if not k.startswith('@@'))
+                    for k in all_keys:
+                        if k.startswith('@@'):
+                            continue
+                        # Skip non-enumerable properties
+                        if value._descriptors:
+                            desc = value._descriptors.get(k)
+                            if desc and not desc.get('enumerable', True):
+                                continue
+                        rest_obj.props[k] = _obj_get_property(value, k)
                 self._assign_to(prop.argument, rest_obj, env)
             elif pt == 'Property':
                 key = self._eval_property_key(prop.key, prop.computed, env)
-                key_str = js_to_string(key)
-                val = self._get_value_property(value, key_str)
-                self._assign_to_elem(prop.value, val, env)
+                key_str = _to_property_key(key)
+                # Per spec KeyedDestructuringAssignmentEvaluation:
+                # Step 1a: If target is not a pattern, evaluate lref FIRST
+                # Step 2: GetV(value, propertyName)
+                # Step 7: PutValue(lref, rhsValue)
+                target = prop.value
+                # Unwrap default: { [k]: target = def } = ...
+                default_expr = None
+                if type(target).__name__ == 'AssignmentExpression' and target.operator == '=':
+                    default_expr = target.right
+                    target = target.left
+                target_t = type(target).__name__
+                if target_t == 'MemberExpression':
+                    # Evaluate reference parts before GetV
+                    ref_obj = self.eval(target.object, env)
+                    if target.computed:
+                        ref_key_val = self.eval(target.property, env)
+                    else:
+                        ref_key_val = target.property.name
+                    val = self._get_value_property(value, key_str)
+                    if default_expr is not None and val is undefined:
+                        val = self.eval(default_expr, env)
+                    # PutValue with pre-evaluated reference
+                    if target.computed:
+                        ref_key = _symbol_to_key(ref_key_val) if isinstance(ref_key_val, JSSymbol) else js_to_string(ref_key_val)
+                    else:
+                        ref_key = ref_key_val
+                    is_super = type(target.object).__name__ == 'Super'
+                    if is_super:
+                        this_val = env.get('this') if env.has_binding('this') else undefined
+                        if isinstance(this_val, JSObject):
+                            _obj_set_property(this_val, ref_key, val, env._is_strict())
+                        elif isinstance(ref_obj, JSObject):
+                            _obj_set_property(ref_obj, ref_key, val, env._is_strict())
+                    else:
+                        self._set_property(ref_obj, ref_key, val, env._is_strict())
+                else:
+                    val = self._get_value_property(value, key_str)
+                    self._assign_to_elem(prop.value, val, env)
 
     def _exec_func_decl(self, node: FunctionDeclaration, env: Environment) -> Any:
-        # Already hoisted; but in case of re-declaration in block scope
+        # Already hoisted; update the binding if needed
         if node.id:
+            fn_name = node.id.name
             fn = self._make_function(node, env)
-            env.define_var(node.id.name, fn)
-        return undefined
+
+            # Check Annex B eval context
+            _annex_b_env = None
+            _e = env
+            while _e is not None:
+                ab_names = getattr(_e, '_annex_b_var_names', None)
+                if ab_names is not None:
+                    _annex_b_env = _e
+                    break
+                _e = _e._parent
+
+            if _annex_b_env is not None:
+                # In Annex B eval context
+                if fn_name in env._bindings:
+                    # Check if this binding is a block-scoped (let) one we created for Annex B
+                    # or if it's a conflicting let/const from user code
+                    if fn_name in _annex_b_env._annex_b_var_names:
+                        # This function qualified for Annex B — update block binding
+                        env.set(fn_name, fn)
+                    else:
+                        # Function name conflicts with a let/const — don't overwrite
+                        pass
+                else:
+                    # Name not in current bindings — define as block-scoped
+                    env.define_let(fn_name, fn)
+                # Annex B.3.3.3: Propagate block-scoped function to var scope
+                if fn_name in (_annex_b_env._annex_b_var_names or set()):
+                    ab_var_scope = getattr(_annex_b_env, '_annex_b_var_scope', None)
+                    if ab_var_scope is not None:
+                        ab_var_scope.set(fn_name, fn)
+            else:
+                # Normal (non-annex B eval) context
+                if fn_name in env._bindings:
+                    env.set(fn_name, fn)
+                else:
+                    env.define_var(fn_name, fn)
+        return _EMPTY  # FunctionDeclaration has empty completion per spec
 
     def _exec_if(self, node: IfStatement, env: Environment) -> Any:
         test = self.eval(node.test, env)
         if js_is_truthy(test):
-            return self.exec(node.consequent, env)
+            branch = node.consequent
         elif node.alternate:
-            return self.exec(node.alternate, env)
-        return undefined
+            branch = node.alternate
+        else:
+            # IfStatement with no else, condition false: NormalCompletion(undefined)
+            return undefined
+        # Execute branch, applying UpdateEmpty for abrupt completions (spec sec-if-statement)
+        try:
+            result = self.exec(branch, env)
+            # UpdateEmpty: if completion is empty, replace with undefined
+            if result is _EMPTY:
+                result = undefined
+            return result
+        except (_BreakSignal, _ContinueSignal) as e:
+            # UpdateEmpty: if signal has no value, set to undefined
+            if e.value is None:
+                e.value = undefined
+            raise
 
-    def _exec_while(self, node: WhileStatement, env: Environment) -> Any:
+    def _exec_while(self, node: WhileStatement, env: Environment, label: str | None = None) -> Any:
+        V = undefined
         while js_is_truthy(self.eval(node.test, env)):
             try:
-                self.exec(node.body, env)
+                v = self.exec(node.body, env)
+                if v is not None and v is not _EMPTY:
+                    V = v
             except _BreakSignal as e:
-                if e.label is None:
+                if e.label is None or e.label == label:
+                    if e.value is not None:
+                        V = e.value
                     break
                 raise
             except _ContinueSignal as e:
-                if e.label is None:
+                if e.label is None or e.label == label:
+                    if e.value is not None:
+                        V = e.value
                     continue
                 raise
-        return undefined
+        return V
 
-    def _exec_do_while(self, node: DoWhileStatement, env: Environment) -> Any:
+    def _exec_do_while(self, node: DoWhileStatement, env: Environment, label: str | None = None) -> Any:
+        V = undefined
         while True:
             try:
-                self.exec(node.body, env)
+                v = self.exec(node.body, env)
+                if v is not None and v is not _EMPTY:
+                    V = v
             except _BreakSignal as e:
-                if e.label is None:
+                if e.label is None or e.label == label:
+                    if e.value is not None:
+                        V = e.value
                     break
                 raise
             except _ContinueSignal as e:
-                if e.label is None:
-                    pass  # continue to test
-                else:
+                if e.label is not None and e.label != label:
                     raise
+                # UpdateEmpty: carry completion value from continue
+                if e.value is not None:
+                    V = e.value
+                # continue to test
             if not js_is_truthy(self.eval(node.test, env)):
                 break
-        return undefined
+        return V
 
-    def _exec_for(self, node: ForStatement, env: Environment) -> Any:
+    def _exec_for(self, node: ForStatement, env: Environment, label: str | None = None) -> Any:
         for_env = Environment(parent=env)
         # Detect whether init uses let/const (per-iteration binding needed)
         init_is_lexical = (
@@ -1844,6 +4216,10 @@ class Interpreter:
             and type(node.init).__name__ == 'VariableDeclaration'
             and node.init.kind in ('let', 'const')
         )
+        # For per-iteration let: track which names need copying (only 'let', not 'const')
+        per_iter_names = None
+        if init_is_lexical and node.init.kind == 'let':
+            per_iter_names = list(for_env._bindings.keys()) if for_env._bindings else []
         # Init
         if node.init:
             t = type(node.init).__name__
@@ -1851,45 +4227,60 @@ class Interpreter:
                 self._exec_var_decl(node.init, for_env)
             else:
                 self.exec(node.init, for_env)
+            # Update per_iter_names after init (bindings now exist)
+            if per_iter_names is not None:
+                per_iter_names = list(for_env._bindings.keys())
+        V = undefined
+
+        # Per-spec ForBodyEvaluation: CreatePerIterationEnvironment before first test
+        if per_iter_names is not None:
+            iter_env = Environment(parent=env)
+            for _name in per_iter_names:
+                iter_env.define_let(_name, for_env._bindings[_name])
+        else:
+            iter_env = for_env
+
         while True:
-            if node.test and not js_is_truthy(self.eval(node.test, for_env)):
+            if node.test and not js_is_truthy(self.eval(node.test, iter_env)):
                 break
-            # For let/const, create a fresh per-iteration scope with a copy of bindings
-            if init_is_lexical:
-                iter_env = Environment(parent=env)
-                # Copy the let/const bindings from for_env into iter_env
-                for decl in node.init.declarations:
-                    name = decl.id.name if type(decl.id).__name__ == 'Identifier' else None
-                    if name:
-                        iter_env.define_let(name, for_env.get(name))
-            else:
-                iter_env = for_env
             try:
-                self.exec(node.body, iter_env)
+                v = self.exec(node.body, iter_env)
+                if v is not None and v is not _EMPTY:
+                    V = v
             except _BreakSignal as e:
-                if e.label is None:
+                if e.label is None or e.label == label:
+                    if e.value is not None:
+                        V = e.value
                     break
                 raise
             except _ContinueSignal as e:
-                if e.label is None:
-                    pass  # continue to update
-                else:
+                if e.label is not None and e.label != label:
                     raise
-            # Copy back mutated bindings from iter_env to for_env (update step needs them)
-            if init_is_lexical:
-                for decl in node.init.declarations:
-                    name = decl.id.name if type(decl.id).__name__ == 'Identifier' else None
-                    if name:
-                        try:
-                            for_env.set(name, iter_env.get(name))
-                        except Exception:
-                            pass
+                # UpdateEmpty: carry completion value from continue
+                if e.value is not None:
+                    V = e.value
+                # continue to update
+            # CreatePerIterationEnvironment: copy bindings to new env
+            if per_iter_names is not None:
+                new_iter_env = Environment(parent=env)
+                for _name in per_iter_names:
+                    new_iter_env.define_let(_name, iter_env._bindings[_name])
+                iter_env = new_iter_env
             if node.update:
-                self.eval(node.update, for_env)
-        return undefined
+                self.eval(node.update, iter_env)
+        return V
 
-    def _exec_for_in(self, node: ForInStatement, env: Environment) -> Any:
-        obj = self.eval(node.right, env)
+    def _exec_for_in(self, node: ForInStatement, env: Environment, label: str | None = None) -> Any:
+        # Per spec 14.7.5.4: if for-in has let/const declaration, create TDZ scope
+        # before evaluating the right-hand side expression.
+        eval_env = env
+        if type(node.left).__name__ == 'VariableDeclaration' and node.left.kind in ('let', 'const'):
+            tdz_env = Environment(parent=env)
+            for decl in node.left.declarations:
+                self._hoist_let_pattern(decl.id, tdz_env, node.left.kind)
+            eval_env = tdz_env
+
+        obj = self.eval(node.right, eval_env)
         if obj is null or obj is undefined:
             return undefined
 
@@ -1903,29 +4294,28 @@ class Interpreter:
 
         if isinstance(obj, JSObject):
             # Handle Proxy objects (lazy iteration via traps)
-            if obj._proxy_ownKeys is not None:
-                raw_keys = obj._proxy_ownKeys()
+            if _is_proxy(obj):
+                raw_keys = _proxy_ownkeys_trap(obj)
                 for_env = Environment(parent=env)
                 for k in raw_keys:
                     if not isinstance(k, str) or k.startswith('@@'):
                         continue
-                    # Check getOwnPropertyDescriptor trap lazily (after each body exec)
-                    if obj._proxy_getOwnPropDesc is not None:
-                        desc = obj._proxy_getOwnPropDesc(k)
-                        if desc is undefined or desc is None:
+                    # Check getOwnPropertyDescriptor trap for enumerability
+                    desc_result = _proxy_get_own_prop_desc_trap(obj, k)
+                    if desc_result is undefined or desc_result is None:
+                        continue
+                    if isinstance(desc_result, JSObject):
+                        if not js_is_truthy(desc_result.props.get('enumerable', False)):
                             continue
-                        if isinstance(desc, JSObject):
-                            if not js_is_truthy(desc.props.get('enumerable', False)):
-                                continue
                     try:
                         self._assign_for_iter_var(node.left, k, for_env, env)
                         self.exec(node.body, for_env)
                     except _BreakSignal as e:
-                        if e.label is None:
+                        if e.label is None or e.label == label:
                             return undefined
                         raise
                     except _ContinueSignal as e:
-                        if e.label is None:
+                        if e.label is None or e.label == label:
                             continue
                         raise
                 return undefined
@@ -1934,7 +4324,13 @@ class Interpreter:
                 while o is not None:
                     layer_int: list[str] = []
                     layer_str: list[str] = []
-                    for k in list(o.props.keys()):
+                    # Collect all own keys from both props and descriptors
+                    all_own = list(o.props.keys())
+                    if o._descriptors:
+                        for k in o._descriptors:
+                            if k not in o.props:
+                                all_own.append(k)
+                    for k in all_own:
                         if k.startswith('@@'):
                             continue
                         if k in seen or k in non_enum:
@@ -1964,47 +4360,123 @@ class Interpreter:
                     o = o.proto
 
         for_env = Environment(parent=env)
+        V = undefined
         for key in keys:
+            # Per spec: if a property was deleted during enumeration, skip it
+            if isinstance(obj, JSObject) and not _is_proxy(obj):
+                if not _obj_has_property(obj, key):
+                    continue
+            # Per-iteration scope: let/const require new binding each iteration
+            if type(node.left).__name__ == 'VariableDeclaration' and node.left.kind in ('let', 'const'):
+                for_env = Environment(parent=env)
             try:
                 self._assign_for_iter_var(node.left, key, for_env, env)
-                self.exec(node.body, for_env)
+                v = self.exec(node.body, for_env)
+                if v is not None and v is not _EMPTY:
+                    V = v
             except _BreakSignal as e:
-                if e.label is None:
+                if e.label is None or e.label == label:
+                    if e.value is not None:
+                        V = e.value
                     break
                 raise
             except _ContinueSignal as e:
-                if e.label is None:
+                if e.label is None or e.label == label:
+                    if e.value is not None:
+                        V = e.value
                     continue
                 raise
-        return undefined
+        return V
 
-    def _exec_for_of(self, node: ForOfStatement, env: Environment) -> Any:
-        iterable = self.eval(node.right, env)
+    def _exec_for_of(self, node: ForOfStatement, env: Environment, label: str | None = None) -> Any:
+        # Per spec 14.7.5.4: if for-of has let/const declaration, create TDZ scope
+        # before evaluating the right-hand side expression.
+        eval_env = env
+        if type(node.left).__name__ == 'VariableDeclaration' and node.left.kind in ('let', 'const'):
+            tdz_env = Environment(parent=env)
+            for decl in node.left.declarations:
+                self._hoist_let_pattern(decl.id, tdz_env, node.left.kind)
+            eval_env = tdz_env
+
+        iterable = self.eval(node.right, eval_env)
         iterator = _get_iterator(iterable, self)
         for_env = Environment(parent=env)
-        while True:
-            value, done = _iterate_to_next(iterator)
-            if done:
-                break
-            try:
-                self._assign_for_iter_var(node.left, value, for_env, env)
-                self.exec(node.body, for_env)
-            except _BreakSignal as e:
-                if e.label is None:
+        _per_iter = (type(node.left).__name__ == 'VariableDeclaration' and
+                     node.left.kind in ('let', 'const'))
+        V = undefined
+        iterating = False  # True once we've entered the iteration loop
+        try:
+            while True:
+                value, done = _iterate_to_next(iterator)
+                if done:
                     break
-                raise
-            except _ContinueSignal as e:
-                if e.label is None:
-                    continue
-                raise
-        return undefined
+                iterating = True
+                if _per_iter:
+                    for_env = Environment(parent=env)
+                try:
+                    self._assign_for_iter_var(node.left, value, for_env, env)
+                    v = self.exec(node.body, for_env)
+                    if v is not None and v is not _EMPTY:
+                        V = v
+                except _BreakSignal as e:
+                    if e.label is None or e.label == label:
+                        if e.value is not None:
+                            V = e.value
+                        self._close_iterator(iterator)
+                        return V
+                    self._close_iterator(iterator)
+                    raise
+                except _ContinueSignal as e:
+                    if e.label is None or e.label == label:
+                        if e.value is not None:
+                            V = e.value
+                        continue
+                    self._close_iterator(iterator)
+                    raise
+        except (_BreakSignal, _ContinueSignal):
+            raise
+        except _ThrowSignal:
+            if iterating:
+                self._close_iterator_suppress(iterator)
+            raise
+        except Exception:
+            if iterating:
+                self._close_iterator_suppress(iterator)
+            raise
+        return V
+
+    def _close_iterator(self, iterator) -> None:
+        """Call iterator.return() if it exists (IteratorClose)."""
+        try:
+            ret_fn = _obj_get_property(iterator, 'return')
+            if ret_fn is not undefined and ret_fn is not null:
+                _call_value(ret_fn, iterator, [])
+        except Exception:
+            pass
+
+    def _close_iterator_suppress(self, iterator) -> None:
+        """Call iterator.return() while suppressing any error it throws."""
+        try:
+            ret_fn = _obj_get_property(iterator, 'return')
+            if ret_fn is not undefined and ret_fn is not null:
+                _call_value(ret_fn, iterator, [])
+        except Exception:
+            pass
 
     def _assign_for_iter_var(self, left, value, for_env: Environment, outer_env: Environment) -> None:
         """Assign the loop variable for for-in/for-of."""
         t = type(left).__name__
         if t == 'VariableDeclaration':
             decl = left.declarations[0]
-            self._bind_pattern(decl.id, value, for_env, left.kind)
+            kind = left.kind
+            pat = decl.id
+            pat_t = type(pat).__name__
+            if kind == 'var' and pat_t == 'Identifier':
+                # Use assign_var (not define_var) so that undefined is always written,
+                # even if the variable was previously bound to another value.
+                for_env.assign_var(pat.name, value)
+            else:
+                self._bind_pattern(pat, value, for_env, kind)
         elif t == 'Identifier':
             try:
                 outer_env.set(left.name, value)
@@ -2014,91 +4486,194 @@ class Interpreter:
             # e.g. for(a.x in obj)
             obj = self.eval(left.object, outer_env)
             if left.computed:
-                key = js_to_string(self.eval(left.property, outer_env))
+                key = _to_property_key(self.eval(left.property, outer_env))
             else:
                 key = left.property.name
-            self._set_property(obj, key, value)
+            self._set_property(obj, key, value, outer_env._is_strict())
+        elif t in ('ArrayExpression', 'ObjectExpression', 'ArrayPattern', 'ObjectPattern'):
+            # Destructuring assignment: for ([x, y] of ...) or for ({a, b} of ...)
+            self._assign_to(left, value, outer_env)
         else:
             self._bind_pattern(left, value, for_env, 'var')
 
     def _exec_labeled(self, node: LabeledStatement, env: Environment) -> Any:
         label = node.label.name
+        body_type = type(node.body).__name__
+        # For iteration statements, pass the label so the loop can catch it directly
+        if body_type == 'WhileStatement':
+            return self._exec_while(node.body, env, label=label)
+        if body_type == 'DoWhileStatement':
+            return self._exec_do_while(node.body, env, label=label)
+        if body_type == 'ForStatement':
+            return self._exec_for(node.body, env, label=label)
+        if body_type == 'ForInStatement':
+            return self._exec_for_in(node.body, env, label=label)
+        if body_type == 'ForOfStatement':
+            return self._exec_for_of(node.body, env, label=label)
+        # For non-loop statements, handle break only
         try:
             return self.exec(node.body, env)
         except _BreakSignal as e:
             if e.label == label:
-                return undefined
-            raise
-        except _ContinueSignal as e:
-            if e.label == label:
-                # Re-raise without label to be caught by the loop
-                raise _ContinueSignal(None)
+                return e.value if e.value is not None else undefined
             raise
 
     def _exec_switch(self, node: SwitchStatement, env: Environment) -> Any:
         discriminant = self.eval(node.discriminant, env)
         switch_env = Environment(parent=env)
 
-        found = False
-        default_case = None
+        # Hoist declarations within switch cases into switch_env
+        for case in node.cases:
+            self._hoist_declarations(case.consequent, switch_env, is_block=True)
+
+        # Find default case index
+        default_idx = None
+        for i, case in enumerate(node.cases):
+            if case.test is None:
+                default_idx = i
+                break
+
+        V = undefined
         try:
-            for case in node.cases:
-                if case.test is None:
-                    default_case = case
-                    if not found:
-                        continue
-                if not found:
+            # Phase 1: scan cases A (before default, or all cases if no default)
+            # looking for a matching case
+            match_idx = None
+            scan_end = default_idx if default_idx is not None else len(node.cases)
+            for i in range(scan_end):
+                case = node.cases[i]
+                if case.test is not None:
                     test_val = self.eval(case.test, switch_env)
                     if js_strict_equal(discriminant, test_val):
-                        found = True
-                if found:
-                    for stmt in case.consequent:
-                        self.exec(stmt, switch_env)
-            if not found and default_case is not None:
-                for stmt in default_case.consequent:
-                    self.exec(stmt, switch_env)
+                        match_idx = i
+                        break
+
+            if match_idx is None and default_idx is not None:
+                # Phase 2: scan cases B (after default) if no match yet
+                for i in range(default_idx + 1, len(node.cases)):
+                    case = node.cases[i]
+                    if case.test is not None:
+                        test_val = self.eval(case.test, switch_env)
+                        if js_strict_equal(discriminant, test_val):
+                            match_idx = i
+                            break
+
+            # Determine execution start point
+            if match_idx is not None:
+                start_idx = match_idx
+            elif default_idx is not None:
+                start_idx = default_idx
+            else:
+                return V  # No match, no default
+
+            # Phase 3: execute from start_idx, falling through subsequent cases
+            for i in range(start_idx, len(node.cases)):
+                for stmt in node.cases[i].consequent:
+                    v = self.exec(stmt, switch_env)
+                    if v is not None and v is not _EMPTY:
+                        V = v
+
         except _BreakSignal as e:
             if e.label is None:
-                return undefined
+                # Unlabeled break: consume it, return UpdateEmpty(V)
+                if e.value is not None and e.value is not _EMPTY:
+                    V = e.value
+                return V
+            # Labeled break: apply UpdateEmpty and re-raise
+            if e.value is None or e.value is _EMPTY:
+                e.value = V
             raise
-        return undefined
+        except (_ContinueSignal, _ThrowSignal) as e:
+            # Apply UpdateEmpty(R, V) before propagating
+            if hasattr(e, 'value') and (e.value is None or e.value is _EMPTY):
+                e.value = V
+            raise
+        return V
 
     def _exec_try(self, node: TryStatement, env: Environment) -> Any:
+        # TryStatement evaluation per spec:
+        # 1. Evaluate block (B). If throw and handler, evaluate catch (C). Else C=B.
+        # 2. Evaluate finally (F). If F normal, return UpdateEmpty(C, undefined).
+        #    Else return UpdateEmpty(F, undefined) — finally's abrupt supersedes C.
+
+        # Accumulate the "current" completion:
+        # For normal: (None, value) where value is the result
+        # For abrupt: ('signal', signal_exception)
+        current_type = 'normal'
+        current_value = undefined
+        current_signal = None
+
         try:
-            self._exec_block(node.block, env)
+            current_value = self._exec_block(node.block, env)
         except _ThrowSignal as e:
             if node.handler:
                 catch_env = Environment(parent=env)
                 if node.handler.param:
                     self._bind_pattern(node.handler.param, e.js_value, catch_env, 'let')
                 try:
-                    self._exec_block(node.handler.body, catch_env, new_scope=False)
-                finally:
-                    if node.finalizer:
-                        self._exec_block(node.finalizer, env)
+                    current_value = self._exec_block(node.handler.body, catch_env, new_scope=True)
+                except (_ThrowSignal, _ReturnSignal, _BreakSignal, _ContinueSignal) as ce:
+                    current_type = 'abrupt'
+                    current_signal = ce
             else:
-                if node.finalizer:
-                    self._exec_block(node.finalizer, env)
-                raise
+                current_type = 'abrupt'
+                current_signal = e
         except (_ReturnSignal, _BreakSignal, _ContinueSignal) as e:
-            if node.finalizer:
-                self._exec_block(node.finalizer, env)
-            raise
-        else:
-            if node.finalizer:
-                self._exec_block(node.finalizer, env)
-        return undefined
+            current_type = 'abrupt'
+            current_signal = e
+
+        if not node.finalizer:
+            if current_type == 'abrupt':
+                raise current_signal
+            # UpdateEmpty(C, undefined): if completion value is empty, return undefined
+            return undefined if current_value is _EMPTY else current_value
+
+        # Run the finalizer
+        finally_type = 'normal'
+        finally_value = undefined
+        finally_signal = None
+        try:
+            finally_value = self._exec_block(node.finalizer, env)
+        except (_ThrowSignal, _ReturnSignal, _BreakSignal, _ContinueSignal) as fe:
+            finally_type = 'abrupt'
+            finally_signal = fe
+
+        if finally_type == 'abrupt':
+            # Spec: return UpdateEmpty(F, undefined)
+            if hasattr(finally_signal, 'value') and finally_signal.value is None:
+                finally_signal.value = undefined
+            raise finally_signal
+
+        # Finally was normal: return UpdateEmpty(C, undefined)
+        if current_type == 'abrupt':
+            if hasattr(current_signal, 'value') and current_signal.value is None:
+                current_signal.value = undefined
+            raise current_signal
+
+        # UpdateEmpty(C, undefined)
+        return undefined if current_value is _EMPTY else current_value
 
     def _exec_class_decl(self, node: ClassDeclaration, env: Environment) -> Any:
         cls = self._eval_class(node.id, node.super_class, node.body, env)
         if node.id:
             env.define_let(node.id.name, cls)
-        return undefined
+        return _EMPTY  # ClassDeclaration has empty completion per spec
 
     def _exec_with(self, node: WithStatement, env: Environment) -> Any:
         obj = self.eval(node.object, env)
+        # Spec 14.11.2: Let val be ? ToObject(? GetValue(obj))
+        if obj is undefined or obj is null:
+            raise _ThrowSignal(make_error('TypeError',
+                f'Cannot convert {"undefined" if obj is undefined else "null"} to object'))
         with_env = Environment(parent=env, with_obj=obj)
-        return self.exec(node.body, with_env)
+        try:
+            result = self.exec(node.body, with_env)
+        except (_BreakSignal, _ContinueSignal) as e:
+            # UpdateEmpty on abrupt completion: replace None/empty value with undefined
+            if e.value is None or e.value is _EMPTY:
+                e.value = undefined
+            raise
+        # UpdateEmpty per spec 14.11.2
+        return undefined if result is _EMPTY else result
 
     # ---- Module system ----
 
@@ -2315,8 +4890,26 @@ class Interpreter:
         return v
 
     def _make_regexp(self, pattern: str, flags: str) -> JSObject:
+        # Validate flags first: only valid chars, no duplicates
+        _valid_re_flags = 'dgimsuyv'
+        _seen_flags = set()
+        for _fc in flags:
+            if _fc not in _valid_re_flags or _fc in _seen_flags:
+                raise _ThrowSignal(make_error('SyntaxError',
+                    f"Invalid regular expression flags: {flags}"))
+            _seen_flags.add(_fc)
+        if 'u' in _seen_flags and 'v' in _seen_flags:
+            raise _ThrowSignal(make_error('SyntaxError',
+                f"Invalid regular expression flags: u and v are mutually exclusive"))
         obj = JSObject(class_name='RegExp', proto=_PROTOS.get('RegExp'))
         obj._regex_flags = flags
+        # Validate pattern for early errors (duplicate groups, invalid backrefs, etc.)
+        try:
+            from pyquickjs.parser import _check_re_pattern
+            _check_re_pattern(pattern, u_flag='u' in flags)
+        except ValueError as exc:
+            raise _ThrowSignal(make_error('SyntaxError',
+                f"Invalid regular expression: /{pattern}/{flags}: {exc}"))
         # Convert JS regex flags to Python
         py_flags = _re_mod.IGNORECASE if 'i' in flags else 0
         if 'm' in flags:
@@ -2325,29 +4918,39 @@ class Interpreter:
             py_flags |= _re_mod.DOTALL
         use_v = 'v' in flags
         use_i = 'i' in flags
+        use_s = 's' in flags
         # Convert JS regex features to Python
-        py_pattern = _js_regex_to_python(pattern, v_flag=use_v, i_flag=use_i)
+        py_pattern, dup_group_info = _js_regex_to_python(pattern, v_flag=use_v, i_flag=use_i, s_flag=use_s, u_flag='u' in flags)
         try:
             if use_v:
                 # VERSION1 enables set operations [a&&b], [a--b] in regex module
                 obj._regex = _re_mod.compile(py_pattern, py_flags | _re_mod.VERSION1)
             else:
                 obj._regex = _re_mod.compile(py_pattern, py_flags)
-        except Exception:
-            obj._regex = None
+        except Exception as exc:
+            raise _ThrowSignal(make_error('SyntaxError',
+                f"Invalid regular expression: /{pattern}/{flags}: {exc}"))
+        obj._dup_group_info = dup_group_info
         obj.props['source'] = pattern
         obj.props['flags'] = flags
-        obj.props['global'] = 'g' in flags
-        obj.props['ignoreCase'] = 'i' in flags
-        obj.props['multiline'] = 'm' in flags
         obj.props['lastIndex'] = 0
+        # lastIndex: writable, non-enumerable, non-configurable
+        if obj._descriptors is None:
+            obj._descriptors = {}
+        obj._descriptors['lastIndex'] = {'value': 0, 'writable': True, 'enumerable': False, 'configurable': False}
+        # source and flags should also be non-enumerable
+        obj._descriptors['source'] = {'value': pattern, 'writable': False, 'enumerable': False, 'configurable': True}
+        obj._descriptors['flags'] = {'value': flags, 'writable': False, 'enumerable': False, 'configurable': True}
         return obj
 
     def _eval_array_expr(self, node: ArrayExpression, env: Environment) -> JSObject:
+        from pyquickjs.parser import _TRAILING_COMMA_AFTER_SPREAD
         items = []
         for elem in node.elements:
+            if elem is _TRAILING_COMMA_AFTER_SPREAD:
+                continue  # skip trailing comma sentinel
             if elem is None:
-                items.append(undefined)
+                items.append(_HOLE)  # elision — not an own property
             elif type(elem).__name__ == 'SpreadElement':
                 spread_val = self.eval(elem.argument, env)
                 if isinstance(spread_val, JSObject) and spread_val._is_array:
@@ -2364,6 +4967,8 @@ class Interpreter:
                                 break
                             items.append(v)
                     except _ThrowSignal:
+                        raise
+                    except Exception:
                         items.append(spread_val)
             else:
                 items.append(self.eval(elem, env))
@@ -2378,16 +4983,54 @@ class Interpreter:
                     # { ...expr }
                     spread = self.eval(prop.value.argument, env)
                     if isinstance(spread, JSObject):
-                        for k, v in spread.props.items():
-                            if not k.startswith('@@'):
-                                obj.props[k] = v
+                        # Collect all own enumerable property keys
+                        all_keys = []
+                        for k in spread.props:
+                            if k.startswith('@@') and not k.startswith('@@sym_'):
+                                continue
+                            all_keys.append(k)
+                        if spread._descriptors:
+                            for k in spread._descriptors:
+                                if k.startswith('@@') and not k.startswith('@@sym_'):
+                                    continue
+                                if k not in spread.props:
+                                    all_keys.append(k)
+                        # OrdinaryOwnPropertyKeys: integer indices, string keys, symbol keys
+                        indices = []
+                        strings = []
+                        symbols = []
+                        for k in all_keys:
+                            if k.startswith('@@sym_'):
+                                symbols.append(k)
+                            else:
+                                try:
+                                    idx = int(k)
+                                    if idx >= 0 and str(idx) == k:
+                                        indices.append((idx, k))
+                                        continue
+                                except (ValueError, OverflowError):
+                                    pass
+                                strings.append(k)
+                        indices.sort(key=lambda x: x[0])
+                        all_keys = [k for _, k in indices] + strings + symbols
+                        for k in all_keys:
+                            # Skip non-enumerable properties
+                            if spread._descriptors:
+                                desc = spread._descriptors.get(k)
+                                if desc and not desc.get('enumerable', True):
+                                    continue
+                            # Use _obj_get_property to invoke getters
+                            v = _obj_get_property(spread, k)
+                            obj.props[k] = v
                     continue
 
                 key = self._eval_property_key(prop.key, prop.computed, env)
-                key_str = js_to_string(key)
+                key_str = _to_property_key(key)
 
                 if prop.kind == 'get':
                     fn = self._make_function(prop.value, env)
+                    fn.home_obj = obj
+                    _set_function_name(fn, 'get ' + key_str)
                     if obj._descriptors is None:
                         obj._descriptors = {}
                     existing = obj._descriptors.get(key_str, {})
@@ -2395,8 +5038,13 @@ class Interpreter:
                     existing.setdefault('enumerable', True)
                     existing.setdefault('configurable', True)
                     obj._descriptors[key_str] = existing
+                    # Ensure key is in props for insertion-order tracking
+                    if key_str not in obj.props:
+                        obj.props[key_str] = undefined
                 elif prop.kind == 'set':
                     fn = self._make_function(prop.value, env)
+                    fn.home_obj = obj
+                    _set_function_name(fn, 'set ' + key_str)
                     if obj._descriptors is None:
                         obj._descriptors = {}
                     existing = obj._descriptors.get(key_str, {})
@@ -2404,11 +5052,21 @@ class Interpreter:
                     existing.setdefault('enumerable', True)
                     existing.setdefault('configurable', True)
                     obj._descriptors[key_str] = existing
+                    # Ensure key is in props for insertion-order tracking
+                    if key_str not in obj.props:
+                        obj.props[key_str] = undefined
                 else:
                     val = self.eval(prop.value, env)
                     if isinstance(val, JSFunction) and prop.method:
                         val.home_obj = obj
-                    obj.props[key_str] = val
+                    # ES2015+ SetFunctionName for property initializers and methods
+                    _set_function_name(val, key_str)
+                    # __proto__: val (non-computed, non-shorthand) sets prototype, not own property
+                    if key_str == '__proto__' and not prop.computed and not prop.shorthand:
+                        if isinstance(val, JSObject) or val is null:
+                            obj.proto = val if val is not null else None
+                    else:
+                        obj.props[key_str] = val
         return obj
 
     def _eval_unary(self, node: UnaryExpression, env: Environment) -> Any:
@@ -2419,10 +5077,17 @@ class Interpreter:
 
         if op == 'typeof':
             # typeof on undefined variable should return 'undefined', not throw
+            # BUT typeof on TDZ variable (let/const before init) MUST throw ReferenceError
             if type(node.argument).__name__ == 'Identifier':
                 try:
                     val = env.get(node.argument.name)
-                except _ThrowSignal:
+                except _ThrowSignal as ts:
+                    err = ts.args[0] if ts.args else None
+                    msg = ''
+                    if isinstance(err, JSObject):
+                        msg = err.props.get('message', '')
+                    if 'before initialization' in str(msg):
+                        raise  # TDZ — re-throw ReferenceError
                     return 'undefined'
             else:
                 val = self.eval(node.argument, env)
@@ -2440,18 +5105,29 @@ class Interpreter:
         if op == '!':
             return not js_is_truthy(val)
         if op == '-':
+            # ToNumeric: unwrap BigInt objects
+            if isinstance(val, JSObject):
+                val = js_to_primitive(val, 'number')
             if isinstance(val, JSBigInt):
                 return JSBigInt(-val.value)
             n = js_to_number(val)
             if isinstance(n, int):
+                if n == 0:
+                    return -0.0  # -0 must be float negative zero
                 return -n
             return -n
         if op == '+':
+            # ToNumeric: unwrap BigInt objects first
+            if isinstance(val, JSObject):
+                val = js_to_primitive(val, 'number')
             if isinstance(val, JSBigInt):
                 raise _ThrowSignal(make_error('TypeError',
                     'Cannot convert a BigInt value to a number'))
             return js_to_number(val)
         if op == '~':
+            # ToNumeric: unwrap BigInt objects
+            if isinstance(val, JSObject):
+                val = js_to_primitive(val, 'number')
             if isinstance(val, JSBigInt):
                 return JSBigInt(~val.value)
             return ~js_to_int32(val)
@@ -2477,6 +5153,12 @@ class Interpreter:
 
     def _eval_delete(self, node, env: Environment) -> bool:
         t = type(node).__name__
+        if t == 'ChainExpression':
+            # delete a?.b — unwrap, but catch short-circuit
+            try:
+                return self._eval_delete(node.expression, env)
+            except _OptionalChainShortCircuit:
+                return True
         if t == 'MemberExpression':
             # delete super.x is always a ReferenceError
             if type(node.object).__name__ == 'Super':
@@ -2488,22 +5170,76 @@ class Interpreter:
                 if self._has_optional_in_chain(node.object):
                     return True
                 if node.computed:
-                    _dkey = js_to_string(self.eval(node.property, env))
+                    _dkey = _to_property_key(self.eval(node.property, env))
                 else:
                     _dkey = node.property.name
                 raise _ThrowSignal(make_error('TypeError',
                     f"cannot read property '{_dkey}' of {'null' if obj is null else 'undefined'}"))
             if node.computed:
-                key = js_to_string(self.eval(node.property, env))
+                key = _to_property_key(self.eval(node.property, env))
             else:
                 key = node.property.name
+            if isinstance(obj, JSFunction):
+                # Handle deletion of JSFunction virtual own properties
+                if key in ('length', 'name'):
+                    # These are configurable, so mark as deleted
+                    if obj._descriptors is None:
+                        obj._descriptors = {}
+                    obj._descriptors[key] = {'_deleted': True}
+                    return True
+                if key == 'prototype':
+                    # prototype is non-configurable, cannot delete
+                    if env._is_strict():
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"Cannot delete property '{key}' of function"))
+                    return False
+                # For static props
+                if obj._static_props and key in obj._static_props:
+                    del obj._static_props[key]
+                return True
             if isinstance(obj, JSObject):
-                return _obj_delete_property(obj, key)
+                deleted = _obj_delete_property(obj, key)
+                if not deleted and env._is_strict():
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"Cannot delete property '{key}' of object"))
+                return deleted
             return True
         if t == 'Identifier':
+            # In strict mode, delete of a binding name is a SyntaxError
+            if env._is_strict():
+                raise _ThrowSignal(make_error('SyntaxError',
+                    f'Delete of an unqualified identifier in strict mode.'))
             # In sloppy mode, delete on var/function is false; on undeclared is true.
             # For configurable global properties, delete is allowed.
             name = node.name
+            # Check with-object scope chain first — properties on with-objects
+            # are deletable (they are object properties, not bindings).
+            scope = env
+            while scope is not None:
+                if scope._with_obj is not None:
+                    obj = scope._with_obj
+                    if isinstance(obj, JSObject) and _obj_has_property(obj, name):
+                        if not _with_is_unscopable(obj, name):
+                            return _obj_delete_property(obj, name)
+                if name in scope._bindings:
+                    # At global scope, check globalThis for configurable properties
+                    if scope._parent is None and 'globalThis' in scope._bindings:
+                        global_obj = scope._bindings['globalThis']
+                        if isinstance(global_obj, JSObject) and global_obj._descriptors and name in global_obj._descriptors:
+                            desc = global_obj._descriptors[name]
+                            if desc.get('configurable', False):
+                                # Configurable global property — delete it
+                                del global_obj._descriptors[name]
+                                if name in global_obj.props:
+                                    del global_obj.props[name]
+                                if name in scope._bindings:
+                                    del scope._bindings[name]
+                                return True
+                    # Found as a real binding — non-deletable
+                    return False
+                scope = scope._parent
+            # Check globalThis for dynamically added properties (e.g. via
+            # Object.defineProperty(this, ...) or this.x = ...).
             global_env = env.get_global()
             if global_env is not None and 'globalThis' in global_env._bindings:
                 global_obj = global_env._bindings['globalThis']
@@ -2515,29 +5251,140 @@ class Interpreter:
                         del global_obj._descriptors[name]
                         if name in global_obj.props:
                             del global_obj.props[name]
-                        if name in global_env._bindings:
-                            del global_env._bindings[name]
                         return True
                     elif desc is not None:
-                        return False  # non-configurable
-            return False
+                        return False  # non-configurable global property
+                    # Check props — configurable by default
+                    if name in global_obj.props:
+                        del global_obj.props[name]
+                        return True
+            # Unresolvable reference → delete returns true
+            return True
+        # For any other expression (call, new, literal, etc.) evaluate it
+        # for side effects and return true (non-reference → delete returns true).
+        self.eval(node, env)
         return True
 
     def _eval_update(self, node: UpdateExpression, env: Environment) -> Any:
         if node.line:
             self._current_line = node.line
             self._current_col = node.col
-        old_val = self._get_ref(node.argument, env)
-        n = js_to_number(old_val)
+
+        # For MemberExpression, evaluate object and key once to avoid double evaluation
+        arg = node.argument
+        cached_obj = None
+        cached_key = None
+        cached_is_private = False
+        with_ref = None  # captured with-object for PutValue
+        if type(arg).__name__ == 'MemberExpression':
+            cached_obj = self.eval(arg.object, env)
+            if isinstance(arg.property, PrivateIdentifier):
+                cached_key = arg.property.name
+                cached_is_private = True
+                old_val = self._get_private_field(cached_obj, cached_key, env)
+            elif arg.computed:
+                # Per spec: for super[expr]++, GetThisBinding() before key eval
+                if type(arg.object).__name__ == 'Super':
+                    env.get('this')
+                key_val = self.eval(arg.property, env)
+                # Per spec: ToObject(base) before ToPropertyKey(key), so
+                # null/undefined base throws TypeError without toString on key
+                if cached_obj is null or cached_obj is undefined:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"cannot read properties of {'null' if cached_obj is null else 'undefined'}"))
+                cached_key = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else js_to_string(key_val)
+                old_val = self._get_property(cached_obj, cached_key)
+            else:
+                cached_key = arg.property.name
+                old_val = self._get_property(cached_obj, cached_key)
+        elif type(arg).__name__ == 'Identifier':
+            # Resolve identifier and capture with-object if relevant
+            old_val, with_ref = self._resolve_ref_with(arg.name, env)
+        else:
+            old_val = self._get_ref(arg, env)
+
+        # ToNumeric: unwrap BigInt objects
         if isinstance(old_val, JSBigInt):
-            n = old_val.value
-            new_val = JSBigInt(n + (1 if node.operator == '++' else -1))
+            n = old_val
+        elif isinstance(old_val, JSObject):
+            prim = js_to_primitive(old_val, 'number')
+            n = prim if isinstance(prim, JSBigInt) else js_to_number(prim)
+        elif isinstance(old_val, JSSymbol):
+            raise _ThrowSignal(make_error('TypeError', 'Cannot convert a Symbol value to a number'))
+        else:
+            n = js_to_number(old_val)
+        if isinstance(n, JSBigInt):
+            new_val = JSBigInt(n.value + (1 if node.operator == '++' else -1))
         else:
             new_val = n + (1 if node.operator == '++' else -1)
             if isinstance(n, int):
                 new_val = int(new_val)
-        self._set_ref(node.argument, new_val, env)
+
+        if cached_obj is not None:
+            if cached_is_private:
+                self._set_private_field(cached_obj, cached_key, new_val, env)
+            else:
+                self._set_property(cached_obj, cached_key, new_val, env._is_strict())
+        elif with_ref is not None:
+            # PutValue / SetMutableBinding for Object Environment Records:
+            # Per spec §9.1.1.2.5: check HasProperty first; throw ReferenceError
+            # if property was deleted and strict mode is active
+            if env._is_strict() and not _obj_has_property(with_ref, arg.name):
+                raise _ThrowSignal(make_error('ReferenceError',
+                    f"'{arg.name}' is not defined"))
+            _obj_set_property(with_ref, arg.name, new_val, env._is_strict())
+        else:
+            self._set_ref(arg, new_val, env)
         return n if not node.prefix else new_val
+
+    def _find_with_ref(self, name: str, env: Environment):
+        """Find the with-object if the identifier resolves through a with-scope.
+        Returns the with-object or None."""
+        scope = env
+        while scope is not None:
+            if scope._with_obj is not None:
+                obj = scope._with_obj
+                if isinstance(obj, JSObject) and _obj_has_property(obj, name):
+                    if not _with_is_unscopable(obj, name):
+                        return obj
+            if name in scope._bindings:
+                return None
+            if scope._parent is None and 'globalThis' in scope._bindings:
+                global_obj = scope._bindings.get('globalThis')
+                if isinstance(global_obj, JSObject) and (name in global_obj.props or (global_obj._descriptors and name in global_obj._descriptors)):
+                    return None
+            scope = scope._parent
+        return None
+
+    def _resolve_ref_with(self, name: str, env: Environment):
+        """Resolve an identifier and capture the with-object if resolved through one.
+        Returns (value, with_obj_or_None)."""
+        scope = env
+        while scope is not None:
+            if scope._with_obj is not None:
+                obj = scope._with_obj
+                if isinstance(obj, JSObject) and _obj_has_property(obj, name):
+                    if not _with_is_unscopable(obj, name):
+                        return _obj_get_property(obj, name), obj
+            if name in scope._bindings:
+                val = scope._bindings[name]
+                if val is _SENTINEL:
+                    raise _ThrowSignal(make_error('ReferenceError',
+                        f"Cannot access '{name}' before initialization"))
+                # At global scope, check globalThis descriptors (getters)
+                if scope._parent is None and 'globalThis' in scope._bindings:
+                    global_obj = scope._bindings.get('globalThis')
+                    if isinstance(global_obj, JSObject) and global_obj._descriptors and name in global_obj._descriptors:
+                        return _obj_get_property(global_obj, name), None
+                return val, None
+            # At global scope, check globalThis for properties not in _bindings
+            if scope._parent is None and 'globalThis' in scope._bindings:
+                global_obj = scope._bindings.get('globalThis')
+                if isinstance(global_obj, JSObject) and (name in global_obj.props or (global_obj._descriptors and name in global_obj._descriptors)):
+                    return _obj_get_property(global_obj, name), None
+            scope = scope._parent
+        raise _ThrowSignal(make_error('ReferenceError',
+            f"'{name}' is not defined"))
 
     def _get_ref(self, node, env: Environment) -> Any:
         return self.eval(node, env)
@@ -2553,68 +5400,198 @@ class Interpreter:
                 key = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else js_to_string(key_val)
             else:
                 key = node.property.name
-            self._set_property(obj, key, value)
+            self._set_property(obj, key, value, env._is_strict())
         else:
             raise _ThrowSignal(make_error('SyntaxError',
                 'Invalid left-hand side in assignment'))
 
-    def _set_property(self, obj, key: str, value) -> None:
+    def _set_property(self, obj, key: str, value, strict: bool = False) -> None:
         if isinstance(obj, JSFunction):
+            # Poison pills: strict mode functions throw on .caller and .arguments
+            # Bound functions: let prototype chain handle it
+            if key in ('caller', 'arguments') and not obj.is_arrow and obj._bound_target is None and _fn_is_strict(obj):
+                raise _ThrowSignal(make_error('TypeError',
+                    "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"))
+            if obj._descriptors and key in obj._descriptors:
+                desc = obj._descriptors[key]
+                if desc.get('_deleted'):
+                    # Property was deleted, re-create as a new own property
+                    pass
+                elif 'set' in desc:
+                    setter = desc['set']
+                    if isinstance(setter, JSFunction):
+                        setter.interp.call_function(setter, obj, [value])
+                        return
+                    if callable(setter):
+                        setter(obj, [value])
+                        return
+                    if isinstance(setter, JSObject) and setter._call:
+                        setter._call(obj, [value])
+                        return
+                    if strict:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"Cannot set property '{key}' of object which has only a getter"))
+                    return
+                elif not desc.get('writable', True):
+                    if strict:
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"Cannot assign to read only property '{key}' of function"))
+                    return
+                else:
+                    # Writable data descriptor: update it
+                    desc['value'] = value
+                    if obj._static_props is None:
+                        obj._static_props = {}
+                    obj._static_props[key] = value
+                    return
+            # Built-in 'name' and 'length' are non-writable by default
+            if key in ('name', 'length'):
+                if strict:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"Cannot assign to read only property '{key}' of function"))
+                return
+            # prototype is a virtual own property stored directly on fn.prototype
+            if key == 'prototype':
+                obj.prototype = value
+                return
+            # Check Function.prototype for inherited setters (e.g. 'caller'/'arguments' poison pills)
+            fn_ctor = self.global_env._bindings.get('Function')
+            if fn_ctor is not None:
+                fn_proto = getattr(fn_ctor, 'props', {}).get('prototype')
+                if fn_proto is not None and isinstance(fn_proto, JSObject) and fn_proto._descriptors and key in fn_proto._descriptors:
+                    desc = fn_proto._descriptors[key]
+                    if 'set' in desc:
+                        setter = desc['set']
+                        if isinstance(setter, JSFunction):
+                            setter.interp.call_function(setter, obj, [value])
+                            return
+                        if callable(setter):
+                            setter(obj, [value])
+                            return
+                        if isinstance(setter, JSObject) and setter._call:
+                            setter._call(obj, [value])
+                            return
             if obj._static_props is None:
                 obj._static_props = {}
             obj._static_props[key] = value
             return
         if isinstance(obj, JSObject):
+            if _is_proxy(obj):
+                _proxy_set_trap(obj, key, value)
+                return
             if obj._is_array and key == 'length':
-                # resize
-                new_len = js_to_integer(value)
+                # Per spec ArraySetLength: coerce first (steps 3-4), then check writable (step 12)
+                raw = js_to_uint32(value)
+                num = js_to_number(value)
+                if raw != num:
+                    raise _ThrowSignal(make_error('RangeError', 'Invalid array length'))
+                # Check if length is non-writable (may have been changed by valueOf side effects)
+                if obj._descriptors and 'length' in obj._descriptors:
+                    ldesc = obj._descriptors['length']
+                    if not ldesc.get('writable', True):
+                        if strict:
+                            raise _ThrowSignal(make_error('TypeError',
+                                f"Cannot assign to read only property 'length' of object"))
+                        return
+                # resize — validate range per 10.4.2.4 ArraySetLength
+                new_len = raw
                 old_len = obj.props.get('length', 0)
                 if new_len < old_len:
-                    # Delete elements from old_len-1 down to new_len
-                    # Stop (and throw) if a non-configurable element is encountered
-                    actual_new = old_len
-                    for i in range(old_len - 1, new_len - 1, -1):
-                        k = str(i)
-                        if obj._descriptors and k in obj._descriptors:
-                            desc = obj._descriptors[k]
-                            if not desc.get('configurable', True):
-                                # Can't delete this element; set length to i+1 and throw
-                                obj.props['length'] = i + 1
-                                data = obj.props.get('@@array_data')
-                                if data is not None:
-                                    while len(data) > i + 1:
-                                        data.pop()
-                                raise _ThrowSignal(make_error('TypeError',
-                                    f'Cannot delete property \'{k}\' of [object Array]'))
-                        if k in obj.props:
-                            del obj.props[k]
-                        data = obj.props.get('@@array_data')
-                        if data is not None and i < len(data):
-                            data.pop()
-                obj.props['length'] = max(new_len, 0)
+                    data = obj.props.get('@@array_data')
+                    if data is not None:
+                        # Dense: just truncate the list
+                        if new_len < len(data):
+                            for i in range(len(data) - 1, new_len - 1, -1):
+                                k = str(i)
+                                if obj._descriptors and k in obj._descriptors:
+                                    desc = obj._descriptors[k]
+                                    if not desc.get('configurable', True):
+                                        obj.props['length'] = i + 1
+                                        while len(data) > i + 1:
+                                            data.pop()
+                                        raise _ThrowSignal(make_error('TypeError',
+                                            f'Cannot delete property \'{k}\' of [object Array]'))
+                                obj.props.pop(k, None)
+                            del data[new_len:]
+                    else:
+                        # Sparse: only delete keys that actually exist
+                        for k in list(obj.props.keys()):
+                            if k.isdigit():
+                                idx = int(k)
+                                if idx >= new_len:
+                                    if obj._descriptors and k in obj._descriptors:
+                                        desc = obj._descriptors[k]
+                                        if not desc.get('configurable', True):
+                                            continue
+                                    del obj.props[k]
+                elif new_len > old_len:
+                    data = obj.props.get('@@array_data')
+                    if data is not None:
+                        if new_len <= _MAX_DENSE_ARRAY_LEN:
+                            data.extend([undefined] * (new_len - len(data)))
+                        else:
+                            del obj.props['@@array_data']
+                obj.props['length'] = new_len
                 return
             if obj._is_array:
-                # TypedArray: write to ArrayBuffer
-                if obj.props.get('@@ta_type'):
+                # TypedArray check is separate below (TypedArrays no longer have _is_array)
+                if obj._mapped_params is None:
+                    # Regular array fast path (skip for mapped arguments)
                     try:
                         idx = int(key)
-                        if str(idx) == key and idx >= 0:
-                            _typed_array_set(obj, idx, value)
-                            return
+                        if str(idx) == key and 0 <= idx < 0xFFFFFFFF:
+                            # Skip fast path if index has a descriptor (e.g. frozen array)
+                            if not (obj._descriptors and key in obj._descriptors):
+                                # Check proto chain for inherited accessor on this key
+                                # (e.g. setter on Array.prototype['1'])
+                                if key not in obj.props:
+                                    p = obj.proto
+                                    while p is not None and isinstance(p, JSObject):
+                                        if p._descriptors and key in p._descriptors:
+                                            pd = p._descriptors[key]
+                                            if 'set' in pd or 'get' in pd:
+                                                break  # accessor found, use slow path
+                                        p = p.proto
+                                    else:
+                                        _array_set_item(obj, idx, value)
+                                        return
+                                else:
+                                    _array_set_item(obj, idx, value)
+                                    return
                     except (ValueError, TypeError):
                         pass
-                    # non-index property falls through to _obj_set_property
-                else:
-                    try:
-                        idx = int(key)
-                        if str(idx) == key and idx >= 0:
-                            _array_set_item(obj, idx, value)
-                            return
-                    except (ValueError, TypeError):
-                        pass
-            _obj_set_property(obj, key, value)
-        elif isinstance(obj, str):
-            pass  # setting properties on primitives is no-op in sloppy mode
+            # TypedArray: write to ArrayBuffer
+            if obj.props.get('@@ta_type'):
+                try:
+                    idx = int(key)
+                    if str(idx) == key and idx >= 0:
+                        _typed_array_set(obj, idx, value)
+                        return
+                except (ValueError, TypeError):
+                    pass
+                # non-index property falls through to _obj_set_property
+            _obj_set_property(obj, key, value, strict)
+        elif isinstance(obj, (str, bool, int, float, JSSymbol, JSBigInt)) and not (obj is null or obj is undefined):
+            # Primitive base: per spec, ToObject(base).[[Set]](key, value, base)
+            # Check proto chain for setter first — call if found
+            wrapper = _js_to_object(obj)
+            # Walk prototype chain looking for an accessor setter
+            has_setter = False
+            p = wrapper
+            while p is not None and isinstance(p, JSObject):
+                if p._descriptors and key in p._descriptors:
+                    desc = p._descriptors[key]
+                    if 'set' in desc and desc['set'] is not None and desc['set'] is not undefined:
+                        has_setter = True
+                    break
+                if key in p.props:
+                    break
+                p = p.proto
+            if has_setter:
+                _obj_set_property(wrapper, key, value, strict, receiver=obj)
+            elif strict:
+                raise _ThrowSignal(make_error('TypeError',
+                    f"Cannot create property '{key}' on {js_typeof(obj)} '{repr(obj)}'"))
         # else no-op
 
     def _get_property(self, obj, key: str) -> Any:
@@ -2642,23 +5619,97 @@ class Interpreter:
         if isinstance(obj, JSSymbol):
             return self._get_symbol_proto_prop(obj, key)
         if isinstance(obj, JSFunction):
+            # Poison pills: strict mode functions throw on .caller and .arguments
+            # Bound functions have no own caller/arguments — let prototype chain handle it
+            if key in ('caller', 'arguments') and not obj.is_arrow and obj._bound_target is None:
+                if _fn_is_strict(obj):
+                    raise _ThrowSignal(make_error('TypeError',
+                        "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"))
+                # Non-strict functions: return null for .caller (Annex B);
+                # .arguments returns null when not executing.
+                # Return undefined so feature-detection works (tests check === undefined).
+                return undefined
             # Check function own props
             if key == 'length':
+                # Check if overridden by a descriptor (e.g., static method named 'length')
+                if obj._descriptors and 'length' in obj._descriptors:
+                    desc = obj._descriptors['length']
+                    if desc.get('_deleted'):
+                        return undefined
+                    if 'get' in desc or 'set' in desc:
+                        getter = desc.get('get')
+                        if isinstance(getter, JSFunction):
+                            return getter.interp.call_function(getter, obj, [])
+                        if callable(getter) and getter is not undefined:
+                            return getter(obj)
+                        if isinstance(getter, JSObject) and getter._call:
+                            return getter._call(obj, [])
+                        return undefined  # setter-only or get is undefined
+                    if 'value' in desc:
+                        return desc['value']
+                # Check static props
+                static_props = getattr(obj, '_static_props', None)
+                if static_props and 'length' in static_props:
+                    return static_props['length']
                 return obj.length
             if key == 'name':
+                # Check if overridden by a descriptor (e.g., static method named 'name')
+                if obj._descriptors and 'name' in obj._descriptors:
+                    desc = obj._descriptors['name']
+                    if desc.get('_deleted'):
+                        return undefined
+                    if 'get' in desc or 'set' in desc:
+                        getter = desc.get('get')
+                        if isinstance(getter, JSFunction):
+                            return getter.interp.call_function(getter, obj, [])
+                        if callable(getter) and getter is not undefined:
+                            return getter(obj)
+                        if isinstance(getter, JSObject) and getter._call:
+                            return getter._call(obj, [])
+                        return undefined  # setter-only or get is undefined
+                    if 'value' in desc:
+                        return desc['value']
+                # Check static props
+                static_props = getattr(obj, '_static_props', None)
+                if static_props and 'name' in static_props:
+                    return static_props['name']
                 return obj.name
             if key == 'prototype':
-                return _build_function_prototype(obj)
+                if obj._no_prototype:
+                    pass  # fall through to static_props / descriptors / proto chain
+                elif obj.prototype is not None:
+                    return obj.prototype
+                else:
+                    return _build_function_prototype(obj)
             if key == 'call':
                 return _make_native_fn('call', lambda this, args:
-                    self.call_function(this, args[0] if args else undefined, list(args[1:])))
+                    self._call(this, args[0] if args else undefined, list(args[1:])), 1)
             if key == 'apply':
-                return _make_native_fn('apply', lambda this, args:
-                    self.call_function(this, args[0] if args else undefined,
-                        _array_to_list(args[1]) if len(args) > 1 and isinstance(args[1], JSObject) else []))
+                def _fn_apply(this, args):
+                    this_arg = args[0] if args else undefined
+                    arg_array = args[1] if len(args) > 1 else undefined
+                    if arg_array is undefined or arg_array is null or arg_array is None:
+                        return self._call(this, this_arg, [])
+                    if not isinstance(arg_array, JSObject):
+                        raise _ThrowSignal(make_error('TypeError', 'CreateListFromArrayLike called on non-object'))
+                    return self._call(this, this_arg, _array_to_list(arg_array))
+                return _make_native_fn('apply', _fn_apply, 2)
             if key == 'bind':
                 return _make_native_fn('bind', lambda this, args:
-                    self._bind_function(this, args))
+                    self._bind_function(this, args), 1)
+            # Check static descriptors first (from Object.defineProperty, class static getters/setters)
+            if obj._descriptors and key in obj._descriptors:
+                desc = obj._descriptors[key]
+                if '_deleted' not in desc:
+                    if 'get' in desc:
+                        getter = desc['get']
+                        if isinstance(getter, JSFunction):
+                            return getter.interp.call_function(getter, obj, [])
+                        if callable(getter):
+                            return getter(obj)
+                        if isinstance(getter, JSObject) and getter._call:
+                            return getter._call(obj, [])
+                    return desc.get('value', undefined)
             # Check static properties (from class static fields/methods)
             static_props = getattr(obj, '_static_props', None)
             if static_props and key in static_props:
@@ -2689,6 +5740,8 @@ class Interpreter:
                         return result
             return undefined
         if isinstance(obj, JSObject):
+            if _is_proxy(obj):
+                return _proxy_get_trap(obj, key, obj)
             if obj._is_array and key == 'length':
                 data = obj.props.get('@@array_data')
                 return len(data) if data is not None else obj.props.get('length', 0)
@@ -2701,19 +5754,43 @@ class Interpreter:
                 except (ValueError, TypeError):
                     pass
                 # Non-index key: fall through to props lookup
+            result = _obj_get_property(obj, key, obj)
+            if result is not undefined:
+                return result
             # For callable objects (native functions), provide call/apply/bind
+            # as fallback if not found on prototype chain
             if obj._call is not None and key in ('call', 'apply', 'bind'):
                 if key == 'call':
                     return _make_native_fn('call', lambda this, args:
-                        self._call(this, args[0] if args else undefined, list(args[1:])))
+                        self._call(this, args[0] if args else undefined, list(args[1:])), 1)
                 if key == 'apply':
                     return _make_native_fn('apply', lambda this, args:
                         self._call(this, args[0] if args else undefined,
-                            _array_to_list(args[1]) if len(args) > 1 and isinstance(args[1], JSObject) else []))
+                            _array_to_list(args[1]) if len(args) > 1 and isinstance(args[1], JSObject) else []), 2)
                 if key == 'bind':
                     return _make_native_fn('bind', lambda this, args:
-                        self._bind_function(this, args))
-            result = _obj_get_property(obj, key, obj)
+                        self._bind_function(this, args), 1)
+                return undefined
+            # For callable JSObjects (native functions), fall through to Function.prototype
+            # so that hasOwnProperty, toString, etc. are accessible.
+            if obj._call is not None:
+                fn_ctor = self.global_env._bindings.get('Function')
+                if fn_ctor is not None:
+                    fn_proto = getattr(fn_ctor, 'props', {}).get('prototype')
+                    if fn_proto is not None:
+                        result = _obj_get_property(fn_proto, key, obj)
+                        if result is not undefined:
+                            return result
+                # Also check Object.prototype for hasOwnProperty etc.
+                obj_ctor = self.global_env._bindings.get('Object')
+                if obj_ctor is not None:
+                    obj_proto = None
+                    if isinstance(obj_ctor, JSObject):
+                        obj_proto = obj_ctor.props.get('prototype')
+                    if obj_proto is not None:
+                        result = _obj_get_property(obj_proto, key, obj)
+                        if result is not undefined:
+                            return result
             return result
         if obj is null or obj is undefined:
             raise _ThrowSignal(make_error('TypeError',
@@ -2724,9 +5801,29 @@ class Interpreter:
         """Function.prototype.bind implementation."""
         bound_this = args[0] if args else undefined
         bound_args = list(args[1:]) if len(args) > 1 else []
+
+        # Read target name (step 12-15): Get(Target, "name"), must trigger getters
+        target_name = self._get_property(fn, 'name')
+        if not isinstance(target_name, str):
+            target_name = ''
+        bound_name = 'bound ' + target_name
+
+        # Read target length (steps 5-6)
+        target_len = self._get_property(fn, 'length')
+        if isinstance(target_len, (int, float)) and not isinstance(target_len, bool):
+            if target_len == float('inf'):
+                bound_len = float('inf')
+            elif target_len == float('-inf') or target_len != target_len:  # -inf or NaN
+                bound_len = 0
+            else:
+                target_len_int = int(target_len) if target_len >= 0 else -int(-target_len)
+                bound_len = max(0, target_len_int - len(bound_args))
+        else:
+            bound_len = 0
+
         if isinstance(fn, JSFunction):
             new_fn = JSFunction(
-                name=f'bound {fn.name}',
+                name=bound_name,
                 params=fn.params,
                 body=fn.body,
                 env=fn.env,
@@ -2738,11 +5835,12 @@ class Interpreter:
             new_fn._bound_this = bound_this
             new_fn._bound_args = bound_args
             new_fn._bound_target = fn  # for new construction (ignore bound this)
-            # Bound function length = max(0, original.length - number of pre-bound args)
-            new_fn.length = max(0, fn.length - len(bound_args))
+            new_fn.length = bound_len
+            # Bound functions have no own prototype property per spec
+            new_fn._no_prototype = True
             return new_fn
         obj = JSObject(class_name='Function')
-        obj.name = f'bound {getattr(fn, "name", "")}'
+        obj.name = bound_name
         orig_call = fn._call if isinstance(fn, JSObject) else fn
         def bound_call(this, call_args):
             return orig_call(bound_this, bound_args + list(call_args))
@@ -2754,6 +5852,14 @@ class Interpreter:
         if node.line:
             self._current_line = node.line
             self._current_col = node.col
+        # Handle '#field in obj' (private field presence check)
+        if op == 'in' and isinstance(node.left, PrivateIdentifier):
+            right = self.eval(node.right, env)
+            if not isinstance(right, JSObject):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Cannot use \'in\' operator to search for a private field without an object'))
+            pname = node.left.name
+            return self._has_private_field(right, pname, env)
         left = self.eval(node.left, env)
         right = self.eval(node.right, env)
         return self._apply_binary(op, left, right)
@@ -2775,7 +5881,7 @@ class Interpreter:
                                 lambda a, b: _bigint_mod(a, b))
         if op == '**':
             return self._num_op(left, right, lambda a, b: _js_pow(a, b),
-                                lambda a, b: JSBigInt(a.value ** b.value))
+                                lambda a, b: _bigint_pow(a, b))
         if op == '===':
             return js_strict_equal(left, right)
         if op == '!==':
@@ -2788,37 +5894,60 @@ class Interpreter:
             r = js_less_than(left, right)
             return False if r is undefined else bool(r)
         if op == '>':
-            r = js_less_than(right, left)
+            r = js_less_than(right, left, left_first=False)
             return False if r is undefined else bool(r)
         if op == '<=':
-            r = js_less_than(right, left)
+            r = js_less_than(right, left, left_first=False)
             return not (r if r is not undefined else True)
         if op == '>=':
             r = js_less_than(left, right)
             return not (r if r is not undefined else True)
         if op == '&':
+            left, right = self._to_numeric_pair(left, right)
             if isinstance(left, JSBigInt) and isinstance(right, JSBigInt):
                 return JSBigInt(left.value & right.value)
+            if isinstance(left, JSBigInt) or isinstance(right, JSBigInt):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Cannot mix BigInt and other types, use explicit conversions'))
             return js_to_int32(js_to_int32(left) & js_to_int32(right))
         if op == '|':
+            left, right = self._to_numeric_pair(left, right)
             if isinstance(left, JSBigInt) and isinstance(right, JSBigInt):
                 return JSBigInt(left.value | right.value)
+            if isinstance(left, JSBigInt) or isinstance(right, JSBigInt):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Cannot mix BigInt and other types, use explicit conversions'))
             return js_to_int32(js_to_int32(left) | js_to_int32(right))
         if op == '^':
+            left, right = self._to_numeric_pair(left, right)
             if isinstance(left, JSBigInt) and isinstance(right, JSBigInt):
                 return JSBigInt(left.value ^ right.value)
+            if isinstance(left, JSBigInt) or isinstance(right, JSBigInt):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Cannot mix BigInt and other types, use explicit conversions'))
             return js_to_int32(js_to_int32(left) ^ js_to_int32(right))
         if op == '<<':
+            left, right = self._to_numeric_pair(left, right)
             if isinstance(left, JSBigInt) and isinstance(right, JSBigInt):
                 if right.value < 0:
-                    raise _ThrowSignal(make_error('RangeError', 'BigInt negative exponent'))
+                    return JSBigInt(left.value >> (-right.value))
                 return JSBigInt(left.value << right.value)
+            if isinstance(left, JSBigInt) or isinstance(right, JSBigInt):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Cannot mix BigInt and other types, use explicit conversions'))
             return js_to_int32(js_to_int32(left) << (js_to_uint32(right) & 31))
         if op == '>>':
+            left, right = self._to_numeric_pair(left, right)
             if isinstance(left, JSBigInt) and isinstance(right, JSBigInt):
+                if right.value < 0:
+                    return JSBigInt(left.value << (-right.value))
                 return JSBigInt(left.value >> right.value)
+            if isinstance(left, JSBigInt) or isinstance(right, JSBigInt):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Cannot mix BigInt and other types, use explicit conversions'))
             return js_to_int32(left) >> (js_to_uint32(right) & 31)
         if op == '>>>':
+            left, right = self._to_numeric_pair(left, right)
             if isinstance(left, JSBigInt) or isinstance(right, JSBigInt):
                 raise _ThrowSignal(make_error('TypeError',
                     'Cannot mix BigInt and other types, use BigInt bitwise operators'))
@@ -2829,18 +5958,67 @@ class Interpreter:
             return js_in(left, right)
         raise _ThrowSignal(make_error('TypeError', f'Unknown binary op: {op}'))
 
+    def _to_numeric_pair(self, left, right):
+        """Convert both operands via ToNumeric (unwrapping BigInt objects)."""
+        def _to_numeric_one(v):
+            if isinstance(v, JSBigInt):
+                return v
+            if isinstance(v, JSObject):
+                prim = js_to_primitive(v, 'number')
+                if isinstance(prim, JSBigInt):
+                    return prim
+                return js_to_number(prim)
+            if isinstance(v, JSSymbol):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Cannot convert a Symbol value to a number'))
+            return js_to_number(v)
+        return _to_numeric_one(left), _to_numeric_one(right)
+
     def _num_op(self, left, right, num_fn, bigint_fn):
-        if isinstance(left, JSBigInt) and isinstance(right, JSBigInt):
+        # Unwrap BigInt objects (Object(1n)) and handle ToNumeric
+        def _to_numeric(v):
+            if isinstance(v, JSBigInt):
+                return v
+            if isinstance(v, JSObject):
+                prim = js_to_primitive(v, 'number')
+                if isinstance(prim, JSBigInt):
+                    return prim
+                return js_to_number(prim)
+            if isinstance(v, JSSymbol):
+                raise _ThrowSignal(make_error('TypeError',
+                    'Cannot convert a Symbol value to a number'))
+            return js_to_number(v)
+
+        nl = _to_numeric(left)
+        nr = _to_numeric(right)
+
+        if isinstance(nl, JSBigInt) and isinstance(nr, JSBigInt):
             if bigint_fn is None:
                 raise _ThrowSignal(make_error('TypeError',
                     'Cannot mix BigInt and other types'))
-            return bigint_fn(left, right)
-        nl = js_to_number(left)
-        nr = js_to_number(right)
+            return bigint_fn(nl, nr)
+        if isinstance(nl, JSBigInt) or isinstance(nr, JSBigInt):
+            raise _ThrowSignal(make_error('TypeError',
+                'Cannot mix BigInt and other types, use explicit conversions'))
+        # nl/nr are already numeric from _to_numeric; ensure they are numbers
+        nl = js_to_number(nl)
+        nr = js_to_number(nr)
         result = num_fn(nl, nr)
-        if isinstance(nl, int) and isinstance(nr, int) and isinstance(result, (int, float)):
-            if isinstance(result, float) and not math.isinf(result) and not math.isnan(result) and result == int(result):
-                return int(result)
+        if isinstance(result, int) and not isinstance(result, bool):
+            # If result exceeds float64 range, return ±Infinity
+            if abs(result) > 1.7976931348623158e+308:
+                return math.inf if result > 0 else -math.inf
+            # JS numbers are IEEE 754 doubles; if result exceeds safe integer
+            # range, convert through float to match IEEE 754 rounding.
+            if result > 9007199254740991 or result < -9007199254740991:
+                return int(float(result))
+            return result
+        if isinstance(result, float):
+            if not math.isinf(result) and not math.isnan(result):
+                if result == 0.0 and math.copysign(1, result) < 0:
+                    return result  # preserve -0.0
+                if abs(result) <= 2**53 and result == int(result):
+                    return int(result)
             return result
         return result
 
@@ -2869,12 +6047,160 @@ class Interpreter:
         lt = type(left).__name__
 
         if op == '=':
+            # Spec 13.15.2: evaluate LHS reference before RHS
+            if lt == 'MemberExpression':
+                # Private field assignment: this.#x = val
+                if isinstance(left.property, PrivateIdentifier):
+                    lhs_obj = self.eval(left.object, env)
+                    value = self.eval(node.right, env)
+                    return self._set_private_field(lhs_obj, left.property.name, value, env)
+                is_super_lhs = type(left.object).__name__ == 'Super'
+                lhs_obj = self.eval(left.object, env)
+                if left.computed:
+                    # Per spec: for super[expr] = val, GetThisBinding() before key eval
+                    if is_super_lhs:
+                        env.get('this')
+                    lhs_key_val = self.eval(left.property, env)
+                    if not is_super_lhs:
+                        lhs_key = _symbol_to_key(lhs_key_val) if isinstance(lhs_key_val, JSSymbol) else js_to_string(lhs_key_val)
+                else:
+                    lhs_key = left.property.name
+
+                value = self.eval(node.right, env)
+
+                if is_super_lhs:
+                    # Defer ToPropertyKey to PutValue time (after RHS eval)
+                    if left.computed:
+                        lhs_key = _symbol_to_key(lhs_key_val) if isinstance(lhs_key_val, JSSymbol) else js_to_string(lhs_key_val)
+                    this_val = env.get('this') if env.has_binding('this') else undefined
+                    # OrdinarySet: lookup starts at super base, receiver is this
+                    _super_set_property(lhs_obj, lhs_key, value, env._is_strict(), this_val)
+                else:
+                    self._set_property(lhs_obj, lhs_key, value, env._is_strict())
+                return value
+
+            # Per spec: resolve LHS reference before evaluating RHS.
+            # In strict mode, if the identifier is unresolvable, PutValue
+            # will throw ReferenceError.  Snapshot resolvability now so
+            # that properties created by the RHS on globalThis don't mask it.
+            lhs_unresolvable = (lt == 'Identifier' and env._is_strict()
+                                and not env.has_binding(left.name))
+            # Capture with-object reference for SetMutableBinding §9.1.1.2.5
+            lhs_with_ref = None
+            if lt == 'Identifier' and not lhs_unresolvable:
+                lhs_with_ref = self._find_with_ref(left.name, env)
             value = self.eval(node.right, env)
+            # ES2015+ SetFunctionName for simple identifier assignment
+            if lt == 'Identifier' and _is_anonymous_function_def(node.right):
+                _set_function_name(value, left.name)
+            if lhs_unresolvable:
+                raise _ThrowSignal(make_error('ReferenceError',
+                    f'{left.name} is not defined'))
+            # SetMutableBinding: if binding was in a with-object, perform Set
+            if lhs_with_ref is not None:
+                # SetMutableBinding step 2: re-check HasProperty (may trigger proxy has trap)
+                still_exists = _obj_has_property(lhs_with_ref, left.name)
+                if env._is_strict() and not still_exists:
+                    raise _ThrowSignal(make_error('ReferenceError',
+                        f'{left.name} is not defined'))
+                self._set_property(lhs_with_ref, left.name, value, env._is_strict())
+                return value
             self._assign_to(left, value, env)
             return value
 
-        # Compound assignment
-        current = self._get_ref(left, env)
+        # Compound assignment - cache MemberExpression evaluation
+        cached_obj = None
+        cached_key = None
+        cached_is_super = False
+        cached_with_ref = [None]  # mutable container for with-scope ref
+
+        def _compound_set(new_val):
+            """Set the compound assignment target."""
+            if cached_obj is not None:
+                if cached_is_super:
+                    this_val = env.get('this') if env.has_binding('this') else undefined
+                    _super_set_property(cached_obj, cached_key, new_val, env._is_strict(), this_val)
+                    return
+                self._set_property(cached_obj, cached_key, new_val, env._is_strict())
+            elif cached_with_ref[0] is not None:
+                # SetMutableBinding: HasProperty + Set on the with-scope binding object
+                still_exists = _obj_has_property(cached_with_ref[0], left.name)
+                if env._is_strict() and not still_exists:
+                    raise _ThrowSignal(make_error('ReferenceError',
+                        f'{left.name} is not defined'))
+                self._set_property(cached_with_ref[0], left.name, new_val, env._is_strict())
+            else:
+                self._set_ref(left, new_val, env)
+
+        if lt == 'MemberExpression':
+            # Private field compound assignment: this.#x += val
+            if isinstance(left.property, PrivateIdentifier):
+                cached_obj = self.eval(left.object, env)
+                cached_key = left.property.name
+                current = self._get_private_field(cached_obj, cached_key, env)
+                def _compound_set_private(new_val):
+                    self._set_private_field(cached_obj, cached_key, new_val, env)
+                _compound_set = _compound_set_private
+            else:
+                cached_is_super = type(left.object).__name__ == 'Super'
+                cached_obj = self.eval(left.object, env)
+                if left.computed:
+                    # Per spec: for super[expr] op= val, GetThisBinding() before key eval
+                    if cached_is_super:
+                        env.get('this')
+                    key_val = self.eval(left.property, env)
+                    # Per spec: RequireObjectCoercible before ToPropertyKey
+                    if cached_obj is null or cached_obj is undefined:
+                        # Don't call js_to_string (ToPropertyKey) on key_val for the
+                        # error message — that's a user-observable ToString which must
+                        # not happen before RequireObjectCoercible throws.
+                        _dkey = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else (key_val if isinstance(key_val, str) else repr(key_val))
+                        raise _ThrowSignal(make_error('TypeError',
+                            f"cannot read properties of {'null' if cached_obj is null else 'undefined'} (reading '{_dkey}')"))
+                    cached_key = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else js_to_string(key_val)
+                else:
+                    cached_key = left.property.name
+                if cached_is_super and isinstance(cached_obj, JSObject):
+                    this_val = env.get('this') if env.has_binding('this') else undefined
+                    current = _obj_get_property(cached_obj, cached_key, this=this_val)
+                else:
+                    current = self._get_property(cached_obj, cached_key)
+        else:
+            # For identifiers in with-scope, resolve once and get/set via binding object
+            if lt == 'Identifier':
+                cached_with_ref[0] = self._find_with_ref(left.name, env)
+            if cached_with_ref[0] is not None:
+                # GetBindingValue §9.1.1.2.6: HasProperty + Get
+                _obj_has_property(cached_with_ref[0], left.name)
+                current = self._get_property(cached_with_ref[0], left.name)
+            else:
+                current = self._get_ref(left, env)
+        # Logical assignments: short-circuit BEFORE evaluating RHS
+        if op == '&&=':
+            if not js_is_truthy(current):
+                return current
+            new_val = self.eval(node.right, env)
+            if lt == 'Identifier' and _is_anonymous_function_def(node.right):
+                _set_function_name(new_val, left.name)
+            _compound_set(new_val)
+            return new_val
+        if op == '||=':
+            if js_is_truthy(current):
+                return current
+            new_val = self.eval(node.right, env)
+            if lt == 'Identifier' and _is_anonymous_function_def(node.right):
+                _set_function_name(new_val, left.name)
+            _compound_set(new_val)
+            return new_val
+        if op == '??=':
+            if current is not null and current is not undefined:
+                return current
+            new_val = self.eval(node.right, env)
+            if lt == 'Identifier' and _is_anonymous_function_def(node.right):
+                _set_function_name(new_val, left.name)
+            _compound_set(new_val)
+            return new_val
+
         right_val = self.eval(node.right, env)
 
         if op == '+=':
@@ -2901,22 +6227,10 @@ class Interpreter:
             new_val = self._apply_binary('>>', current, right_val)
         elif op == '>>>=':
             new_val = self._apply_binary('>>>', current, right_val)
-        elif op == '&&=':
-            if not js_is_truthy(current):
-                return current
-            new_val = right_val
-        elif op == '||=':
-            if js_is_truthy(current):
-                return current
-            new_val = right_val
-        elif op == '??=':
-            if current is not null and current is not undefined:
-                return current
-            new_val = right_val
         else:
             raise _ThrowSignal(make_error('TypeError', f'Unknown assignment op: {op}'))
 
-        self._set_ref(left, new_val, env)
+        _compound_set(new_val)
         return new_val
 
     def _assign_to(self, left, value, env: Environment) -> None:
@@ -2925,13 +6239,22 @@ class Interpreter:
         if t == 'Identifier':
             env.set(left.name, value)
         elif t == 'MemberExpression':
+            is_super = type(left.object).__name__ == 'Super'
             obj = self.eval(left.object, env)
             if left.computed:
                 key_val = self.eval(left.property, env)
                 key = _symbol_to_key(key_val) if isinstance(key_val, JSSymbol) else js_to_string(key_val)
             else:
                 key = left.property.name
-            self._set_property(obj, key, value)
+            if is_super:
+                # super.x = val: set on `this`, walking super proto chain for descriptors
+                this_val = env.get('this') if env.has_binding('this') else undefined
+                if isinstance(this_val, JSObject):
+                    _obj_set_property(this_val, key, value, env._is_strict())
+                elif isinstance(obj, JSObject):
+                    _obj_set_property(obj, key, value, env._is_strict())
+            else:
+                self._set_property(obj, key, value, env._is_strict())
         elif t == 'ArrayPattern':
             self._bind_array_pattern(left, value, env, 'var')
         elif t == 'ObjectPattern':
@@ -2957,7 +6280,7 @@ class Interpreter:
                 # super.method() — look up on super-proto but call with current this
                 super_proto = env.get('@@super_proto')
                 if callee_node.computed:
-                    key = js_to_string(self.eval(callee_node.property, env))
+                    key = _to_property_key(self.eval(callee_node.property, env))
                 else:
                     key = callee_node.property.name
                 if isinstance(super_proto, JSFunction):
@@ -2971,39 +6294,130 @@ class Interpreter:
                 obj = self.eval(callee_node.object, env)
                 # Optional chaining on object
                 if callee_node.optional and (obj is null or obj is undefined):
-                    return undefined
-                if callee_node.computed:
-                    key = js_to_string(self.eval(callee_node.property, env))
+                    raise _OptionalChainShortCircuit()
+                if isinstance(callee_node.property, PrivateIdentifier):
+                    fn = self._get_private_field(obj, callee_node.property.name, env)
+                elif callee_node.computed:
+                    key = _to_property_key(self.eval(callee_node.property, env))
+                    fn = self._get_property(obj, key)
                 else:
                     key = callee_node.property.name
-                fn = self._get_property(obj, key)
+                    fn = self._get_property(obj, key)
                 this = obj
         elif callee_t == 'Super':
-            # super() — call super constructor, passing this
-            this = env.get('this')
-            super_ctor = env.get('@@super_ctor') if env.has_binding('@@super_ctor') else undefined
+            # super() — call super constructor
+            # GetSuperConstructor: dynamically look up activeFunction.[[GetPrototypeOf]]()
+            if env.has_binding('@@active_ctor'):
+                active_ctor = env.get('@@active_ctor')
+                # Dynamic prototype lookup (supports Object.setPrototypeOf changes)
+                if isinstance(active_ctor, JSFunction):
+                    p = active_ctor._proto
+                    if p is _SENTINEL:
+                        p = _PROTOS.get('Function')
+                    super_ctor = p
+                elif isinstance(active_ctor, JSObject):
+                    super_ctor = active_ctor.proto
+                else:
+                    super_ctor = env.get('@@super_ctor') if env.has_binding('@@super_ctor') else undefined
+            else:
+                super_ctor = env.get('@@super_ctor') if env.has_binding('@@super_ctor') else undefined
             if super_ctor is undefined or super_ctor is None:
                 raise _ThrowSignal(make_error('ReferenceError', "'super' keyword unexpected here"))
             args = self._eval_args(node.arguments, env)
-            if isinstance(super_ctor, JSFunction):
-                self.call_function(super_ctor, this, args)
-            elif isinstance(super_ctor, JSObject) and (super_ctor._call or super_ctor._construct):
-                fn_call = super_ctor._construct or super_ctor._call
-                fn_call(this, args)
-            return this
+
+            # Check if this is a derived constructor (this is _SENTINEL)
+            # Walk up env chain to find the function scope with 'this'
+            this_env = env
+            while this_env is not None:
+                if 'this' in this_env._bindings:
+                    break
+                this_env = this_env._parent
+
+            raw_this = this_env._bindings.get('this', undefined) if this_env else undefined
+
+            if raw_this is _SENTINEL:
+                # Derived constructor: super() creates the instance
+                # Get new.target for prototype chain
+                new_target = env.get('new.target') if env.has_binding('new.target') else None
+                instance = self._construct(super_ctor, args, new_target=new_target)
+                # Initialize derived class instance fields after super() returns
+                # Find the current constructor function to get its _instance_fields
+                cur_new_target = env.get('new.target') if env.has_binding('new.target') else None
+                if cur_new_target and isinstance(cur_new_target, JSFunction):
+                    inst_fields = getattr(cur_new_target, '_instance_fields', [])
+                    if inst_fields and isinstance(instance, (JSObject, JSFunction)):
+                        field_env = Environment(parent=env, is_function=False)
+                        field_env.define_let('this', instance)
+                        for key_str, val_node in inst_fields:
+                            val = self.eval(val_node, field_env) if val_node is not None else undefined
+                            if isinstance(instance, JSObject):
+                                instance.props[key_str] = val
+                            elif isinstance(instance, JSFunction):
+                                if instance._static_props is None:
+                                    instance._static_props = {}
+                                instance._static_props[key_str] = val
+                    # Initialize private fields for derived class after super()
+                    if isinstance(instance, (JSObject, JSFunction)):
+                        self._init_private_fields(instance, cur_new_target)
+                # Bind 'this' to the created instance
+                this_env._bindings['this'] = instance
+                return instance
+            elif this_env and this_env._bindings.get('@@derived'):
+                # Double super() call in derived constructor — this is already initialized
+                raise _ThrowSignal(make_error('ReferenceError',
+                    'Super constructor may only be called once'))
+            else:
+                # Base constructor super() or legacy — use existing this
+                this = raw_this
+                if isinstance(super_ctor, JSFunction):
+                    self.call_function(super_ctor, this, args, as_constructor=True)
+                elif isinstance(super_ctor, JSObject) and (super_ctor._call or super_ctor._construct):
+                    fn_call = super_ctor._construct or super_ctor._call
+                    fn_call(this, args)
+                return this
+        elif callee_t == 'ChainExpression':
+            # (a?.b)() — unwrap ChainExpression to preserve this binding
+            inner = callee_node.expression
+            inner_t = type(inner).__name__
+            old_chain = getattr(self, '_in_optional_chain', False)
+            self._in_optional_chain = True
+            try:
+                if inner_t == 'MemberExpression':
+                    obj = self.eval(inner.object, env)
+                    if inner.optional and (obj is null or obj is undefined):
+                        raise _OptionalChainShortCircuit()
+                    if inner.computed:
+                        key = _to_property_key(self.eval(inner.property, env))
+                    else:
+                        key = inner.property.name
+                    fn = self._get_property(obj, key)
+                    this = obj
+                else:
+                    fn = self.eval(callee_node, env)
+                    this = undefined
+            except _OptionalChainShortCircuit:
+                return undefined
+            finally:
+                self._in_optional_chain = old_chain
         else:
-            fn = self.eval(callee_node, env)
-            this = undefined
+            # For bare Identifier calls, check WithBaseObject for `this` binding
+            if callee_t == 'Identifier':
+                fn, with_base = env.get_with_base(callee_node.name)
+                this = with_base if with_base is not None else undefined
+            else:
+                fn = self.eval(callee_node, env)
+                this = undefined
 
         # Check for optional call
         if getattr(node, 'optional', False) and (fn is null or fn is undefined):
-            return undefined
+            raise _OptionalChainShortCircuit()
 
         args = self._eval_args(node.arguments, env)
 
-        # Direct eval call: execute in calling scope
+        # Direct eval call: execute in calling scope (NOT for optional chain eval?.())
         if (callee_t == 'Identifier' and callee_node.name == 'eval'
-                and isinstance(fn, JSObject) and fn.name == 'eval'):
+                and isinstance(fn, JSObject) and fn.name == 'eval'
+                and not getattr(self, '_in_optional_chain', False)):
             return self._direct_eval(args, env)
 
         if node.line:
@@ -3011,11 +6425,82 @@ class Interpreter:
             self._current_col = node.col
         return self._call(fn, this, args, callee_node)
 
+    def _eval_in_default_param_context(self, env: Environment) -> bool:
+        """Check if the given env (or any ancestor up to function scope) is inside
+        a default parameter evaluation context where 'arguments' exists as a binding."""
+        e = env
+        while e is not None:
+            if e._in_default_param:
+                # Check if 'arguments' is bound in this function scope
+                return 'arguments' in e._bindings
+            if e._is_function:
+                break
+            e = e._parent
+        return False
+
+    @staticmethod
+    def _eval_ast_has_new_target(ast) -> bool:
+        """Check if an AST (from eval) contains a new.target MetaProperty.
+
+        Only checks the top-level; does not descend into function bodies
+        (those have their own new.target scope).
+        """
+        def _walk(node):
+            if node is None:
+                return False
+            t = type(node).__name__
+            if t == 'MetaProperty':
+                return getattr(node, 'meta', '') == 'new' and getattr(node, 'property', '') == 'target'
+            # Don't descend into nested functions/classes (they have their own scope)
+            if t in ('FunctionDeclaration', 'FunctionExpression',
+                      'ArrowFunctionExpression', 'ClassDeclaration',
+                      'ClassExpression', 'MethodDefinition'):
+                return False
+            # Walk child nodes
+            for attr in ('body', 'expression', 'left', 'right', 'test',
+                         'consequent', 'alternate', 'init', 'update',
+                         'argument', 'object', 'property', 'callee',
+                         'discriminant', 'block', 'handler', 'finalizer',
+                         'declarations', 'elements', 'properties', 'arguments',
+                         'cases', 'param', 'value', 'key', 'tag', 'quasi',
+                         'expressions', 'quasis'):
+                child = getattr(node, attr, None)
+                if child is None:
+                    continue
+                if isinstance(child, list):
+                    for item in child:
+                        if item is not None and hasattr(item, '__class__') and _walk(item):
+                            return True
+                elif hasattr(child, '__class__') and type(child).__name__ not in ('str', 'int', 'float', 'bool', 'NoneType'):
+                    if _walk(child):
+                        return True
+            return False
+        if hasattr(ast, 'body') and isinstance(ast.body, list):
+            for stmt in ast.body:
+                if _walk(stmt):
+                    return True
+        return False
+
+    @staticmethod
+    def _env_has_own_new_target(env: 'Environment') -> bool:
+        """Check if the environment chain has a non-arrow function scope
+        that provides its own new.target binding."""
+        e = env
+        while e is not None:
+            if 'new.target' in e._bindings:
+                return True
+            e = e._parent
+        return False
+
     def _direct_eval(self, args: list, env: Environment) -> Any:
         """Execute eval() in the calling scope (direct eval)."""
         if not args:
             return undefined
-        src = js_to_string(args[0])
+        arg0 = args[0]
+        # Per spec: if argument is not a string primitive, return it as-is
+        if not isinstance(arg0, str):
+            return arg0
+        src = arg0
         from pyquickjs.parser import Parser, ParseError
         from pyquickjs.lexer import JSSyntaxError as _JSSyntaxError, JS_MODE_STRICT
         # Save and restore filename context
@@ -3023,6 +6508,15 @@ class Interpreter:
         self._current_filename = '<eval>'
         try:
             parser = Parser(self._ctx, src, '<eval>')
+            parser.s.cur_func.is_eval = True
+            # Propagate super/new.target context from the calling environment
+            # Check if eval is inside a method with super access
+            e = env
+            while e is not None:
+                if '@@super_proto' in e._bindings:
+                    parser.s.cur_func.super_prop_allowed = True
+                    break
+                e = e._parent
             # Detect top-level "use strict" directive prologue BEFORE parsing
             # so that strict-mode reserved words (yield, etc.) are rejected as keywords
             stripped = src.lstrip()
@@ -3030,12 +6524,18 @@ class Interpreter:
                     or env._is_strict()):
                 parser.s.cur_func.js_mode |= JS_MODE_STRICT
             ast = parser.parse_program()
+
+            # Per spec 15.1.1: new.target in eval code is a SyntaxError unless
+            # the eval is contained in function code of a non-arrow function.
+            if self._eval_ast_has_new_target(ast):
+                # Check if we're inside a non-arrow function scope
+                if not self._env_has_own_new_target(env):
+                    raise _ThrowSignal(make_error('SyntaxError',
+                        'new.target expression is not allowed here'))
+
             result = undefined
             # Detect 'use strict' in eval code itself (for runtime strict mode)
-            eval_code_strict = (ast.body and
-                type(ast.body[0]).__name__ == 'ExpressionStatement' and
-                type(ast.body[0].expression).__name__ == 'Literal' and
-                ast.body[0].expression.value == 'use strict')
+            eval_code_strict = _has_use_strict_directive(ast.body)
             # In strict mode (inherited or from eval code), use isolated scope so
             # var declarations don't leak. In sloppy mode, run in the caller's scope.
             if env._is_strict() or eval_code_strict:
@@ -3044,17 +6544,223 @@ class Interpreter:
                     eval_env.set_strict()
                 self._hoist_declarations(ast.body, eval_env)
                 for stmt in ast.body:
-                    result = self.exec(stmt, eval_env)
+                    v = self.exec(stmt, eval_env)
+                    if v is not _EMPTY:
+                        result = v
             else:
                 # Sloppy mode: var declarations should leak to the enclosing
                 # function (or global) scope. Find the var scope.
                 var_scope = env
                 while var_scope._parent is not None and not var_scope._is_function:
                     var_scope = var_scope._parent
-                self._hoist_declarations(ast.body, var_scope)
-                eval_env = Environment(parent=env)
-                for stmt in ast.body:
-                    result = self.exec(stmt, eval_env)
+
+                # Per spec 19.2.1.3 EvalDeclarationInstantiation:
+                # If varEnv != lexEnv (i.e., inside default parameter expressions)
+                # and eval code declares var 'arguments', throw SyntaxError.
+                if self._eval_in_default_param_context(env):
+                    var_names = _collect_eval_var_names(ast.body)
+                    if 'arguments' in var_names:
+                        raise _ThrowSignal(make_error('SyntaxError',
+                            "cannot declare 'var arguments' in eval inside parameter initializer"))
+
+                # Eval-declared vars are configurable on the global object
+                old_eval_cfg = var_scope._eval_var_configurable
+                var_scope._eval_var_configurable = True
+                try:
+                    # Per spec: var/function declarations leak to var_scope;
+                    # let/const/class go to a new lexical env for this eval call.
+                    eval_env = Environment(parent=env)
+
+                    # Annex B.3.3.3: Collect function declarations inside blocks
+                    # for var-scoped binding creation.
+                    # A function f in a block qualifies UNLESS replacing it with
+                    # "var f" would produce an early error (e.g. let f in same scope).
+                    _annex_b_fns = set()
+                    def _collect_block_fns(stmts, lex_names_stack):
+                        """Recursively collect Annex B function names.
+                        lex_names_stack: list of sets of lex-declared names in enclosing blocks."""
+                        for st in stmts:
+                            stt = type(st).__name__
+                            if stt == 'BlockStatement':
+                                # Collect lex names in this block
+                                block_lex = set()
+                                for inner in st.body:
+                                    it = type(inner).__name__
+                                    if it == 'VariableDeclaration' and inner.kind in ('let', 'const'):
+                                        for decl in inner.declarations:
+                                            if type(decl.id).__name__ == 'Identifier':
+                                                block_lex.add(decl.id.name)
+                                # Check function declarations in this block
+                                for inner in st.body:
+                                    if type(inner).__name__ == 'FunctionDeclaration' and inner.id:
+                                        fn_name = inner.id.name
+                                        # Check all enclosing lex scopes for conflicts
+                                        conflicts = fn_name in block_lex
+                                        if not conflicts:
+                                            for ls in lex_names_stack:
+                                                if fn_name in ls:
+                                                    conflicts = True
+                                                    break
+                                        if not conflicts:
+                                            _annex_b_fns.add(fn_name)
+                                # Recurse into nested blocks
+                                _collect_block_fns(st.body, lex_names_stack + [block_lex])
+                            elif stt in ('IfStatement',):
+                                if st.consequent:
+                                    ct = type(st.consequent).__name__
+                                    if ct == 'FunctionDeclaration' and st.consequent.id:
+                                        fn_name = st.consequent.id.name
+                                        conflicts = any(fn_name in ls for ls in lex_names_stack)
+                                        if not conflicts:
+                                            _annex_b_fns.add(fn_name)
+                                    elif ct == 'BlockStatement':
+                                        _collect_block_fns([st.consequent], lex_names_stack)
+                                if hasattr(st, 'alternate') and st.alternate:
+                                    at = type(st.alternate).__name__
+                                    if at == 'FunctionDeclaration' and st.alternate.id:
+                                        fn_name = st.alternate.id.name
+                                        conflicts = any(fn_name in ls for ls in lex_names_stack)
+                                        if not conflicts:
+                                            _annex_b_fns.add(fn_name)
+                                    elif at in ('BlockStatement', 'IfStatement'):
+                                        _collect_block_fns([st.alternate], lex_names_stack)
+                            elif stt == 'SwitchStatement':
+                                for case in st.cases:
+                                    for inner in case.consequent:
+                                        if type(inner).__name__ == 'FunctionDeclaration' and inner.id:
+                                            fn_name = inner.id.name
+                                            conflicts = any(fn_name in ls for ls in lex_names_stack)
+                                            if not conflicts:
+                                                _annex_b_fns.add(fn_name)
+                            elif stt == 'TryStatement':
+                                if st.block:
+                                    _collect_block_fns([st.block], lex_names_stack)
+                                if st.handler and st.handler.body:
+                                    # Per B.3.5, for simple catch(ident), var ident in the 
+                                    # catch block body is allowed. For destructured catch
+                                    # patterns, var with same name IS an early error.
+                                    catch_names = set()
+                                    if st.handler.param and type(st.handler.param).__name__ != 'Identifier':
+                                        # Destructured catch parameter — collect bound names
+                                        def _bound_names(node, out):
+                                            nt = type(node).__name__
+                                            if nt == 'Identifier':
+                                                out.add(node.name)
+                                            elif nt == 'ObjectPattern':
+                                                for prop in node.properties:
+                                                    _bound_names(prop.value if hasattr(prop, 'value') and prop.value else prop.key, out)
+                                            elif nt == 'ArrayPattern':
+                                                for el in node.elements:
+                                                    if el:
+                                                        _bound_names(el, out)
+                                            elif nt == 'AssignmentPattern':
+                                                _bound_names(node.left, out)
+                                            elif nt == 'RestElement':
+                                                _bound_names(node.argument, out)
+                                        _bound_names(st.handler.param, catch_names)
+                                    _collect_block_fns([st.handler.body], lex_names_stack + [catch_names])
+                                if st.finalizer:
+                                    _collect_block_fns([st.finalizer], lex_names_stack)
+                            elif stt in ('ForStatement', 'ForInStatement', 'ForOfStatement'):
+                                loop_lex = set()
+                                if stt == 'ForStatement' and st.init:
+                                    if type(st.init).__name__ == 'VariableDeclaration' and st.init.kind in ('let', 'const'):
+                                        for decl in st.init.declarations:
+                                            if type(decl.id).__name__ == 'Identifier':
+                                                loop_lex.add(decl.id.name)
+                                elif stt in ('ForInStatement', 'ForOfStatement') and st.left:
+                                    if type(st.left).__name__ == 'VariableDeclaration' and st.left.kind in ('let', 'const'):
+                                        for decl in st.left.declarations:
+                                            if type(decl.id).__name__ == 'Identifier':
+                                                loop_lex.add(decl.id.name)
+                                body = st.body
+                                if body and type(body).__name__ == 'BlockStatement':
+                                    _collect_block_fns([body], lex_names_stack + [loop_lex])
+
+                    # Collect eval-level lex names
+                    _eval_lex_names = set()
+                    for st in ast.body:
+                        stt = type(st).__name__
+                        if stt == 'VariableDeclaration' and st.kind in ('let', 'const'):
+                            for decl in st.declarations:
+                                if type(decl.id).__name__ == 'Identifier':
+                                    _eval_lex_names.add(decl.id.name)
+
+                    _collect_block_fns(ast.body, [_eval_lex_names])
+
+                    # Create var-scoped bindings for Annex B functions
+                    _annex_b_var_names = set()
+                    for fn_name in _annex_b_fns:
+                        # Skip if a lex declaration with the same name exists
+                        if fn_name in _eval_lex_names:
+                            continue
+                        # Skip if the var scope already has a binding (not eval-configurable)
+                        if not var_scope.has_binding(fn_name):
+                            var_scope.define_var(fn_name, undefined)
+                            _annex_b_var_names.add(fn_name)
+                        elif var_scope.has_binding(fn_name):
+                            _annex_b_var_names.add(fn_name)
+
+                    # Store annex B names for runtime propagation
+                    eval_env._annex_b_var_names = _annex_b_var_names
+                    eval_env._annex_b_var_scope = var_scope
+
+                    # Check if var_scope is the global scope (no parent)
+                    _is_global_eval = var_scope._parent is None
+
+                    # Per spec steps 8-10: validate ALL declarations BEFORE installing any.
+                    # This ensures that if CanDeclareGlobalFunction/Var fails for any name,
+                    # no declarations from this eval are installed.
+                    if _is_global_eval:
+                        gt = var_scope._bindings.get('globalThis')
+                        if isinstance(gt, JSObject):
+                            for st in ast.body:
+                                stt = type(st).__name__
+                                if stt == 'FunctionDeclaration' and st.id:
+                                    fn_name = st.id.name
+                                    # CanDeclareGlobalFunction
+                                    if gt._descriptors and fn_name in gt._descriptors:
+                                        gdesc = gt._descriptors[fn_name]
+                                        if not gdesc.get('configurable', True):
+                                            is_accessor = 'get' in gdesc or 'set' in gdesc
+                                            if is_accessor or not gdesc.get('writable', False) or not gdesc.get('enumerable', False):
+                                                raise _ThrowSignal(make_error('TypeError',
+                                                    f"Cannot declare global function '{fn_name}'"))
+                                    elif not gt.extensible:
+                                        raise _ThrowSignal(make_error('TypeError',
+                                            f"Cannot define global function '{fn_name}', global is not extensible"))
+                                elif stt == 'VariableDeclaration' and st.kind == 'var':
+                                    for decl in st.declarations:
+                                        if type(decl.id).__name__ == 'Identifier':
+                                            vn = decl.id.name
+                                            # CanDeclareGlobalVar
+                                            if not gt.extensible and vn not in gt.props and not (gt._descriptors and vn in gt._descriptors):
+                                                raise _ThrowSignal(make_error('TypeError',
+                                                    f"Cannot define global variable '{vn}', global is not extensible"))
+
+                    # Hoist var declarations and function decls to var_scope
+                    for st in ast.body:
+                        stt = type(st).__name__
+                        if stt == 'FunctionDeclaration':
+                            if st.id:
+                                fn = self._make_function(st, var_scope)
+                                var_scope.define_var(st.id.name, fn)
+                        elif stt == 'VariableDeclaration' and st.kind == 'var':
+                            for decl in st.declarations:
+                                self._hoist_var_pattern(decl.id, var_scope)
+                        elif stt == 'VariableDeclaration' and st.kind in ('let', 'const'):
+                            for decl in st.declarations:
+                                self._hoist_let_pattern(decl.id, eval_env, st.kind)
+                        elif stt == 'ClassDeclaration' and st.id:
+                            eval_env.define_let(st.id.name, _SENTINEL)
+                        else:
+                            self._hoist_vars_nested(st, var_scope)
+                    for stmt in ast.body:
+                        v = self.exec(stmt, eval_env)
+                        if v is not _EMPTY:
+                            result = v
+                finally:
+                    var_scope._eval_var_configurable = old_eval_cfg
             return result
         except ParseError as e:
             err = make_error('SyntaxError', e.msg)
@@ -3073,19 +6779,26 @@ class Interpreter:
             if type(arg).__name__ == 'SpreadElement':
                 spread = self.eval(arg.argument, env)
                 if isinstance(spread, JSObject) and spread._is_array:
-                    args.extend(_array_to_list(spread))
-                elif isinstance(spread, str):
-                    args.extend(list(spread))
-                else:
-                    try:
-                        it = _get_iterator(spread, self)
+                    # Check for Symbol.iterator override on arrays
+                    sym_iter = _obj_get_property(spread, '@@iterator')
+                    if sym_iter is not undefined and sym_iter is not None and not getattr(sym_iter, '_is_builtin_array_iter', False):
+                        it = _call_value(sym_iter, spread, [])
                         while True:
                             v, done = _iterate_to_next(it)
                             if done:
                                 break
                             args.append(v)
-                    except _ThrowSignal:
-                        args.append(spread)
+                    else:
+                        args.extend(_array_to_list(spread))
+                elif isinstance(spread, str):
+                    args.extend(list(spread))
+                else:
+                    it = _get_iterator(spread, self)
+                    while True:
+                        v, done = _iterate_to_next(it)
+                        if done:
+                            break
+                        args.append(v)
             else:
                 args.append(self.eval(arg, env))
         return args
@@ -3112,8 +6825,11 @@ class Interpreter:
         raise _ThrowSignal(make_error('TypeError',
             f'{js_typeof(fn)} is not a function'))
 
-    def call_function(self, fn: JSFunction, this, args: list) -> Any:
+    def call_function(self, fn: JSFunction, this, args: list, *, as_constructor: bool = False) -> Any:
         """Call a JSFunction, setting up its environment."""
+        if fn.is_class_ctor and not as_constructor:
+            raise _ThrowSignal(make_error('TypeError',
+                f"Class constructor {fn.name or ''} cannot be invoked without 'new'"))
         self._call_stack_depth += 1
         if self._call_stack_depth > self._max_call_depth:
             self._call_stack_depth -= 1
@@ -3130,14 +6846,36 @@ class Interpreter:
             else:
                 actual_this = this if this is not undefined else undefined
 
+            # ECMAScript OrdinaryCallBindThis: in sloppy mode, undefined/null 'this'
+            # is coerced to global object, and primitive 'this' is wrapped via ToObject.
+            # This applies to both regular and bound calls (but not arrows).
+            if not fn.is_arrow:
+                fn_is_strict = fn.env._is_strict() if fn.env is not None else False
+                if not fn_is_strict:
+                    # Also check function body for 'use strict' directive
+                    if (isinstance(fn.body, BlockStatement) and
+                            _has_use_strict_directive(fn.body.body)):
+                        fn_is_strict = True
+                if not fn_is_strict:
+                    if actual_this is undefined or actual_this is null:
+                        global_this = self.global_env._bindings.get('this')
+                        if global_this is not None:
+                            actual_this = global_this
+                    elif not isinstance(actual_this, (JSObject, JSFunction)):
+                        # Primitive this → ToObject wrapping
+                        actual_this = _js_to_object(actual_this)
+
             if fn.is_generator:
                 return self._call_generator(fn, actual_this, args)
 
             call_env = Environment(parent=fn.env, is_function=True)
             call_env.define_let('this', actual_this)
             if not fn.is_arrow:
-                # Arrow functions don't have own 'arguments'; they inherit from enclosing scope
-                call_env.define_let('arguments', self._make_arguments(args))
+                # Determine if arguments should be strict/unmapped
+                _is_strict_args = _fn_is_strict(fn) or _fn_has_non_simple_params(fn)
+                # Create arguments object (mapped args set up after param binding)
+                _args_obj = self._make_arguments(args, strict=_is_strict_args, callee=fn)
+                call_env.define_let('arguments', _args_obj)
                 # Arrow functions don't have own 'new.target' either
                 call_env.define_let('new.target', undefined)
                 # Set @@super_proto for methods with a home object
@@ -3148,11 +6886,18 @@ class Interpreter:
                     else:
                         call_env.define_let('@@super_proto', fn.home_obj.proto)
             # Named function expressions: name is read-only inside the body (const-like)
-            if fn.name and fn.name != '<anonymous>':
+            # Skip for function declarations — their name is in the enclosing scope
+            if fn.name and fn.name != '<anonymous>' and not fn.is_declaration:
                 call_env.define_nfe_name(fn.name, fn)
 
             # Bind params
-            self._bind_params(fn.params, args, call_env)
+            self._bind_params(fn.params, args, call_env, is_arrow=fn.is_arrow)
+
+            # Set up mapped arguments after params are bound
+            if not fn.is_arrow and not _is_strict_args:
+                _param_names = _collect_simple_param_names(fn.params)
+                if _param_names:
+                    self._setup_mapped_args(_args_obj, _param_names, args, call_env)
             # Hoist body
             if isinstance(fn.body, BlockStatement):
                 # If any param has a default value, use a separate body scope so that
@@ -3162,9 +6907,7 @@ class Interpreter:
                     body_env = Environment(parent=call_env, is_function=True)
                     self._hoist_declarations(fn.body.body, body_env)
                     # Detect 'use strict' directive
-                    if (fn.body.body and type(fn.body.body[0]).__name__ == 'ExpressionStatement'
-                            and type(fn.body.body[0].expression).__name__ == 'Literal'
-                            and fn.body.body[0].expression.value == 'use strict'):
+                    if _has_use_strict_directive(fn.body.body):
                         body_env.set_strict()
                     try:
                         self._exec_block(fn.body, body_env, new_scope=False)
@@ -3174,9 +6917,7 @@ class Interpreter:
                 else:
                     self._hoist_declarations(fn.body.body, call_env)
                     # Detect 'use strict' directive
-                    if (fn.body.body and type(fn.body.body[0]).__name__ == 'ExpressionStatement'
-                            and type(fn.body.body[0].expression).__name__ == 'Literal'
-                            and fn.body.body[0].expression.value == 'use strict'):
+                    if _has_use_strict_directive(fn.body.body):
                         call_env.set_strict()
                     try:
                         self._exec_block(fn.body, call_env, new_scope=False)
@@ -3199,35 +6940,93 @@ class Interpreter:
         to_gen: _queue_module.Queue = _queue_module.Queue()
         _state = {'started': False, 'done': False}
 
+        # Eagerly bind parameters in the calling thread (per spec:
+        # FunctionDeclarationInstantiation happens during [[Call]], not .next()).
+        # Errors during parameter binding propagate immediately to the caller.
+        call_env = Environment(parent=fn.env, is_function=True)
+        call_env.define_let('this', this)
+        _is_strict_args = _fn_is_strict(fn) or _fn_has_non_simple_params(fn)
+        _args_obj = self._make_arguments(args, strict=_is_strict_args, callee=fn)
+        call_env.define_let('arguments', _args_obj)
+        call_env.define_let('new.target', undefined)
+        if fn.home_obj is not None:
+            if isinstance(fn.home_obj, JSFunction):
+                call_env.define_let('@@super_proto', fn.home_obj._super_ctor)
+            else:
+                call_env.define_let('@@super_proto', fn.home_obj.proto)
+        self._bind_params(fn.params, args, call_env)
+        # Set up mapped arguments for sloppy generators with simple params.
+        # Use the function's actual strictness (not _fn_is_strict which treats
+        # all generators as strict for caller/arguments poison-pill purposes).
+        _actual_strict = ((fn.env is not None and fn.env._is_strict()) or
+                          _has_use_strict_directive(fn.body.body if hasattr(fn.body, 'body') else []))
+        _has_non_simple = _fn_has_non_simple_params(fn)
+        if not _actual_strict and not _has_non_simple:
+            _param_names = _collect_simple_param_names(fn.params)
+            if _param_names:
+                self._setup_mapped_args(_args_obj, _param_names, args, call_env)
+        if isinstance(fn.body, BlockStatement):
+            self._hoist_declarations(fn.body.body, call_env)
+
         def yield_hook(val: Any, delegate: bool) -> Any:
             """Called from within the generator thread when a yield is encountered."""
             if delegate:
                 # yield* val: iterate the inner value, forwarding yields and sends
-                try:
-                    inner_iter = _get_iterator(val, self)
-                except Exception:
-                    raise _ThrowSignal(make_error('TypeError', 'not iterable'))
-                send_val = undefined
+                # Spec 14.4.14 Evaluation of yield* AssignmentExpression
+                inner_iter = _get_iterator(val, self)
+                if not isinstance(inner_iter, JSObject):
+                    raise _ThrowSignal(make_error('TypeError',
+                        'Result of the Symbol.iterator method is not an object'))
+                inner_next_fn = _obj_get_property(inner_iter, 'next')
+                received_type = 'next'
+                received_value = undefined
                 while True:
-                    inner_next_fn = _obj_get_property(inner_iter, 'next')
-                    inner_result = _call_value(inner_next_fn, inner_iter, [send_val])
-                    inner_val = inner_result.props.get('value', undefined) if isinstance(inner_result, JSObject) else undefined
-                    inner_done = inner_result.props.get('done', False) if isinstance(inner_result, JSObject) else True
-                    if js_is_truthy(inner_done):
-                        return inner_val  # value of yield* expression
-                    from_gen.put(('yield', inner_val))
-                    msg = to_gen.get()
-                    if msg[0] == 'return':
-                        ret_fn = _obj_get_property(inner_iter, 'return')
-                        if ret_fn is not undefined:
-                            _call_value(ret_fn, inner_iter, [msg[1]])
-                        raise _ReturnSignal(msg[1])
-                    if msg[0] == 'throw':
+                    if received_type == 'next':
+                        # Step 7.a: received is normal completion
+                        inner_result = _call_value(inner_next_fn, inner_iter, [received_value])
+                        if not isinstance(inner_result, JSObject):
+                            raise _ThrowSignal(make_error('TypeError',
+                                'iterator.next() returned a non-object value'))
+                        inner_done = _obj_get_property(inner_result, 'done')
+                        if js_is_truthy(inner_done):
+                            return _obj_get_property(inner_result, 'value')
+                    elif received_type == 'throw':
+                        # Step 7.b: received is throw completion
                         thr_fn = _obj_get_property(inner_iter, 'throw')
-                        if thr_fn is not undefined:
-                            _call_value(thr_fn, inner_iter, [msg[1]])
-                        raise _ThrowSignal(msg[1])
-                    send_val = msg[1]
+                        if thr_fn is undefined or thr_fn is null or not (isinstance(thr_fn, JSFunction) or (isinstance(thr_fn, JSObject) and thr_fn._call is not None)):
+                            close_fn = _obj_get_property(inner_iter, 'return')
+                            if close_fn is not undefined and close_fn is not null and (isinstance(close_fn, JSFunction) or (isinstance(close_fn, JSObject) and close_fn._call is not None)):
+                                _call_value(close_fn, inner_iter, [])
+                            raise _ThrowSignal(make_error('TypeError',
+                                'The iterator does not provide a \'throw\' method'))
+                        inner_result = _call_value(thr_fn, inner_iter, [received_value])
+                        if not isinstance(inner_result, JSObject):
+                            raise _ThrowSignal(make_error('TypeError',
+                                'iterator.throw() returned a non-object value'))
+                        thr_done = _obj_get_property(inner_result, 'done')
+                        if js_is_truthy(thr_done):
+                            return _obj_get_property(inner_result, 'value')
+                    elif received_type == 'return':
+                        # Step 7.c: received is return completion
+                        ret_fn = _obj_get_property(inner_iter, 'return')
+                        if ret_fn is undefined or ret_fn is null or not (isinstance(ret_fn, JSFunction) or (isinstance(ret_fn, JSObject) and ret_fn._call is not None)):
+                            raise _ReturnSignal(received_value)
+                        inner_result = _call_value(ret_fn, inner_iter, [received_value])
+                        if not isinstance(inner_result, JSObject):
+                            raise _ThrowSignal(make_error('TypeError',
+                                'iterator.return() returned a non-object value'))
+                        ret_done = _obj_get_property(inner_result, 'done')
+                        if js_is_truthy(ret_done):
+                            ret_val = _obj_get_property(inner_result, 'value')
+                            raise _ReturnSignal(ret_val)
+                    else:
+                        break
+
+                    # GeneratorYield(innerResult) — pass raw result to caller
+                    from_gen.put(('yield_raw', inner_result))
+                    msg = to_gen.get()
+                    received_type = msg[0]
+                    received_value = msg[1]
             else:
                 from_gen.put(('yield', val))
                 msg = to_gen.get()
@@ -3240,12 +7039,7 @@ class Interpreter:
         def gen_run():
             _thread_local.yield_hook = yield_hook
             try:
-                call_env = Environment(parent=fn.env, is_function=True)
-                call_env.define_let('this', this)
-                call_env.define_let('arguments', self._make_arguments(args))
-                self._bind_params(fn.params, args, call_env)
                 if isinstance(fn.body, BlockStatement):
-                    self._hoist_declarations(fn.body.body, call_env)
                     try:
                         self._exec_block(fn.body, call_env, new_scope=False)
                         from_gen.put(('return', undefined))
@@ -3264,16 +7058,25 @@ class Interpreter:
         def _gen_next(send_val=undefined):
             if _state['done']:
                 return {'value': undefined, 'done': True}
+            if _state.get('executing'):
+                _state['done'] = True
+                raise _ThrowSignal(make_error('TypeError', 'Generator is already running'))
             if not _state['started']:
                 _state['started'] = True
+                _state['executing'] = True
                 t = threading.Thread(target=gen_run, daemon=True)
                 t.start()
                 # Don't send anything on first call; thread runs immediately
             else:
+                _state['executing'] = True
                 to_gen.put(('next', send_val))
             msg = from_gen.get()
+            _state['executing'] = False
             if msg[0] == 'yield':
                 return {'value': msg[1], 'done': False}
+            elif msg[0] == 'yield_raw':
+                # yield* delegation: inner result passed through as-is
+                return msg[1]
             elif msg[0] == 'return':
                 _state['done'] = True
                 return {'value': msg[1], 'done': True}
@@ -3288,13 +7091,32 @@ class Interpreter:
             if _state['done'] or not _state['started']:
                 _state['done'] = True
                 return {'value': val, 'done': True}
+            if _state.get('executing'):
+                _state['done'] = True
+                raise _ThrowSignal(make_error('TypeError', 'Generator is already running'))
+            _state['executing'] = True
             to_gen.put(('return', val))
             try:
-                from_gen.get(timeout=5)
+                msg = from_gen.get(timeout=30)
             except Exception:
-                pass
-            _state['done'] = True
-            return {'value': val, 'done': True}
+                _state['done'] = True
+                _state['executing'] = False
+                return {'value': val, 'done': True}
+            _state['executing'] = False
+            if msg[0] == 'yield':
+                # Generator's finally block yielded a value
+                return {'value': msg[1], 'done': False}
+            elif msg[0] == 'yield_raw':
+                return msg[1]
+            elif msg[0] == 'return':
+                _state['done'] = True
+                return {'value': msg[1], 'done': True}
+            elif msg[0] == 'throw':
+                _state['done'] = True
+                raise _ThrowSignal(msg[1])
+            else:
+                _state['done'] = True
+                return {'value': val, 'done': True}
 
         def _gen_throw(err):
             if _state['done']:
@@ -3302,10 +7124,17 @@ class Interpreter:
             if not _state['started']:
                 _state['done'] = True
                 raise _ThrowSignal(err)
+            if _state.get('executing'):
+                _state['done'] = True
+                raise _ThrowSignal(make_error('TypeError', 'Generator is already running'))
+            _state['executing'] = True
             to_gen.put(('throw', err))
             msg = from_gen.get()
+            _state['executing'] = False
             if msg[0] == 'yield':
                 return {'value': msg[1], 'done': False}
+            elif msg[0] == 'yield_raw':
+                return msg[1]
             elif msg[0] == 'return':
                 _state['done'] = True
                 return {'value': msg[1], 'done': True}
@@ -3316,31 +7145,35 @@ class Interpreter:
                 _state['done'] = True
                 raise RuntimeError(f'Generator error: {msg[1]}')
 
-        gen_obj = JSObject(class_name='Generator')
+        gen_proto = _build_function_prototype(fn)
+        if not isinstance(gen_proto, JSObject):
+            gen_proto = _PROTOS.get('Generator') or _PROTOS.get('Object')
+        gen_obj = JSObject(class_name='Generator', proto=gen_proto)
         gen_obj._gen_iter = True  # mark as generator for _get_iterator
+
+        def _wrap_gen_result(result):
+            """Convert generator internal result to a JS IteratorResult object."""
+            if isinstance(result, JSObject):
+                return result  # yield_raw: already a JS object
+            res_obj = JSObject(proto=_PROTOS.get('Object'))
+            res_obj.props['value'] = result['value']
+            res_obj.props['done'] = result['done']
+            return res_obj
 
         def next_fn(this_val, call_args):
             send_val = call_args[0] if call_args else undefined
             result = _gen_next(send_val)
-            res_obj = JSObject()
-            res_obj.props['value'] = result['value']
-            res_obj.props['done'] = result['done']
-            return res_obj
+            return _wrap_gen_result(result)
 
         def return_fn(this_val, call_args):
             val = call_args[0] if call_args else undefined
             result = _gen_return(val)
-            res_obj = JSObject()
-            res_obj.props['value'] = result['value']
-            res_obj.props['done'] = result['done']
-            return res_obj
+            return _wrap_gen_result(result)
 
         def throw_fn(this_val, call_args):
             err = call_args[0] if call_args else undefined
             result = _gen_throw(err)
-            res_obj = JSObject()
-            res_obj.props['value'] = result['value']
-            res_obj.props['done'] = result['done']
+            return _wrap_gen_result(result)
             return res_obj
 
         gen_obj.props['next'] = _make_native_fn('next', next_fn)
@@ -3354,19 +7187,90 @@ class Interpreter:
         """Execute a statement inside a generator (legacy, no longer used)."""
         self.exec(stmt, env)
 
-    def _make_arguments(self, args: list) -> JSObject:
-        """Create the 'arguments' object."""
-        obj = JSObject(class_name='Arguments')
-        obj._is_array = True
-        data = list(args)
-        obj.props['@@array_data'] = data
-        obj.props['length'] = len(data)
-        for i, v in enumerate(data):
+    def _make_arguments(self, args: list, strict: bool = False, callee=None) -> JSObject:
+        """Create the 'arguments' object (array-like, NOT a real array)."""
+        obj = JSObject(proto=_PROTOS.get('Object'), class_name='Arguments')
+        # Arguments is NOT a real array — no _is_array, no @@array_data.
+        # Mark length as non-enumerable per spec
+        obj.props['length'] = len(args)
+        obj._non_enum = obj._non_enum or set()
+        obj._non_enum.add('length')
+        for i, v in enumerate(args):
             obj.props[str(i)] = v
+        # Arguments objects should be iterable via Symbol.iterator
+        arr_ctor = self.global_env._bindings.get('Array') if self.global_env else None
+        if isinstance(arr_ctor, JSObject):
+            arr_proto = arr_ctor.props.get('prototype')
+            if isinstance(arr_proto, JSObject):
+                iter_fn = arr_proto.props.get('@@iterator')
+                if iter_fn is not None:
+                    obj.props['@@iterator'] = iter_fn
+                    obj._non_enum.add('@@iterator')
+        # @@toStringTag = 'Arguments' (non-enum, configurable)
+        obj.props['@@toStringTag'] = 'Arguments'
+        obj._non_enum.add('@@toStringTag')
+        if strict:
+            # Strict mode: callee/caller are poison-pill accessors
+            tte = self._get_throw_type_error()
+            obj._descriptors = obj._descriptors or {}
+            obj._descriptors['callee'] = {
+                'get': tte, 'set': tte,
+                'enumerable': False, 'configurable': False,
+            }
+            obj._non_enum.add('callee')
+        else:
+            # Sloppy mode: callee is the calling function (non-enumerable, writable, configurable)
+            if callee is not None:
+                obj.props['callee'] = callee
+                obj._non_enum.add('callee')
         return obj
 
-    def _bind_params(self, params: list, args: list, env: Environment) -> None:
+    def _setup_mapped_args(self, args_obj: JSObject, param_names: list, args: list, env: 'Environment') -> None:
+        """Set up mapped arguments using a parameter map (spec §9.4.4).
+
+        Values stay in props as normal data properties. The mapping is stored
+        in ``_mapped_params`` (index-str → param-name) and ``_mapped_env``.
+        """
+        param_map: dict[str, str] = {}
+        seen: set[str] = set()
+        # Walk from last to first to handle duplicate param names (last wins)
+        for i in range(min(len(param_names), len(args)) - 1, -1, -1):
+            name = param_names[i]
+            if name in seen:
+                continue
+            seen.add(name)
+            param_map[str(i)] = name
+        args_obj._mapped_params = param_map
+        args_obj._mapped_env = env
+
+    def _get_throw_type_error(self) -> JSObject:
+        """Return the %ThrowTypeError% intrinsic (singleton per realm)."""
+        if hasattr(self, '_throw_type_error') and self._throw_type_error is not None:
+            return self._throw_type_error
+        def _tte_call(this, args):
+            raise _ThrowSignal(make_error('TypeError',
+                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"))
+        fn = _make_native_fn('%ThrowTypeError%', _tte_call, 0)
+        fn.extensible = False
+        # Freeze it: non-writable, non-configurable own properties
+        fn._descriptors = fn._descriptors or {}
+        fn._descriptors['length'] = {'value': 0, 'writable': False, 'enumerable': False, 'configurable': False}
+        fn._descriptors['name'] = {'value': '', 'writable': False, 'enumerable': False, 'configurable': False}
+        fn.name = ''
+        self._throw_type_error = fn
+        return fn
+
+    def _bind_params(self, params: list, args: list, env: Environment, is_arrow: bool = False) -> None:
         """Bind function parameters in the call environment."""
+        # Pre-declare all parameter names as TDZ to prevent forward references
+        # from resolving to outer scope (e.g., function(x = y, y) where y is global)
+        has_defaults = any(type(p).__name__ == 'AssignmentPattern' for p in params)
+        if has_defaults:
+            env._in_default_param = True
+            for param in params:
+                for name in _collect_binding_names(param):
+                    if name not in env._bindings:
+                        env._bindings[name] = _SENTINEL
         for i, param in enumerate(params):
             t = type(param).__name__
             if t == 'RestElement':
@@ -3375,47 +7279,81 @@ class Interpreter:
                 break
             val = args[i] if i < len(args) else undefined
             self._bind_pattern(param, val, env, 'let')
-
+        if has_defaults:
+            env._in_default_param = False
     def _eval_new(self, node: NewExpression, env: Environment) -> Any:
         callee = self.eval(node.callee, env)
         args = self._eval_args(node.arguments, env)
         return self._construct(callee, args)
 
-    def _construct(self, ctor, args: list) -> Any:
+    def _construct(self, ctor, args: list, new_target=None) -> Any:
         if isinstance(ctor, JSFunction):
             # Bound functions: prepend bound args, use original target for construction
             if ctor._bound_args or ctor._bound_target is not None:
                 bound_target = ctor._bound_target if ctor._bound_target is not None else ctor
-                return self._construct(bound_target, list(ctor._bound_args) + list(args))
+                # Per spec: if SameValue(F, newTarget), set newTarget = target
+                effective_nt = new_target or ctor
+                if effective_nt is ctor:
+                    effective_nt = bound_target
+                return self._construct(bound_target, list(ctor._bound_args) + list(args), new_target=effective_nt)
             if ctor.is_arrow:
                 raise _ThrowSignal(make_error('TypeError',
                     'Arrow functions cannot be used as constructors'))
             if ctor.is_generator:
                 raise _ThrowSignal(make_error('TypeError',
                     f'{ctor.name or "function"} is not a constructor'))
-            proto = _build_function_prototype(ctor)
-            obj = JSObject(proto=proto)
+            # Use new_target for prototype lookup if provided
+            # Per spec GetPrototypeFromConstructor: Get(constructor, "prototype")
+            # which must invoke getters
+            actual_new_target = new_target or ctor
+            proto = _obj_get_property(actual_new_target, 'prototype')
+            # Per spec GetPrototypeFromConstructor steps 3-4:
+            # If proto is not an Object, call GetFunctionRealm(constructor).
+            # GetFunctionRealm throws TypeError for revoked proxies (7.3.22 step 4a).
+            if not isinstance(proto, (JSObject, JSFunction)):
+                if _is_proxy(actual_new_target) and actual_new_target._proxy_handler is None:
+                    raise _ThrowSignal(make_error('TypeError',
+                        'Cannot perform \'get\' on a proxy that has been revoked'))
+                proto = _build_function_prototype(ctor)
 
-            # Initialize instance fields before running constructor body
+            is_derived = ctor._super_ctor is not None
+
+            if is_derived:
+                # Derived constructor: this is uninitialized until super() is called
+                obj = _SENTINEL
+            else:
+                obj = JSObject(proto=proto)
+
+            # Initialize instance fields before running constructor body (base class only)
             instance_fields = getattr(ctor, '_instance_fields', [])
-            if instance_fields:
+            if instance_fields and not is_derived:
                 field_env = Environment(parent=ctor.env, is_function=False)
                 field_env.define_let('this', obj)
-                for f in instance_fields:
-                    key = self._eval_property_key(f.key, f.computed, ctor.env)
-                    key_str = js_to_string(key)
-                    val = self.eval(f.value, field_env) if f.value is not None else undefined
+                for key_str, val_node in instance_fields:
+                    val = self.eval(val_node, field_env) if val_node is not None else undefined
                     obj.props[key_str] = val
 
+            # Initialize private instance fields (base class only)
+            if not is_derived:
+                self._init_private_fields(obj, ctor)
+
             call_env = Environment(parent=ctor.env, is_function=True)
-            call_env.define_let('this', obj)
-            call_env.define_let('arguments', self._make_arguments(args))
-            call_env.define_let('new.target', ctor)
+            if is_derived:
+                # TDZ: accessing 'this' before super() throws ReferenceError
+                call_env._bindings['this'] = _SENTINEL
+                call_env._bindings['@@derived'] = True
+            else:
+                call_env.define_let('this', obj)
+            _is_strict_args = _fn_is_strict(ctor) or _fn_has_non_simple_params(ctor)
+            _args_obj = self._make_arguments(args, strict=_is_strict_args, callee=ctor)
+            call_env.define_let('arguments', _args_obj)
+            call_env.define_let('new.target', new_target or ctor)
             if ctor.home_obj is not None:
                 call_env.define_let('@@super_proto', ctor.home_obj.proto)
             # Make super constructor available for super() calls in constructor body
             if ctor._super_ctor is not None:
                 call_env.define_let('@@super_ctor', ctor._super_ctor)
+                call_env.define_let('@@active_ctor', ctor)
                 # Also set super proto for super.method() in constructor
                 if ctor.home_obj is None:
                     # instance method super.x() proto is from super_ctor.prototype
@@ -3426,6 +7364,11 @@ class Interpreter:
                         call_env.define_let('@@super_proto', sc.props['prototype'])
 
             self._bind_params(ctor.params, args, call_env)
+            # Set up mapped arguments for sloppy constructors with simple params
+            if not _is_strict_args:
+                _param_names = _collect_simple_param_names(ctor.params)
+                if _param_names:
+                    self._setup_mapped_args(_args_obj, _param_names, args, call_env)
             if isinstance(ctor.body, BlockStatement):
                 self._hoist_declarations(ctor.body.body, call_env)
                 try:
@@ -3434,14 +7377,46 @@ class Interpreter:
                     # If explicit return of object/function, use that
                     if isinstance(r.value, (JSObject, JSFunction)):
                         return r.value
+                    # Derived constructor: non-undefined return is TypeError
+                    if is_derived and r.value is not undefined:
+                        raise _ThrowSignal(make_error('TypeError',
+                            'Derived constructors may only return object or undefined'))
+                    # Derived: return undefined falls through to this check below
+                    if is_derived:
+                        this_val = call_env._bindings.get('this', _SENTINEL)
+                        if this_val is _SENTINEL:
+                            raise _ThrowSignal(make_error('ReferenceError',
+                                "Must call super constructor in derived class before returning from derived constructor"))
+                        return this_val
+
+            if is_derived:
+                # implicit return — check this was initialized by super()
+                this_val = call_env._bindings.get('this', _SENTINEL)
+                if this_val is _SENTINEL:
+                    raise _ThrowSignal(make_error('ReferenceError',
+                        "Must call super constructor in derived class before returning from derived constructor"))
+                return this_val
             return obj
         if isinstance(ctor, JSObject):
             if ctor._construct is not None:
-                return ctor._construct(undefined, args)
-            if ctor._call is not None:
-                return ctor._call(undefined, args)
+                if _is_proxy(ctor):
+                    return ctor._construct(new_target or ctor, args)
+                # For native constructors that use new_target's prototype,
+                # let each constructor handle GetPrototypeFromConstructor
+                # internally if needed (e.g. ArrayBuffer does it before
+                # allocation). Pass new_target info via the result object.
+                result = ctor._construct(new_target or ctor, args)
+                # Apply new_target's prototype if new_target differs from ctor
+                if new_target is not None and new_target is not ctor:
+                    # Skip if result already has the correct prototype
+                    # (set by _construct internally, e.g. ArrayBuffer)
+                    if isinstance(result, (JSObject, JSFunction)) and not getattr(result, '_nt_proto_set', False):
+                        nt_proto_val = _obj_get_property(new_target, 'prototype')
+                        if isinstance(nt_proto_val, (JSObject, JSFunction)):
+                            result.proto = nt_proto_val
+                return result
             raise _ThrowSignal(make_error('TypeError',
-                f'[object {ctor.class_name}] is not a constructor'))
+                f'{ctor.name or "[object {ctor.class_name}]"} is not a constructor'))
         raise _ThrowSignal(make_error('TypeError',
             f'{js_typeof(ctor)} is not a constructor'))
 
@@ -3449,11 +7424,30 @@ class Interpreter:
         if node.line:
             self._current_line = node.line
             self._current_col = node.col
+        is_super = type(node.object).__name__ == 'Super'
         obj = self.eval(node.object, env)
         if node.optional and (obj is null or obj is undefined):
-            return undefined
+            raise _OptionalChainShortCircuit()
+        # For super property access, null base must throw TypeError
+        if is_super and (obj is null or obj is None or obj is undefined):
+            raise _ThrowSignal(make_error('TypeError',
+                "Cannot read properties of null (reading from super)"))
+        # Private field access: this.#x
+        if isinstance(node.property, PrivateIdentifier):
+            return self._get_private_field(obj, node.property.name, env)
         if node.computed:
+            # Per spec §13.3.7.1: for super[expr], actualThis = GetThisBinding()
+            # BEFORE evaluating the key expression. Throws ReferenceError if this
+            # is uninitialized (derived constructor before super()).
+            if is_super:
+                env.get('this')
             key = self.eval(node.property, env)
+            # Per spec §13.3.2: evaluate key expression first, THEN check base.
+            # §6.2.5.5 GetValue calls ToObject(base) BEFORE ToPropertyKey(key),
+            # so null/undefined base throws TypeError without stringifying key.
+            if obj is null or obj is undefined:
+                raise _ThrowSignal(make_error('TypeError',
+                    f"cannot read properties of {'null' if obj is null else 'undefined'}"))
             if isinstance(key, JSSymbol):
                 key_str = _symbol_to_key(key)
             elif isinstance(key, (int, float)) and not isinstance(key, bool):
@@ -3462,6 +7456,10 @@ class Interpreter:
                 key_str = js_to_string(key)
         else:
             key_str = node.property.name
+        if is_super and isinstance(obj, JSObject):
+            # Super property read: look up on super proto chain, but invoke getters with `this`
+            this_val = env.get('this') if env.has_binding('this') else undefined
+            return _obj_get_property(obj, key_str, this=this_val)
         return self._get_property(obj, key_str)
 
     def _eval_template(self, node: TemplateLiteral, env: Environment) -> str:
@@ -3474,13 +7472,62 @@ class Interpreter:
         return ''.join(parts)
 
     def _eval_tagged_template(self, node: TaggedTemplateExpression, env: Environment) -> Any:
-        tag = self.eval(node.tag, env)
-        strings = make_array([q.value for q in node.quasi.quasis])
-        # raw strings
-        raw = make_array([q.value for q in node.quasi.quasis])
-        strings.props['raw'] = raw
+        # Determine tag function and this binding
+        tag_node = node.tag
+        tag_type = type(tag_node).__name__
+        if tag_type == 'MemberExpression':
+            obj = self.eval(tag_node.object, env)
+            if tag_node.computed:
+                prop = self.eval(tag_node.property, env)
+                tag = _obj_get_property(obj, js_to_string(prop) if not isinstance(prop, str) else prop)
+            else:
+                tag = _obj_get_property(obj, tag_node.property.name)
+            this_val = obj
+        else:
+            tag = self.eval(tag_node, env)
+            this_val = undefined
+
+        # GetTemplateObject: cache by AST node identity
+        cache = getattr(self, '_template_cache', None)
+        if cache is None:
+            cache = {}
+            self._template_cache = cache
+        node_id = id(node.quasi)
+        if node_id in cache:
+            strings = cache[node_id]
+        else:
+            cooked = [q.value if q.value is not None else undefined for q in node.quasi.quasis]
+            raw_vals = [q.raw for q in node.quasi.quasis]
+            strings = make_array(cooked)
+            raw = make_array(raw_vals)
+            # Freeze both arrays: make elements and length non-writable/non-configurable
+            def _freeze_template_arr(arr):
+                if arr._descriptors is None:
+                    arr._descriptors = {}
+                data = arr.props.get('@@array_data', [])
+                for i in range(len(data)):
+                    arr._descriptors[str(i)] = {
+                        'value': data[i], 'writable': False,
+                        'enumerable': True, 'configurable': False,
+                    }
+                arr._descriptors['length'] = {
+                    'value': len(data), 'writable': False,
+                    'enumerable': False, 'configurable': False,
+                }
+                arr.extensible = False
+            _freeze_template_arr(raw)
+            strings.props['raw'] = raw
+            if strings._descriptors is None:
+                strings._descriptors = {}
+            strings._descriptors['raw'] = {
+                'value': raw, 'writable': False,
+                'enumerable': False, 'configurable': False,
+            }
+            _freeze_template_arr(strings)
+            cache[node_id] = strings
+
         args = [strings] + [self.eval(e, env) for e in node.quasi.expressions]
-        return self._call(tag, undefined, args)
+        return self._call(tag, this_val, args)
 
     def _make_function(self, node, env: Environment) -> JSFunction:
         """Create a JSFunction from a function AST node."""
@@ -3500,8 +7547,13 @@ class Interpreter:
             interp=self,
         )
         fn.source_text = getattr(node, 'source_text', '')
+        fn.is_declaration = (t == 'FunctionDeclaration')
         if getattr(node, 'line', None):
             fn._static_props = {'lineNumber': node.line, 'columnNumber': node.col}
+        if fn.is_generator:
+            gen_fn_proto = _PROTOS.get('GeneratorFunction')
+            if gen_fn_proto is not None:
+                fn._proto = gen_fn_proto
         return fn
 
     def _make_arrow(self, node: ArrowFunctionExpression, env: Environment) -> JSFunction:
@@ -3520,6 +7572,153 @@ class Interpreter:
     def _eval_class_expr(self, node: ClassExpression, env: Environment) -> Any:
         return self._eval_class(node.id, node.super_class, node.body, env)
 
+    def _init_private_fields(self, instance, ctor):
+        """Initialize private instance fields and install brand on an instance."""
+        # Get brand and private fields from ctor (JSFunction or JSObject)
+        if isinstance(ctor, JSFunction):
+            private_brand = ctor._private_brand
+            private_inst_fields = ctor._private_instance_fields
+            private_methods = ctor._private_methods
+        else:
+            pf = ctor._private_fields
+            if pf is None:
+                return
+            private_brand = pf.get('@@meta_brand')
+            private_inst_fields = pf.get('@@meta_inst_fields', [])
+            private_methods = pf.get('@@meta_methods')
+        if private_brand is None:
+            return
+        if not private_inst_fields and not private_methods:
+            return
+        if instance._private_fields is None:
+            instance._private_fields = {}
+        # Install brand
+        instance._private_fields[f"@@brand_{private_brand}"] = True
+        # Initialize private instance fields
+        if private_inst_fields:
+            field_env = Environment(parent=ctor.env if isinstance(ctor, JSFunction) else None, is_function=False)
+            field_env.define_let('this', instance)
+            for f in private_inst_fields:
+                name = f.key.name  # e.g. "#x"
+                val = self.eval(f.value, field_env) if f.value is not None else undefined
+                brand_key = f"@@private_{private_brand}_{name}"
+                instance._private_fields[brand_key] = val
+
+    def _get_class_private_info(self, obj):
+        """Extract (brand, methods, inst_fields) from a class constructor."""
+        if isinstance(obj, JSFunction):
+            return (obj._private_brand, 
+                    obj._private_methods, 
+                    obj._private_instance_fields)
+        pf = getattr(obj, '_private_fields', None)
+        if pf:
+            return (pf.get('@@meta_brand'),
+                    pf.get('@@meta_methods'),
+                    pf.get('@@meta_inst_fields', []))
+        return None, None, []
+
+    def _find_private_brand(self, name: str, env: Environment):
+        """Find the class that declares a private name, return (class_obj, brand)."""
+        # Walk up the environment chain to find the enclosing class
+        e = env
+        while e is not None:
+            for _key, val in e._bindings.items():
+                if not isinstance(val, (JSFunction, JSObject)):
+                    continue
+                brand, methods, inst_fields = self._get_class_private_info(val)
+                if brand is None:
+                    continue
+                # Check if this class declares the private name
+                if methods and name in methods:
+                    return val, brand
+                if inst_fields:
+                    for f in inst_fields:
+                        if f.key.name == name:
+                            return val, brand
+                # Check static private fields
+                pf = val._private_fields
+                if pf and f"@@private_{brand}_{name}" in pf:
+                    return val, brand
+            e = e._parent
+        return None, None
+
+    def _get_private_field(self, obj, name: str, env: Environment):
+        """Read a private field/method from obj. name is e.g. '#x'."""
+        if not isinstance(obj, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError',
+                f"Cannot read private member {name} from a non-object"))
+        class_obj, brand = self._find_private_brand(name, env)
+        if class_obj is None:
+            raise _ThrowSignal(make_error('TypeError',
+                f"Cannot read private member {name} from an object whose class did not declare it"))
+        # Check brand
+        pf = obj._private_fields
+        if pf is None or f"@@brand_{brand}" not in pf:
+            raise _ThrowSignal(make_error('TypeError',
+                f"Cannot read private member {name} from an object whose class did not declare it"))
+        # Check for private method/accessor on the class
+        _, methods, _ = self._get_class_private_info(class_obj)
+        if methods and name in methods:
+            entry = methods[name]
+            if entry[0] == 'method':
+                return entry[1]
+            elif entry[0] == 'accessor':
+                getter = entry[1]
+                if getter is None:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'{name}' was defined without a getter"))
+                return self.call_function(getter, obj, [])
+        # Private field
+        brand_key = f"@@private_{brand}_{name}"
+        if brand_key in pf:
+            return pf[brand_key]
+        raise _ThrowSignal(make_error('TypeError',
+            f"Cannot read private member {name} from an object whose class did not declare it"))
+
+    def _set_private_field(self, obj, name: str, value, env: Environment):
+        """Write to a private field on obj. name is e.g. '#x'."""
+        if not isinstance(obj, (JSObject, JSFunction)):
+            raise _ThrowSignal(make_error('TypeError',
+                f"Cannot write private member {name} to a non-object"))
+        class_obj, brand = self._find_private_brand(name, env)
+        if class_obj is None:
+            raise _ThrowSignal(make_error('TypeError',
+                f"Cannot write private member {name} to an object whose class did not declare it"))
+        pf = obj._private_fields
+        if pf is None or f"@@brand_{brand}" not in pf:
+            raise _ThrowSignal(make_error('TypeError',
+                f"Cannot write private member {name} to an object whose class did not declare it"))
+        # Check for private accessor (setter)
+        _, methods, _ = self._get_class_private_info(class_obj)
+        if methods and name in methods:
+            entry = methods[name]
+            if entry[0] == 'method':
+                raise _ThrowSignal(make_error('TypeError',
+                    f"'{name}' is read-only"))
+            elif entry[0] == 'accessor':
+                setter = entry[2] if len(entry) > 2 else None
+                if setter is None:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"'{name}' was defined without a setter"))
+                self.call_function(setter, obj, [value])
+                return value
+        # Private field
+        brand_key = f"@@private_{brand}_{name}"
+        pf[brand_key] = value
+        return value
+
+    def _has_private_field(self, obj, name: str, env: Environment) -> bool:
+        """Check if obj has a private field/method named name (e.g. '#x')."""
+        if not isinstance(obj, (JSObject, JSFunction)):
+            return False
+        class_obj, brand = self._find_private_brand(name, env)
+        if class_obj is None:
+            return False
+        pf = obj._private_fields
+        if pf is None or f"@@brand_{brand}" not in pf:
+            return False
+        return True
+
     def _eval_class(self, id_node, super_class_node, body: ClassBody, env: Environment) -> Any:
         """Build a class constructor function."""
         class_name = id_node.name if id_node else ''
@@ -3529,10 +7728,26 @@ class Interpreter:
         super_proto = None
         if super_class_node:
             super_ctor = self.eval(super_class_node, env)
-            if isinstance(super_ctor, JSFunction):
+            if super_ctor is null:
+                # class C extends null {} — prototype chain has null proto
+                super_proto = None
+            elif isinstance(super_ctor, JSFunction):
+                if super_ctor._no_prototype:
+                    raise _ThrowSignal(make_error('TypeError',
+                        'Class extends value does not have valid prototype property'))
                 super_proto = _build_function_prototype(super_ctor)
-            elif isinstance(super_ctor, JSObject) and 'prototype' in super_ctor.props:
-                super_proto = super_ctor.props['prototype']
+            elif isinstance(super_ctor, JSObject) and (super_ctor._call is not None):
+                proto_val = _obj_get_property(super_ctor, 'prototype')
+                if isinstance(proto_val, JSObject):
+                    super_proto = proto_val
+                elif proto_val is null or proto_val is None:
+                    super_proto = None
+                else:
+                    raise _ThrowSignal(make_error('TypeError',
+                        'Class extends value does not have valid prototype property'))
+            else:
+                raise _ThrowSignal(make_error('TypeError',
+                    'Class extends value is not a constructor or null'))
 
         # Find constructor
         ctor_node = None
@@ -3544,96 +7759,254 @@ class Interpreter:
         static_setters = {}
         instance_fields = []  # class fields on instances
         static_fields = []    # static class fields
+        private_instance_fields = []  # private instance fields (#x = ...)
+        private_static_fields = []    # private static fields (static #x = ...)
+        private_methods = []          # private methods (#m() {})
+        private_static_methods = []
+        private_getters = []          # private get #x() {}
+        private_setters = []          # private set #x() {}
+        private_static_getters = []
+        private_static_setters = []
 
         for method in body.body:
+            is_private = isinstance(method.key, PrivateIdentifier)
             if method.kind == 'constructor':
                 ctor_node = method
             elif method.kind == 'field':
-                if method.static:
-                    static_fields.append(method)
+                if is_private:
+                    if method.static:
+                        private_static_fields.append(method)
+                    else:
+                        private_instance_fields.append(method)
                 else:
-                    instance_fields.append(method)
+                    if method.static:
+                        static_fields.append(method)
+                    else:
+                        instance_fields.append(method)
+            elif is_private:
+                if method.kind == 'get':
+                    if method.static:
+                        private_static_getters.append(method)
+                    else:
+                        private_getters.append(method)
+                elif method.kind == 'set':
+                    if method.static:
+                        private_static_setters.append(method)
+                    else:
+                        private_setters.append(method)
+                else:
+                    if method.static:
+                        private_static_methods.append(method)
+                    else:
+                        private_methods.append(method)
             elif method.static:
                 if method.kind == 'get':
                     key = self._eval_property_key(method.key, method.computed, env)
-                    static_getters[js_to_string(key)] = method
+                    static_getters[_to_property_key(key)] = (key, method)
                 elif method.kind == 'set':
                     key = self._eval_property_key(method.key, method.computed, env)
-                    static_setters[js_to_string(key)] = method
+                    static_setters[_to_property_key(key)] = (key, method)
                 else:
                     static_methods.append(method)
             else:
                 if method.kind == 'get':
                     key = self._eval_property_key(method.key, method.computed, env)
-                    getters[js_to_string(key)] = method
+                    getters[_to_property_key(key)] = (key, method)
                 elif method.kind == 'set':
                     key = self._eval_property_key(method.key, method.computed, env)
-                    setters[js_to_string(key)] = method
+                    setters[_to_property_key(key)] = (key, method)
                 else:
                     methods.append(method)
 
         # Build prototype
-        proto = JSObject(proto=super_proto if super_proto is not None else _PROTOS.get('Object'))
+        if super_class_node and super_proto is None:
+            proto = JSObject(proto=None)  # extends null → [[Prototype]] = null
+        else:
+            proto = JSObject(proto=super_proto if super_proto is not None else _PROTOS.get('Object'))
 
-        # Create class environment
+        # Create class environment — class bodies are always strict (§14.6)
         class_env = Environment(parent=env)
+        class_env.set_strict()
         if class_name:
             class_env.define_let(class_name, None)  # will be set after construction
 
-        # Define instance methods on prototype
-        for m in methods:
-            key = self._eval_property_key(m.key, m.computed, env)
-            key_str = js_to_string(key)
-            fn = self._make_function(m.value, class_env)
-            fn.name = key_str
-            fn.home_obj = proto
-            proto.props[key_str] = fn
+        # Build constructor function (before methods — spec §14.6.13 step 19)
+        # First, resolve computed instance field keys at class definition time
+        # (per spec, abrupt completions from key evaluation propagate here)
+        resolved_instance_fields = []
+        for f in instance_fields:
+            if f.computed:
+                resolved_key = _to_property_key(self._eval_property_key(f.key, True, class_env))
+            else:
+                resolved_key = _to_property_key(self._eval_property_key(f.key, False, class_env))
+            resolved_instance_fields.append((resolved_key, f.value))
 
-        # Add getters/setters to prototype
-        for key_str, m in getters.items():
-            fn = self._make_function(m.value, class_env)
-            fn.name = f'get {key_str}'
-            if proto._descriptors is None:
-                proto._descriptors = {}
-            d = proto._descriptors.get(key_str, {})
-            d['get'] = fn
-            d.setdefault('enumerable', False)
-            d.setdefault('configurable', True)
-            proto._descriptors[key_str] = d
-
-        for key_str, m in setters.items():
-            fn = self._make_function(m.value, class_env)
-            fn.name = f'set {key_str}'
-            if proto._descriptors is None:
-                proto._descriptors = {}
-            d = proto._descriptors.get(key_str, {})
-            d['set'] = fn
-            d.setdefault('enumerable', False)
-            d.setdefault('configurable', True)
-            proto._descriptors[key_str] = d
-
-        proto.props['constructor'] = None  # will be set to ctor below
-
-        # Build constructor function
         if ctor_node:
             ctor_fn = self._make_function(ctor_node.value, class_env)
             ctor_fn.name = class_name
             ctor_fn.prototype = proto
+            ctor_fn.is_class_ctor = True
         else:
             # Default constructor
             if super_ctor is not None:
                 def default_ctor_fn(this, args):
                     if isinstance(super_ctor, JSFunction):
-                        self.call_function(super_ctor, this, args)
+                        self.call_function(super_ctor, this, args, as_constructor=True)
                     elif isinstance(super_ctor, JSObject) and super_ctor._call:
                         super_ctor._call(this, args)
+                def default_ctor_construct(this_unused, args):
+                    # Create instance with the subclass prototype
+                    instance = JSObject(proto=proto)
+                    # Call super constructor with instance as this
+                    if isinstance(super_ctor, JSFunction):
+                        # Initialize super class's private fields first
+                        self._init_private_fields(instance, super_ctor)
+                        # Initialize super class's instance fields
+                        super_inst_fields = getattr(super_ctor, '_instance_fields', [])
+                        if super_inst_fields:
+                            field_env = Environment(parent=super_ctor.env, is_function=False)
+                            field_env.define_let('this', instance)
+                            for key_str, val_node in super_inst_fields:
+                                val = self.eval(val_node, field_env) if val_node is not None else undefined
+                                instance.props[key_str] = val
+                        self.call_function(super_ctor, instance, args, as_constructor=True)
+                    elif isinstance(super_ctor, JSObject):
+                        if super_ctor._construct is not None:
+                            result = super_ctor._construct(instance, args)
+                            # If result is an object, copy its relevant properties
+                            if isinstance(result, JSObject) and result is not instance:
+                                for k, v in result.props.items():
+                                    if k not in instance.props:
+                                        instance.props[k] = v
+                                if result._descriptors:
+                                    if instance._descriptors is None:
+                                        instance._descriptors = {}
+                                    for k, v in result._descriptors.items():
+                                        if k not in instance._descriptors:
+                                            instance._descriptors[k] = v
+                                # Copy internal slots
+                                if getattr(result, '_error_data', False):
+                                    instance._error_data = True
+                        elif super_ctor._call is not None:
+                            super_ctor._call(instance, args)
+                    # Initialize this class's private fields on the instance
+                    if _class_ref[0] is not None:
+                        self._init_private_fields(instance, _class_ref[0])
+                    # Initialize this class's own instance fields (after super)
+                    if resolved_instance_fields:
+                        field_env = Environment(parent=class_env, is_function=False)
+                        field_env.define_let('this', instance)
+                        for key_str, val_node in resolved_instance_fields:
+                            val = self.eval(val_node, field_env) if val_node is not None else undefined
+                            instance.props[key_str] = val
+                    return instance
+                _class_ref = [None]  # mutable ref, set after class_obj is created
                 default_ctor_obj = _make_native_fn(class_name, default_ctor_fn)
+                default_ctor_obj._construct = default_ctor_construct
+                # Class constructors cannot be called without new
+                def _class_call_error(this, args, _name=class_name):
+                    raise _ThrowSignal(make_error('TypeError',
+                        f"Class constructor {_name} cannot be invoked without 'new'"))
+                default_ctor_obj._call = _class_call_error
                 default_ctor_obj.props['prototype'] = proto
                 proto.props['constructor'] = default_ctor_obj
+                # Define instance methods on prototype (after constructor)
+                for m in methods:
+                    key = self._eval_property_key(m.key, m.computed, env)
+                    key_str = _to_property_key(key)
+                    fn = self._make_function(m.value, class_env)
+                    _set_function_name_key(fn, key)
+                    fn._no_prototype = True
+                    fn.home_obj = proto
+                    proto.props[key_str] = fn
+                    if proto._descriptors is None:
+                        proto._descriptors = {}
+                    proto._descriptors[key_str] = {
+                        'value': fn, 'writable': True, 'enumerable': False, 'configurable': True
+                    }
+                for key_str, (raw_key, m) in getters.items():
+                    fn = self._make_function(m.value, class_env)
+                    _set_function_name_key(fn, raw_key, 'get')
+                    fn._no_prototype = True
+                    if proto._descriptors is None:
+                        proto._descriptors = {}
+                    d = proto._descriptors.get(key_str, {})
+                    d['get'] = fn
+                    d.setdefault('enumerable', False)
+                    d.setdefault('configurable', True)
+                    proto._descriptors[key_str] = d
+                for key_str, (raw_key, m) in setters.items():
+                    fn = self._make_function(m.value, class_env)
+                    _set_function_name_key(fn, raw_key, 'set')
+                    fn._no_prototype = True
+                    if proto._descriptors is None:
+                        proto._descriptors = {}
+                    d = proto._descriptors.get(key_str, {})
+                    d['set'] = fn
+                    d.setdefault('enumerable', False)
+                    d.setdefault('configurable', True)
+                    proto._descriptors[key_str] = d
                 # Add static methods
                 self._add_static_methods(default_ctor_obj, static_methods, static_getters, static_setters, class_env)
+                # Set static [[Prototype]]: ctor.__proto__ = super_ctor
+                if super_ctor is not None:
+                    default_ctor_obj.proto = super_ctor
                 if class_name:
                     class_env.set_local(class_name, default_ctor_obj)
+                # Set up private fields/methods on the default constructor
+                _brand = id(default_ctor_obj)
+                if default_ctor_obj._private_fields is None:
+                    default_ctor_obj._private_fields = {}
+                default_ctor_obj._private_fields['@@meta_brand'] = _brand
+                default_ctor_obj._private_fields['@@meta_inst_fields'] = private_instance_fields
+                # Build private methods/accessors
+                _priv_methods = {}
+                for m in private_methods:
+                    name = m.key.name
+                    fn = self._make_function(m.value, class_env)
+                    fn.name = name
+                    fn._no_prototype = True
+                    fn.home_obj = proto
+                    _priv_methods[name] = ('method', fn)
+                for m in private_getters:
+                    name = m.key.name
+                    fn = self._make_function(m.value, class_env)
+                    fn.name = 'get ' + name
+                    fn._no_prototype = True
+                    fn.home_obj = proto
+                    entry = _priv_methods.get(name, ('accessor', None, None))
+                    _priv_methods[name] = ('accessor', fn, entry[2] if len(entry) > 2 else None)
+                for m in private_setters:
+                    name = m.key.name
+                    fn = self._make_function(m.value, class_env)
+                    fn.name = 'set ' + name
+                    fn._no_prototype = True
+                    fn.home_obj = proto
+                    entry = _priv_methods.get(name, ('accessor', None, None))
+                    _priv_methods[name] = ('accessor', entry[1] if len(entry) > 1 else None, fn)
+                if _priv_methods:
+                    default_ctor_obj._private_fields['@@meta_methods'] = _priv_methods
+                default_ctor_obj._private_fields[f'@@brand_{_brand}'] = True
+                # Initialize static private fields on the class
+                if private_static_fields:
+                    static_env = Environment(parent=class_env)
+                    static_env.define_let('this', default_ctor_obj)
+                    for f in private_static_fields:
+                        name = f.key.name
+                        val = self.eval(f.value, static_env) if f.value is not None else undefined
+                        brand_key = f"@@private_{_brand}_{name}"
+                        default_ctor_obj._private_fields[brand_key] = val
+                # Evaluate public static fields
+                if static_fields:
+                    static_env = Environment(parent=class_env)
+                    static_env.define_let('this', default_ctor_obj)
+                    for f in static_fields:
+                        key = self._eval_property_key(f.key, f.computed, static_env)
+                        key_str = _to_property_key(key)
+                        val = self.eval(f.value, static_env) if f.value is not None else undefined
+                        default_ctor_obj.props[key_str] = val
+                # Set class ref for the closure
+                _class_ref[0] = default_ctor_obj
                 return default_ctor_obj
             else:
                 # Synthesize empty constructor
@@ -3646,10 +8019,61 @@ class Interpreter:
                     interp=self,
                 )
                 ctor_fn.prototype = proto
+                ctor_fn.is_class_ctor = True
 
         proto.props['constructor'] = ctor_fn
+        # constructor is non-enumerable per spec
+        if proto._descriptors is None:
+            proto._descriptors = {}
+        proto._descriptors['constructor'] = {
+            'value': ctor_fn, 'writable': True, 'enumerable': False, 'configurable': True
+        }
+
+        # Define instance methods on prototype (after constructor — spec §14.6.13 step 21)
+        for m in methods:
+            key = self._eval_property_key(m.key, m.computed, env)
+            key_str = _to_property_key(key)
+            fn = self._make_function(m.value, class_env)
+            _set_function_name_key(fn, key)
+            fn._no_prototype = True
+            fn.home_obj = proto
+            proto.props[key_str] = fn
+            if proto._descriptors is None:
+                proto._descriptors = {}
+            proto._descriptors[key_str] = {
+                'value': fn, 'writable': True, 'enumerable': False, 'configurable': True
+            }
+
+        # Add getters/setters to prototype
+        for key_str, (raw_key, m) in getters.items():
+            fn = self._make_function(m.value, class_env)
+            _set_function_name_key(fn, raw_key, 'get')
+            fn._no_prototype = True
+            if proto._descriptors is None:
+                proto._descriptors = {}
+            d = proto._descriptors.get(key_str, {})
+            d['get'] = fn
+            d.setdefault('enumerable', False)
+            d.setdefault('configurable', True)
+            proto._descriptors[key_str] = d
+
+        for key_str, (raw_key, m) in setters.items():
+            fn = self._make_function(m.value, class_env)
+            _set_function_name_key(fn, raw_key, 'set')
+            fn._no_prototype = True
+            if proto._descriptors is None:
+                proto._descriptors = {}
+            d = proto._descriptors.get(key_str, {})
+            d['set'] = fn
+            d.setdefault('enumerable', False)
+            d.setdefault('configurable', True)
+            proto._descriptors[key_str] = d
 
         class_obj = ctor_fn
+
+        # Set static [[Prototype]]: class_obj.__proto__ = super_ctor (§15.7.14 step 16)
+        if super_ctor is not None:
+            class_obj._proto = super_ctor
 
         # Add static methods
         self._add_static_methods(class_obj, static_methods, static_getters, static_setters, class_env)
@@ -3663,7 +8087,7 @@ class Interpreter:
         static_env.define_let('this', class_obj)
         for f in static_fields:
             key = self._eval_property_key(f.key, f.computed, static_env)
-            key_str = js_to_string(key)
+            key_str = _to_property_key(key)
             val = self.eval(f.value, static_env) if f.value is not None else undefined
             if isinstance(class_obj, JSFunction):
                 if class_obj._static_props is None:
@@ -3672,11 +8096,87 @@ class Interpreter:
             elif isinstance(class_obj, JSObject):
                 class_obj.props[key_str] = val
 
-        # Store instance fields for use in constructor
-        if instance_fields:
-            class_obj._instance_fields = instance_fields
+        # Store instance fields for use in constructor (already resolved above)
+        class_obj._instance_fields = resolved_instance_fields
+
+        # Store private instance fields for initialization in constructor
+        if private_instance_fields:
+            class_obj._private_instance_fields = private_instance_fields
         else:
-            class_obj._instance_fields = []
+            class_obj._private_instance_fields = []
+
+        # Build private brand for this class (unique identifier)
+        private_brand = id(class_obj)
+
+        # Store private methods/accessors on class (shared, not per-instance)
+        _priv_methods = {}
+        for m in private_methods:
+            name = m.key.name  # e.g. "#foo"
+            fn = self._make_function(m.value, class_env)
+            fn.name = name
+            fn._no_prototype = True
+            fn.home_obj = proto
+            _priv_methods[name] = ('method', fn)
+        for m in private_getters:
+            name = m.key.name
+            fn = self._make_function(m.value, class_env)
+            fn.name = 'get ' + name
+            fn._no_prototype = True
+            fn.home_obj = proto
+            entry = _priv_methods.get(name, ('accessor', None, None))
+            _priv_methods[name] = ('accessor', fn, entry[2] if len(entry) > 2 else None)
+        for m in private_setters:
+            name = m.key.name
+            fn = self._make_function(m.value, class_env)
+            fn.name = 'set ' + name
+            fn._no_prototype = True
+            fn.home_obj = proto
+            entry = _priv_methods.get(name, ('accessor', None, None))
+            _priv_methods[name] = ('accessor', entry[1] if len(entry) > 1 else None, fn)
+        # Static private methods/accessors
+        for m in private_static_methods:
+            name = m.key.name
+            fn = self._make_function(m.value, class_env)
+            fn.name = name
+            fn._no_prototype = True
+            fn.home_obj = class_obj
+            _priv_methods[name] = ('method', fn)
+        for m in private_static_getters:
+            name = m.key.name
+            fn = self._make_function(m.value, class_env)
+            fn.name = 'get ' + name
+            fn._no_prototype = True
+            fn.home_obj = class_obj
+            entry = _priv_methods.get(name, ('accessor', None, None))
+            _priv_methods[name] = ('accessor', fn, entry[2] if len(entry) > 2 else None)
+        for m in private_static_setters:
+            name = m.key.name
+            fn = self._make_function(m.value, class_env)
+            fn.name = 'set ' + name
+            fn._no_prototype = True
+            fn.home_obj = class_obj
+            entry = _priv_methods.get(name, ('accessor', None, None))
+            _priv_methods[name] = ('accessor', entry[1] if len(entry) > 1 else None, fn)
+
+        if _priv_methods:
+            class_obj._private_methods = _priv_methods
+        class_obj._private_brand = private_brand
+
+        # Initialize static private fields on the class object
+        if private_static_fields:
+            if class_obj._private_fields is None:
+                class_obj._private_fields = {}
+            for f in private_static_fields:
+                name = f.key.name
+                val = self.eval(f.value, static_env) if f.value is not None else undefined
+                brand_key = f"@@private_{private_brand}_{name}"
+                class_obj._private_fields[brand_key] = val
+            # Also install brand for static private method access
+        # Install brand for static private methods on the class itself
+        if _priv_methods or private_static_fields:
+            if class_obj._private_fields is None:
+                class_obj._private_fields = {}
+            class_obj._private_fields[f"@@brand_{private_brand}"] = True
 
         # Handle super in constructor
         class_obj._super_ctor = super_ctor
@@ -3687,21 +8187,40 @@ class Interpreter:
         """Add static methods to a class constructor."""
         for m in static_methods:
             key = self._eval_property_key(m.key, m.computed, env)
-            key_str = js_to_string(key)
+            key_str = _to_property_key(key)
+            if key_str == 'prototype':
+                raise _ThrowSignal(make_error('TypeError',
+                    "Classes may not have a static property named 'prototype'"))
             fn = self._make_function(m.value, env)
-            fn.name = key_str
+            _set_function_name_key(fn, key)
+            fn._no_prototype = True
             fn.home_obj = class_obj  # needed for super["x"]() in static methods
             if isinstance(class_obj, JSFunction):
                 # Store as attribute on JSFunction... use a side dict
                 if class_obj._static_props is None:
                     class_obj._static_props = {}
                 class_obj._static_props[key_str] = fn
+                # Static methods are non-enumerable per spec
+                if class_obj._descriptors is None:
+                    class_obj._descriptors = {}
+                class_obj._descriptors[key_str] = {
+                    'value': fn, 'writable': True, 'enumerable': False, 'configurable': True
+                }
             elif isinstance(class_obj, JSObject):
                 class_obj.props[key_str] = fn
+                if class_obj._descriptors is None:
+                    class_obj._descriptors = {}
+                class_obj._descriptors[key_str] = {
+                    'value': fn, 'writable': True, 'enumerable': False, 'configurable': True
+                }
 
-        for key_str, m in static_getters.items():
+        for key_str, (raw_key, m) in static_getters.items():
+            if key_str == 'prototype':
+                raise _ThrowSignal(make_error('TypeError',
+                    "Classes may not have a static property named 'prototype'"))
             fn = self._make_function(m.value, env)
-            fn.name = f'get {key_str}'
+            _set_function_name_key(fn, raw_key, 'get')
+            fn._no_prototype = True
             fn.home_obj = class_obj
             if isinstance(class_obj, JSFunction):
                 if class_obj._descriptors is None:
@@ -3720,9 +8239,13 @@ class Interpreter:
                 d.setdefault('configurable', True)
                 class_obj._descriptors[key_str] = d
 
-        for key_str, m in static_setters.items():
+        for key_str, (raw_key, m) in static_setters.items():
+            if key_str == 'prototype':
+                raise _ThrowSignal(make_error('TypeError',
+                    "Classes may not have a static property named 'prototype'"))
             fn = self._make_function(m.value, env)
-            fn.name = f'set {key_str}'
+            _set_function_name_key(fn, raw_key, 'set')
+            fn._no_prototype = True
             fn.home_obj = class_obj
             if isinstance(class_obj, JSFunction):
                 if class_obj._descriptors is None:
@@ -3766,26 +8289,57 @@ class Interpreter:
         interp = self
 
         def str_method(fn):
-            obj = _make_native_fn(key, fn)
+            def checked_fn(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError',
+                        f'String.prototype.{key} called on null or undefined'))
+                return fn(this, args)
+            obj = _make_native_fn(key, checked_fn)
             return obj
 
         if key == 'charAt':
-            return str_method(lambda this, args:
-                js_to_string(this)[int(js_to_number(args[0]))]
-                if args and 0 <= int(js_to_number(args[0])) < len(js_to_string(this))
-                else '')
+            def charAt(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError',
+                        'String.prototype.charAt called on null or undefined'))
+                s2 = js_to_string(this)
+                if not args:
+                    return s2[0] if s2 else ''
+                n = js_to_integer(args[0])
+                if n < 0 or n >= len(s2):
+                    return ''
+                return s2[int(n)]
+            return str_method(charAt)
         if key == 'charCodeAt':
             def charCodeAt(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError',
+                        'String.prototype.charCodeAt called on null or undefined'))
                 s2 = js_to_string(this)
-                i = int(js_to_number(args[0])) if args else 0
+                if not args:
+                    i = 0
+                else:
+                    n = js_to_number(args[0])
+                    if math.isnan(n):
+                        n = 0
+                    if math.isinf(n):
+                        return math.nan
+                    i = int(n)
                 if 0 <= i < len(s2):
                     return ord(s2[i])
                 return math.nan
             return str_method(charCodeAt)
         if key == 'codePointAt':
             def codePointAt(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError',
+                        'String.prototype.codePointAt called on null or undefined'))
                 s2 = js_to_string(this)
-                i = int(js_to_number(args[0])) if args else 0
+                n = js_to_number(args[0]) if args else 0
+                if math.isnan(n) or math.isinf(n):
+                    i = 0 if math.isnan(n) else (len(s2) if n > 0 else -1)
+                else:
+                    i = int(n)
                 if 0 <= i < len(s2):
                     cp = ord(s2[i])
                     # Surrogate pair detection
@@ -3835,26 +8389,81 @@ class Interpreter:
                 return s2.rfind(search)
             return str_method(lastIndexOf)
         if key == 'includes':
-            return str_method(lambda this, args:
-                js_to_string(args[0]) in js_to_string(this) if args else False)
+            def str_includes(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.includes called on null or undefined"))
+                s2 = js_to_string(this)
+                if args and isinstance(args[0], JSObject):
+                    match_prop = _obj_get_property(args[0], '@@match')
+                    if match_prop is not undefined and match_prop is not None and bool(match_prop):
+                        raise _ThrowSignal(make_error('TypeError', "First argument to String.prototype.includes must not be a regular expression"))
+                search = js_to_string(args[0]) if args else 'undefined'
+                pos = 0
+                if len(args) > 1 and args[1] is not undefined:
+                    n = js_to_number(args[1])
+                    if math.isnan(n):
+                        pos = 0
+                    elif math.isinf(n):
+                        pos = len(s2) if n > 0 else 0
+                    else:
+                        pos = max(0, int(n))
+                return s2.find(search, pos) != -1
+            return str_method(str_includes)
         if key == 'startsWith':
-            return str_method(lambda this, args:
-                js_to_string(this).startswith(js_to_string(args[0])) if args else False)
+            def str_startsWith(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.startsWith called on null or undefined"))
+                s2 = js_to_string(this)
+                if args and isinstance(args[0], JSObject):
+                    match_prop = _obj_get_property(args[0], '@@match')
+                    if match_prop is not undefined and match_prop is not None and bool(match_prop):
+                        raise _ThrowSignal(make_error('TypeError', "First argument to String.prototype.startsWith must not be a regular expression"))
+                search = js_to_string(args[0]) if args else 'undefined'
+                pos = 0
+                if len(args) > 1 and args[1] is not undefined:
+                    n = js_to_number(args[1])
+                    if math.isnan(n):
+                        pos = 0
+                    elif math.isinf(n):
+                        pos = len(s2) if n > 0 else 0
+                    else:
+                        pos = max(0, int(n))
+                return s2.startswith(search, pos)
+            return str_method(str_startsWith)
         if key == 'endsWith':
-            return str_method(lambda this, args:
-                js_to_string(this).endswith(js_to_string(args[0])) if args else False)
+            def str_endsWith(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.endsWith called on null or undefined"))
+                s2 = js_to_string(this)
+                if args and isinstance(args[0], JSObject):
+                    match_prop = _obj_get_property(args[0], '@@match')
+                    if match_prop is not undefined and match_prop is not None and bool(match_prop):
+                        raise _ThrowSignal(make_error('TypeError', "First argument to String.prototype.endsWith must not be a regular expression"))
+                search = js_to_string(args[0]) if args else 'undefined'
+                if len(args) > 1 and args[1] is not undefined:
+                    n = js_to_number(args[1])
+                    if math.isnan(n):
+                        end_pos = 0
+                    elif math.isinf(n):
+                        end_pos = len(s2) if n > 0 else 0
+                    else:
+                        end_pos = max(0, min(int(n), len(s2)))
+                else:
+                    end_pos = len(s2)
+                return s2[:end_pos].endswith(search)
+            return str_method(str_endsWith)
         if key == 'slice':
             def str_slice(this, args):
                 s2 = js_to_string(this)
-                start = int(js_to_number(args[0])) if args else 0
-                end = int(js_to_number(args[1])) if len(args) > 1 and args[1] is not undefined else len(s2)
+                start = js_to_integer(args[0]) if args else 0
+                end = js_to_integer(args[1]) if len(args) > 1 and args[1] is not undefined else len(s2)
                 return s2[start:end]
             return str_method(str_slice)
         if key == 'substring':
             def substring(this, args):
                 s2 = js_to_string(this)
-                start = max(0, int(js_to_number(args[0]))) if args else 0
-                end = max(0, int(js_to_number(args[1]))) if len(args) > 1 and args[1] is not undefined else len(s2)
+                start = max(0, js_to_integer(args[0])) if args else 0
+                end = max(0, js_to_integer(args[1])) if len(args) > 1 and args[1] is not undefined else len(s2)
                 if start > end:
                     start, end = end, start
                 return s2[start:end]
@@ -3871,9 +8480,16 @@ class Interpreter:
             return str_method(lambda this, args: js_to_string(this).rstrip())
         if key == 'split':
             def str_split(this, args):
-                s2 = js_to_string(this)
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.split called on null or undefined"))
                 sep = args[0] if args else undefined
                 limit_arg = args[1] if len(args) > 1 else undefined
+                # @@split protocol
+                if sep is not undefined and sep is not null and isinstance(sep, JSObject):
+                    splitter = _obj_get_property(sep, '@@split')
+                    if splitter is not undefined and splitter is not None:
+                        return _call_value(splitter, sep, [this, limit_arg])
+                s2 = js_to_string(this)
                 if limit_arg is not undefined:
                     lim = js_to_number(limit_arg)
                     limit = 0 if math.isnan(lim) or lim < 0 else min(int(lim), 2**32 - 1)
@@ -3886,8 +8502,7 @@ class Interpreter:
                     return make_array(result)
                 sep_str = js_to_string(sep)
                 if sep_str == '':
-                    # Split into UTF-16 code units
-                    parts = list(s2)  # already stored as code units
+                    parts = list(s2)
                 else:
                     parts = s2.split(sep_str)
                 if limit is not None:
@@ -3896,6 +8511,12 @@ class Interpreter:
             return str_method(str_split)
         if key == 'replace':
             def str_replace(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.replace called on null or undefined"))
+                if args and args[0] is not undefined and args[0] is not null and isinstance(args[0], JSObject):
+                    replacer = _obj_get_property(args[0], '@@replace')
+                    if replacer is not undefined and replacer is not None:
+                        return _call_value(replacer, args[0], [this] + args[1:])
                 s2 = js_to_string(this)
                 if not args:
                     return s2
@@ -3903,22 +8524,67 @@ class Interpreter:
                 replacement = args[1] if len(args) > 1 else undefined
                 if isinstance(pattern, JSObject) and pattern._regex:
                     regex = pattern._regex
-                    if pattern.props.get('global'):
-                        if isinstance(replacement, JSFunction):
-                            def repl_fn(m):
-                                groups = [m.group(0)] + list(m.groups())
-                                return js_to_string(interp.call_function(replacement, undefined, groups + [m.start(), s2]))
-                            return regex.sub(repl_fn, s2)
-                        return regex.sub(js_to_string(replacement), s2)
-                    else:
-                        if isinstance(replacement, JSFunction):
+                    flags = getattr(pattern, '_regex_flags', '') or ''
+                    is_global = 'g' in flags
+                    if isinstance(replacement, JSFunction):
+                        if is_global:
+                            # Global functional replace
+                            result_parts = []
+                            last_end = 0
+                            for m in regex.finditer(s2):
+                                result_parts.append(s2[last_end:m.start()])
+                                caps = [undefined if g is None else g for g in m.groups()]
+                                repl_args = [m.group(0)] + caps + [m.start(), s2]
+                                gdict = _unmangled_groupdict(m)
+                                if gdict:
+                                    go = JSObject()
+                                    go.proto = None
+                                    for gn, gv in gdict.items():
+                                        go.props[gn] = undefined if gv is None else gv
+                                    repl_args.append(go)
+                                result_parts.append(js_to_string(interp.call_function(replacement, undefined, repl_args)))
+                                last_end = m.end()
+                            result_parts.append(s2[last_end:])
+                            return ''.join(result_parts)
+                        else:
+                            # Non-global functional replace
                             m = regex.search(s2)
                             if m:
-                                groups = [m.group(0)] + list(m.groups())
-                                r = js_to_string(interp.call_function(replacement, undefined, groups + [m.start(), s2]))
+                                caps = [undefined if g is None else g for g in m.groups()]
+                                repl_args = [m.group(0)] + caps + [m.start(), s2]
+                                gdict = _unmangled_groupdict(m)
+                                if gdict:
+                                    go = JSObject()
+                                    go.proto = None
+                                    for gn, gv in gdict.items():
+                                        go.props[gn] = undefined if gv is None else gv
+                                    repl_args.append(go)
+                                r = js_to_string(interp.call_function(replacement, undefined, repl_args))
                                 return s2[:m.start()] + r + s2[m.end():]
                             return s2
-                        return regex.sub(js_to_string(replacement), s2, count=1)
+                    else:
+                        repl_str = js_to_string(replacement)
+                        if is_global:
+                            result_parts = []
+                            last_end = 0
+                            for m in regex.finditer(s2):
+                                result_parts.append(s2[last_end:m.start()])
+                                caps = [undefined if g is None else g for g in m.groups()]
+                                gdict = _unmangled_groupdict(m)
+                                named = gdict if gdict else None
+                                result_parts.append(_js_get_substitution(m.group(0), s2, m.start(), caps, named, repl_str))
+                                last_end = m.end()
+                            result_parts.append(s2[last_end:])
+                            return ''.join(result_parts)
+                        else:
+                            m = regex.search(s2)
+                            if m:
+                                caps = [undefined if g is None else g for g in m.groups()]
+                                gdict = _unmangled_groupdict(m)
+                                named = gdict if gdict else None
+                                r = _js_get_substitution(m.group(0), s2, m.start(), caps, named, repl_str)
+                                return s2[:m.start()] + r + s2[m.end():]
+                            return s2
                 pat_str = js_to_string(pattern)
                 if isinstance(replacement, JSFunction):
                     idx = s2.find(pat_str)
@@ -3930,22 +8596,59 @@ class Interpreter:
             return str_method(str_replace)
         if key == 'replaceAll':
             def str_replaceAll(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.replaceAll called on null or undefined"))
+                if args and args[0] is not undefined and args[0] is not null and isinstance(args[0], JSObject):
+                    # If first arg is a RegExp, it must have the 'g' flag
+                    if args[0]._regex:
+                        flags = getattr(args[0], '_regex_flags', '') or ''
+                        if 'g' not in flags:
+                            raise _ThrowSignal(make_error('TypeError', "String.prototype.replaceAll called with a non-global RegExp argument"))
+                    replacer = _obj_get_property(args[0], '@@replace')
+                    if replacer is not undefined and replacer is not None:
+                        return _call_value(replacer, args[0], [this] + args[1:])
                 s2 = js_to_string(this)
                 if not args:
                     return s2
-                pat_str = js_to_string(args[0])
-                repl = js_to_string(args[1]) if len(args) > 1 else ''
-                return s2.replace(pat_str, repl)
+                searchValue = args[0]
+                replaceValue = args[1] if len(args) > 1 else undefined
+                pat_str = js_to_string(searchValue)
+                if isinstance(replaceValue, JSFunction):
+                    result_parts = []
+                    last_end = 0
+                    idx = s2.find(pat_str)
+                    while idx >= 0:
+                        result_parts.append(s2[last_end:idx])
+                        r = js_to_string(interp.call_function(replaceValue, undefined, [pat_str, idx, s2]))
+                        result_parts.append(r)
+                        last_end = idx + len(pat_str)
+                        if not pat_str:
+                            if last_end < len(s2):
+                                result_parts.append(s2[last_end])
+                                last_end += 1
+                            else:
+                                break
+                        idx = s2.find(pat_str, last_end)
+                    result_parts.append(s2[last_end:])
+                    return ''.join(result_parts)
+                repl_str = js_to_string(replaceValue)
+                return s2.replace(pat_str, repl_str)
             return str_method(str_replaceAll)
         if key == 'match':
             def str_match(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.match called on null or undefined"))
+                if args and args[0] is not undefined and args[0] is not null and isinstance(args[0], JSObject):
+                    matcher = _obj_get_property(args[0], '@@match')
+                    if matcher is not undefined and matcher is not None:
+                        return _call_value(matcher, args[0], [this])
                 s2 = js_to_string(this)
                 if not args:
                     return null
                 pattern = args[0]
                 if isinstance(pattern, JSObject) and pattern._regex:
                     regex = pattern._regex
-                    if pattern.props.get('global'):
+                    if 'g' in (getattr(pattern, '_regex_flags', '') or ''):
                         matches = regex.findall(s2)
                         if not matches:
                             return null
@@ -3954,9 +8657,19 @@ class Interpreter:
                         m = regex.search(s2)
                         if m is None:
                             return null
-                        result = make_array([m.group(0)] + list(m.groups()))
+                        grps = list(m.groups())
+                        result = make_array([m.group(0)] + [undefined if g is None else g for g in grps])
                         result.props['index'] = m.start()
                         result.props['input'] = s2
+                        gdict = _unmangled_groupdict(m)
+                        if gdict:
+                            groups_obj = JSObject()
+                            groups_obj.proto = None
+                            for gname, gval in gdict.items():
+                                groups_obj.props[gname] = undefined if gval is None else gval
+                            result.props['groups'] = groups_obj
+                        else:
+                            result.props['groups'] = undefined
                         return result
                 # String pattern: create temp regex
                 pat_str = js_to_string(pattern)
@@ -3969,23 +8682,60 @@ class Interpreter:
             return str_method(str_match)
         if key == 'matchAll':
             def str_matchAll(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.matchAll called on null or undefined"))
+                pattern = args[0] if args else undefined
+                if pattern is not undefined and pattern is not null and isinstance(pattern, JSObject):
+                    # If pattern is a regexp, it must have 'g' flag
+                    if pattern._regex:
+                        flags = getattr(pattern, '_regex_flags', '') or ''
+                        if 'g' not in flags:
+                            raise _ThrowSignal(make_error('TypeError', "String.prototype.matchAll called with a non-global RegExp argument"))
+                    matcher = _obj_get_property(pattern, '@@matchAll')
+                    if matcher is not undefined and matcher is not None:
+                        return _call_value(matcher, pattern, [this])
                 s2 = js_to_string(this)
-                if not args:
-                    return _string_iterator('')
-                pattern = args[0]
+                if pattern is undefined or pattern is null:
+                    return _to_iterator_obj([])
                 if isinstance(pattern, JSObject) and pattern._regex:
                     regex = pattern._regex
                     matches_list = []
                     for m in regex.finditer(s2):
-                        result = make_array([m.group(0)] + list(m.groups()))
-                        result.props['index'] = m.start()
-                        result.props['input'] = s2
-                        matches_list.append(result)
+                        grps = list(m.groups())
+                        r = make_array([m.group(0)] + [undefined if g is None else g for g in grps])
+                        r.props['index'] = m.start()
+                        r.props['input'] = s2
+                        gdict = _unmangled_groupdict(m)
+                        if gdict:
+                            go = JSObject()
+                            go.proto = None
+                            for gn, gv in gdict.items():
+                                go.props[gn] = undefined if gv is None else gv
+                            r.props['groups'] = go
+                        else:
+                            r.props['groups'] = undefined
+                        matches_list.append(r)
                     return _to_iterator_obj(matches_list)
-                return _to_iterator_obj([])
+                # Convert to string and treat as regex with 'g' flag
+                pat_str = js_to_string(pattern)
+                escaped = re.escape(pat_str)
+                matches_list = []
+                for m in re.finditer(escaped, s2):
+                    r = make_array([m.group(0)])
+                    r.props['index'] = m.start()
+                    r.props['input'] = s2
+                    r.props['groups'] = undefined
+                    matches_list.append(r)
+                return _to_iterator_obj(matches_list)
             return str_method(str_matchAll)
         if key == 'search':
             def str_search(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError', "String.prototype.search called on null or undefined"))
+                if args and args[0] is not undefined and args[0] is not null and isinstance(args[0], JSObject):
+                    searcher = _obj_get_property(args[0], '@@search')
+                    if searcher is not undefined and searcher is not None:
+                        return _call_value(searcher, args[0], [this])
                 s2 = js_to_string(this)
                 if not args:
                     return -1
@@ -4032,7 +8782,7 @@ class Interpreter:
         if key == 'repeat':
             def str_repeat(this, args):
                 s2 = js_to_string(this)
-                n = int(js_to_number(args[0])) if args else 0
+                n = js_to_integer(args[0]) if args else 0
                 if n < 0:
                     raise _ThrowSignal(make_error('RangeError',
                         'Invalid count value'))
@@ -4045,8 +8795,15 @@ class Interpreter:
             return str_method(str_concat)
         if key == 'at':
             def str_at(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError',
+                        'String.prototype.at called on null or undefined'))
                 s2 = js_to_string(this)
-                i = int(js_to_number(args[0])) if args else 0
+                n = js_to_number(args[0]) if args else 0
+                if math.isnan(n) or math.isinf(n):
+                    i = 0 if math.isnan(n) else (len(s2) if n > 0 else -len(s2) - 1)
+                else:
+                    i = int(n)
                 if i < 0:
                     i = len(s2) + i
                 if 0 <= i < len(s2):
@@ -4069,45 +8826,163 @@ class Interpreter:
                 if s2 > other: return 1
                 return 0
             return str_method(localeCompare)
+        if key == 'substr':
+            def substr(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError',
+                        'String.prototype.substr called on null or undefined'))
+                s2 = js_to_string(this)
+                slen = len(s2)
+                start = js_to_integer(args[0]) if args else 0
+                if len(args) > 1 and args[1] is not undefined:
+                    length = js_to_integer(args[1])
+                else:
+                    length = slen
+                if start < 0:
+                    start = max(slen + start, 0)
+                if length <= 0 or start >= slen:
+                    return ''
+                end = min(start + int(length), slen)
+                return s2[int(start):end]
+            return str_method(substr)
+        if key == 'isWellFormed':
+            def isWellFormed(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError',
+                        'String.prototype.isWellFormed called on null or undefined'))
+                s2 = js_to_string(this)
+                i = 0
+                while i < len(s2):
+                    cp = ord(s2[i])
+                    if 0xD800 <= cp <= 0xDBFF:
+                        if i + 1 < len(s2):
+                            lo = ord(s2[i + 1])
+                            if 0xDC00 <= lo <= 0xDFFF:
+                                i += 2
+                                continue
+                        return False
+                    elif 0xDC00 <= cp <= 0xDFFF:
+                        return False
+                    i += 1
+                return True
+            return str_method(isWellFormed)
+        if key == 'toWellFormed':
+            def toWellFormed(this, args):
+                if this is undefined or this is null:
+                    raise _ThrowSignal(make_error('TypeError',
+                        'String.prototype.toWellFormed called on null or undefined'))
+                s2 = js_to_string(this)
+                result = []
+                i = 0
+                while i < len(s2):
+                    cp = ord(s2[i])
+                    if 0xD800 <= cp <= 0xDBFF:
+                        if i + 1 < len(s2):
+                            lo = ord(s2[i + 1])
+                            if 0xDC00 <= lo <= 0xDFFF:
+                                result.append(s2[i])
+                                result.append(s2[i + 1])
+                                i += 2
+                                continue
+                        result.append('\uFFFD')
+                        i += 1
+                    elif 0xDC00 <= cp <= 0xDFFF:
+                        result.append('\uFFFD')
+                        i += 1
+                    else:
+                        result.append(s2[i])
+                        i += 1
+                return ''.join(result)
+            return str_method(toWellFormed)
         return undefined
 
     def _get_number_proto_prop(self, n, key: str):
         if key == 'toString':
             def toString(this, args):
-                radix = int(js_to_number(args[0])) if args and args[0] is not undefined else 10
+                radix = js_to_integer(args[0]) if args and args[0] is not undefined else 10
+                if radix < 2 or radix > 36:
+                    raise _ThrowSignal(make_error('RangeError', 'toString() radix must be between 2 and 36'))
                 v = this if not isinstance(this, JSObject) else js_to_number(this)
                 if radix == 10:
                     return js_to_string(v)
-                if isinstance(v, float) and (v != math.trunc(v) or math.isnan(v) or math.isinf(v)):
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v) or v != math.trunc(v)):
                     return _float_to_radix_string(v, radix)
                 return _int_to_radix(int(v), radix)
-            return _make_native_fn('toString', toString)
+            return _make_native_fn('toString', toString, 1)
         if key == 'toFixed':
             def toFixed(this, args):
-                digits = int(js_to_number(args[0])) if args else 0
                 v = js_to_number(this) if isinstance(this, JSObject) else this
                 v = float(v) if isinstance(v, int) else v
+                raw_digits = js_to_number(args[0]) if args and args[0] is not undefined else 0
+                if isinstance(raw_digits, float) and math.isnan(raw_digits):
+                    raw_digits = 0
+                if isinstance(raw_digits, float) and math.isinf(raw_digits):
+                    raise _ThrowSignal(make_error('RangeError', 'toFixed() digits argument must be between 0 and 100'))
+                digits = int(raw_digits)
+                if digits < 0 or digits > 100:
+                    raise _ThrowSignal(make_error('RangeError', 'toFixed() digits argument must be between 0 and 100'))
+                if math.isnan(v):
+                    return 'NaN'
+                if math.isinf(v):
+                    return 'Infinity' if v > 0 else '-Infinity'
+                if abs(v) >= 1e21:
+                    return js_to_string(v)
                 return _js_to_fixed(v, digits)
-            return _make_native_fn('toFixed', toFixed)
+            return _make_native_fn('toFixed', toFixed, 1)
         if key == 'toExponential':
             def toExponential(this, args):
                 v = js_to_number(this) if isinstance(this, JSObject) else this
                 v = float(v) if isinstance(v, int) else v
-                fd = None if not args or args[0] is undefined else int(js_to_number(args[0]))
+                # ToIntegerOrInfinity MUST happen BEFORE NaN/Infinity checks on value
+                fd_undefined = (not args or args[0] is undefined)
+                if not fd_undefined:
+                    raw_fd = js_to_number(args[0])
+                    if isinstance(raw_fd, float) and math.isnan(raw_fd):
+                        raw_fd = 0
+                if math.isnan(v):
+                    return 'NaN'
+                if math.isinf(v):
+                    return 'Infinity' if v > 0 else '-Infinity'
+                if fd_undefined:
+                    return _js_to_exponential(v, None)
+                if isinstance(raw_fd, float) and math.isinf(raw_fd):
+                    raise _ThrowSignal(make_error('RangeError', 'toExponential() argument must be between 0 and 100'))
+                fd = int(raw_fd)
+                if fd < 0 or fd > 100:
+                    raise _ThrowSignal(make_error('RangeError', 'toExponential() argument must be between 0 and 100'))
                 return _js_to_exponential(v, fd)
-            return _make_native_fn('toExponential', toExponential)
+            return _make_native_fn('toExponential', toExponential, 1)
         if key == 'toPrecision':
             def toPrecision(this, args):
                 v = js_to_number(this) if isinstance(this, JSObject) else this
                 v = float(v) if isinstance(v, int) else v
                 if not args or args[0] is undefined:
                     return js_to_string(v)
-                p = int(js_to_number(args[0]))
+                raw_p = js_to_number(args[0])
+                if isinstance(raw_p, float) and math.isnan(raw_p):
+                    raw_p = 0
+                # NaN/Infinity on value come BEFORE range check on precision
+                if math.isnan(v):
+                    return 'NaN'
+                if math.isinf(v):
+                    return 'Infinity' if v > 0 else '-Infinity'
+                if isinstance(raw_p, float) and math.isinf(raw_p):
+                    raise _ThrowSignal(make_error('RangeError', 'toPrecision() argument must be between 1 and 100'))
+                p = int(raw_p)
+                if p < 1 or p > 100:
+                    raise _ThrowSignal(make_error('RangeError', 'toPrecision() argument must be between 1 and 100'))
                 return _js_to_precision(v, p)
-            return _make_native_fn('toPrecision', toPrecision)
+            return _make_native_fn('toPrecision', toPrecision, 1)
         if key == 'valueOf':
             return _make_native_fn('valueOf', lambda this, args:
                 js_to_number(this) if isinstance(this, JSObject) else this)
+        # Fall back to Number.prototype for user-defined properties
+        if self.global_env:
+            num_ctor = self.global_env._bindings.get('Number')
+            if isinstance(num_ctor, JSObject) and 'prototype' in num_ctor.props:
+                result = _obj_get_property(num_ctor.props['prototype'], key, n)
+                if result is not undefined:
+                    return result
         return undefined
 
     def _get_bool_proto_prop(self, b: bool, key: str):
@@ -4116,12 +8991,19 @@ class Interpreter:
                 'true' if (this if not isinstance(this, JSObject) else js_is_truthy(this)) else 'false')
         if key == 'valueOf':
             return _make_native_fn('valueOf', lambda this, args: this)
+        # Fall back to Boolean.prototype for user-defined properties
+        if self.global_env:
+            bool_ctor = self.global_env._bindings.get('Boolean')
+            if isinstance(bool_ctor, JSObject) and 'prototype' in bool_ctor.props:
+                result = _obj_get_property(bool_ctor.props['prototype'], key, b)
+                if result is not undefined:
+                    return result
         return undefined
 
     def _get_bigint_proto_prop(self, b: JSBigInt, key: str):
         if key == 'toString':
             def bi_toString(this, args):
-                radix = int(js_to_number(args[0])) if args and args[0] is not undefined else 10
+                radix = js_to_integer(args[0]) if args and args[0] is not undefined else 10
                 v = this.value if isinstance(this, JSBigInt) else b.value
                 if radix == 10:
                     return str(v)
@@ -4133,6 +9015,21 @@ class Interpreter:
         return undefined
 
     def _get_symbol_proto_prop(self, sym: JSSymbol, key: str):
+        # First check Symbol.prototype (and its prototype chain up to Object.prototype)
+        sym_builtin = self.global_env._bindings.get('Symbol') if self.global_env else None
+        if sym_builtin is not None:
+            proto = None
+            if isinstance(sym_builtin, JSObject):
+                proto = sym_builtin.props.get('prototype')
+            elif isinstance(sym_builtin, JSFunction):
+                sp = sym_builtin._static_props or {}
+                proto = sp.get('prototype')
+            if isinstance(proto, JSObject):
+                # Walk the prototype chain
+                result = _obj_get_property(proto, key, sym)  # pass sym as 'this'
+                if result is not undefined:
+                    return result
+        # Fallback hardcoded
         if key == 'toString':
             def sym_toString(this, args):
                 s = this if isinstance(this, JSSymbol) else sym
@@ -4163,6 +9060,13 @@ class _YieldedValues:
 
 # ---- Helper math functions ----
 
+def _bigint_pow(a: 'JSBigInt', b: 'JSBigInt') -> 'JSBigInt':
+    """BigInt exponentiation — negative exponent throws RangeError."""
+    if b.value < 0:
+        raise _ThrowSignal(make_error('RangeError', 'Exponent must be positive'))
+    return JSBigInt(a.value ** b.value)
+
+
 def _bigint_divide(a: 'JSBigInt', b: 'JSBigInt') -> 'JSBigInt':
     """BigInt division - truncation toward zero (JS semantics)."""
     if b.value == 0:
@@ -4190,33 +9094,100 @@ def _bigint_mod(a: 'JSBigInt', b: 'JSBigInt') -> 'JSBigInt':
 
 
 def _js_divide(a, b):
-    if b == 0:
-        if a == 0:
+    fa, fb = float(a), float(b)
+    if math.isnan(fa) or math.isnan(fb):
+        return math.nan
+    if fb == 0:
+        if fa == 0:
             return math.nan
-        return math.copysign(math.inf, a * b)
-    result = a / b
+        return math.copysign(math.inf, fa) * (1 if math.copysign(1, fb) > 0 else -1)
+    result = fa / fb
+    # Preserve negative zero
+    if result == 0.0 and math.copysign(1, result) < 0:
+        return result
     if isinstance(a, int) and isinstance(b, int) and result == int(result):
         return int(result)
     return result
 
 
 def _js_mod(a, b):
-    if b == 0:
+    fa, fb = float(a), float(b)
+    if fb == 0 or math.isnan(fa) or math.isnan(fb) or math.isinf(fa):
         return math.nan
-    result = math.fmod(float(a), float(b))
-    return int(result) if result == int(result) and not math.isinf(result) else result
+    if math.isinf(fb):
+        return fa if math.copysign(1, fa) >= 0 else fa  # keep sign
+    result = math.fmod(fa, fb)
+    if math.isnan(result) or math.isinf(result):
+        return result
+    # Preserve negative zero: fmod(-1,-1) = -0.0, but int(-0.0) = 0
+    if result == 0.0:
+        return result  # keep -0.0 as float to preserve sign
+    if result == int(result):
+        return int(result)
+    return result
 
 
 def _js_pow(a, b):
-    if a == 1 or b == 0:
+    # Per ECMAScript spec sec-numeric-types-number-exponentiate
+    fa = float(a)
+    fb = float(b)
+    # exponent is NaN → NaN
+    if math.isnan(fb):
+        return math.nan
+    # exponent is ±0 → 1
+    if fb == 0.0:
         return 1
+    # base is NaN → NaN
+    if math.isnan(fa):
+        return math.nan
+    abs_a = abs(fa)
+    if math.isinf(fb):
+        # abs(base) == 1 and exponent is ±∞ → NaN
+        if abs_a == 1.0:
+            return math.nan
+        # abs(base) > 1: +∞ → +∞, -∞ → +0
+        if abs_a > 1.0:
+            return math.inf if fb > 0 else 0.0
+        # abs(base) < 1: +∞ → +0, -∞ → +∞
+        return 0.0 if fb > 0 else math.inf
+    if math.isinf(fa):
+        if fa > 0:
+            return math.inf if fb > 0 else 0.0
+        # base is -∞
+        if _js_pow_is_odd_int(fb):
+            return -math.inf if fb > 0 else -0.0
+        return math.inf if fb > 0 else 0.0
+    # base is ±0
+    if fa == 0.0:
+        is_neg_zero = math.copysign(1.0, fa) < 0
+        if fb > 0:
+            if is_neg_zero and _js_pow_is_odd_int(fb):
+                return -0.0
+            return 0.0
+        else:
+            if is_neg_zero and _js_pow_is_odd_int(-fb):
+                return -math.inf
+            return math.inf
+    # base < 0 and both finite and exponent is non-integer → NaN
+    if fa < 0 and not _js_pow_is_int(fb):
+        return math.nan
     try:
-        result = a ** b
+        result = fa ** fb
+        if isinstance(result, complex):
+            return math.nan
         return result
-    except ZeroDivisionError:
+    except (ZeroDivisionError, OverflowError):
         return math.inf
     except Exception:
         return math.nan
+
+
+def _js_pow_is_int(x):
+    return math.isfinite(x) and x == math.floor(x)
+
+
+def _js_pow_is_odd_int(x):
+    return _js_pow_is_int(x) and int(x) % 2 != 0
 
 
 def _int_to_radix(n: int, radix: int) -> str:
@@ -4282,55 +9253,86 @@ def _float_to_radix_string(v: float, radix: int) -> str:
 
 def _js_to_fixed(v: float, digits: int) -> str:
     """Number.prototype.toFixed with round-half-away-from-zero."""
-    from decimal import Decimal, ROUND_HALF_UP
+    from decimal import Decimal, ROUND_HALF_UP, Context as _DCtx, InvalidOperation
     if math.isnan(v):
         return 'NaN'
     if math.isinf(v):
         return 'Infinity' if v > 0 else '-Infinity'
-    sign = '-' if math.copysign(1, v) < 0 else ''
-    d = Decimal(abs(v))  # exact float64 value (preserves full integer precision)
+    # Negative zero → treat as positive zero
+    if v == 0.0:
+        if digits == 0:
+            return '0'
+        return '0.' + '0' * digits
+    sign = '-' if v < 0 else ''
+    ctx = _DCtx(prec=150)
+    d = ctx.create_decimal_from_float(abs(v))
     quant = Decimal('1.' + '0' * digits) if digits > 0 else Decimal('1')
-    rounded = d.quantize(quant, rounding=ROUND_HALF_UP)
+    try:
+        rounded = d.quantize(quant, rounding=ROUND_HALF_UP, context=ctx)
+    except InvalidOperation:
+        rounded = d
     result = format(rounded, f'.{digits}f')
     return sign + result
 
 
 def _js_to_exponential(v: float, fraction_digits) -> str:
     """Number.prototype.toExponential with round-half-away-from-zero."""
-    from decimal import Decimal, ROUND_HALF_UP
+    from decimal import Decimal, ROUND_HALF_UP, InvalidOperation, Context
     if math.isnan(v):
         return 'NaN'
     if math.isinf(v):
         return 'Infinity' if v > 0 else '-Infinity'
-    sign = '-' if math.copysign(1, v) < 0 else ''
+    sign = '-' if v < 0 else ''
     abs_v = abs(v)
     if abs_v == 0.0:
         if fraction_digits is None:
-            return sign + '0e+0'
-        return sign + '0' + ('.' + '0' * fraction_digits if fraction_digits > 0 else '') + 'e+0'
-    exp = math.floor(math.log10(abs_v))
-    mantissa = abs_v / (10.0 ** exp)
-    # Guard against floating-point imprecision nudging mantissa to 10
-    if mantissa >= 10.0:
-        mantissa /= 10.0
-        exp += 1
+            return '0e+0'
+        return '0' + ('.' + '0' * fraction_digits if fraction_digits > 0 else '') + 'e+0'
+
     if fraction_digits is None:
-        n = 20  # Enough digits for full precision
+        # Use Python's repr to get the shortest representation, then format as exponential
+        s = repr(abs_v)
+        # Parse the result — could be in scientific notation or plain
+        d = Decimal(s)
+        # Convert to exactly one digit before decimal point
+        sign_d, digits, exponent = d.as_tuple()
+        total_digits = len(digits)
+        # Reconstruct: mantissa = d.ddd...  e = total exponent
+        e = total_digits + exponent - 1  # exponent in scientific notation
+        if total_digits == 1:
+            mant_str = str(digits[0])
+        else:
+            mant_str = str(digits[0]) + '.' + ''.join(str(d) for d in digits[1:])
+            # Strip trailing zeros
+            mant_str = mant_str.rstrip('0').rstrip('.')
+        exp_sign = '+' if e >= 0 else '-'
+        return sign + mant_str + 'e' + exp_sign + str(abs(e))
     else:
         n = fraction_digits
-    d = Decimal(repr(mantissa))
-    quant = Decimal('1.' + '0' * n) if n > 0 else Decimal('1')
-    rounded_m = d.quantize(quant, rounding=ROUND_HALF_UP)
-    if rounded_m >= 10:
-        rounded_m = Decimal(repr(float(rounded_m) / 10.0))
-        rounded_m = rounded_m.quantize(quant, rounding=ROUND_HALF_UP)
-        exp += 1
-    mant_str = format(rounded_m, f'.{n}f')
-    if fraction_digits is None:
-        # Trim trailing zeros for auto-precision
-        mant_str = mant_str.rstrip('0').rstrip('.')
-    exp_sign = '+' if exp >= 0 else '-'
-    return sign + mant_str + 'e' + exp_sign + str(abs(exp))
+        from decimal import Context as _DCtx
+        ctx = _DCtx(prec=50)
+        d = ctx.create_decimal_from_float(abs_v)
+        # Use Decimal's own decomposition to avoid float division error
+        _sign, _digits, _exp = d.as_tuple()
+        total_digits = len(_digits)
+        e = total_digits + _exp - 1  # scientific notation exponent
+        # Reconstruct mantissa as Decimal with one digit before point
+        mantissa_d = d / (Decimal(10) ** e)
+        quant = Decimal('1.' + '0' * n) if n > 0 else Decimal('1')
+        try:
+            rounded_m = mantissa_d.quantize(quant, rounding=ROUND_HALF_UP, context=ctx)
+        except InvalidOperation:
+            rounded_m = mantissa_d
+        if rounded_m >= 10:
+            rounded_m = rounded_m / Decimal(10)
+            try:
+                rounded_m = rounded_m.quantize(quant, rounding=ROUND_HALF_UP, context=ctx)
+            except InvalidOperation:
+                pass
+            e += 1
+        mant_str = format(rounded_m, f'.{n}f')
+        exp_sign = '+' if e >= 0 else '-'
+        return sign + mant_str + 'e' + exp_sign + str(abs(e))
 
 
 def _js_to_precision(v: float, precision: int) -> str:
@@ -4339,7 +9341,7 @@ def _js_to_precision(v: float, precision: int) -> str:
         return 'NaN'
     if math.isinf(v):
         return 'Infinity' if v > 0 else '-Infinity'
-    sign = '-' if math.copysign(1, v) < 0 else ''
+    sign = '-' if v < 0 else ''
     abs_v = abs(v)
     if abs_v == 0.0:
         if precision <= 1:
@@ -4631,32 +9633,523 @@ def _transform_v_flag_q_classes(pattern: str, i_flag: bool = False) -> str:
     return ''.join(result)
 
 
-def _js_regex_to_python(pattern: str, v_flag: bool = False, i_flag: bool = False) -> str:
+def _js_get_substitution(matched, s, position, captures, named_captures, replacement):
+    """ES2023 GetSubstitution(matched, str, position, captures, namedCaptures, replacement).
+    
+    Processes $ replacement patterns in string replacements.
+    captures: list of capture values (undefined for non-participating)
+    named_captures: dict of name->value, JSObject, or None if no named groups
+    """
+
+    def _get_named(name):
+        """Look up a named capture, supporting both dict and JSObject."""
+        if named_captures is None:
+            return undefined
+        if isinstance(named_captures, dict):
+            return named_captures.get(name, undefined)
+        # JSObject — use property lookup to follow prototype chain
+        return _obj_get_property(named_captures, name)
+
+    result = []
+    i = 0
+    repl = replacement
+    while i < len(repl):
+        if repl[i] == '$' and i + 1 < len(repl):
+            ch = repl[i + 1]
+            if ch == '$':
+                result.append('$')
+                i += 2
+            elif ch == '&':
+                result.append(matched)
+                i += 2
+            elif ch == '`':
+                result.append(s[:position])
+                i += 2
+            elif ch == "'":
+                result.append(s[position + len(matched):])
+                i += 2
+            elif ch == '<':
+                gt = repl.find('>', i + 2)
+                if gt == -1 or named_captures is None:
+                    result.append('$<')
+                    i += 2
+                else:
+                    group_name = repl[i + 2:gt]
+                    val = _get_named(group_name)
+                    if val is undefined or val is None:
+                        result.append('')
+                    else:
+                        result.append(js_to_string(val))
+                    i = gt + 1
+            elif '0' <= ch <= '9':
+                # $n or $nn
+                if i + 2 < len(repl) and '0' <= repl[i + 2] <= '9':
+                    nn = int(repl[i + 1:i + 3])
+                    if 1 <= nn <= len(captures):
+                        val = captures[nn - 1]
+                        if val is undefined or val is None:
+                            result.append('')
+                        else:
+                            result.append(js_to_string(val))
+                        i += 3
+                        continue
+                n = int(ch)
+                if 1 <= n <= len(captures):
+                    val = captures[n - 1]
+                    if val is undefined or val is None:
+                        result.append('')
+                    else:
+                        result.append(js_to_string(val))
+                    i += 2
+                else:
+                    result.append('$')
+                    i += 1
+            else:
+                result.append('$')
+                i += 1
+        else:
+            result.append(repl[i])
+            i += 1
+    return ''.join(result)
+
+
+def _unmangled_groupdict(m):
+    """Get groupdict from a regex match, reversing _dollar_ → $ name mangling."""
+    gd = m.groupdict()
+    if not gd:
+        return gd
+    return {k.replace('_dollar_', '$').replace('_zwnj_', '\u200C').replace('_zwj_', '\u200D'): v for k, v in gd.items()}
+
+
+def _replace_char_class_escapes(pattern: str) -> str:
+    r"""Replace JS \d, \D, \w, \W, \s, \S with JS-compatible character classes.
+
+    JS definitions (always ASCII-based for \d, \w; fixed set for \s):
+    - \d = [0-9]
+    - \D = [^0-9]
+    - \w = [0-9A-Za-z_]
+    - \W = [^0-9A-Za-z_]
+    - \s = [\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]
+    - \S = [^\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]
+    """
+    _JS_D = '[0-9]'
+    _JS_ND = '[^0-9]'
+    _JS_W = '[0-9A-Za-z_]'
+    _JS_NW = '[^0-9A-Za-z_]'
+    _JS_S = '[\\t\\n\\x0b\\f\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]'
+    _JS_NS = '[^\\t\\n\\x0b\\f\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]'
+    _REPLACEMENTS = {'d': _JS_D, 'D': _JS_ND, 'w': _JS_W, 'W': _JS_NW, 's': _JS_S, 'S': _JS_NS}
+    # Inside character classes, can't nest [...], so use raw char ranges
+    _JS_D_INNER = '0-9'
+    _JS_W_INNER = '0-9A-Za-z_'
+    _JS_S_INNER = '\\t\\n\\x0b\\f\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff'
+    _INNER_REPLACEMENTS = {'d': _JS_D_INNER, 'w': _JS_W_INNER, 's': _JS_S_INNER}
+    out = []
+    i = 0
+    n = len(pattern)
+    in_class = False
+    while i < n:
+        ch = pattern[i]
+        if ch == '\\' and i + 1 < n:
+            nxt = pattern[i + 1]
+            if not in_class and nxt in _REPLACEMENTS:
+                out.append(_REPLACEMENTS[nxt])
+                i += 2
+                continue
+            if in_class and nxt in _INNER_REPLACEMENTS:
+                out.append(_INNER_REPLACEMENTS[nxt])
+                i += 2
+                continue
+            # Skip other escapes
+            out.append(ch)
+            out.append(nxt)
+            i += 2
+            continue
+        if ch == '[' and not in_class:
+            in_class = True
+        elif ch == ']' and in_class:
+            in_class = False
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def _replace_dot_no_dotall(pattern: str) -> str:
+    """Replace unescaped '.' outside character classes with [^\\n\\r\\u2028\\u2029].
+
+    In JS without the 's' flag, '.' excludes all four line terminators,
+    while Python's '.' without DOTALL only excludes \\n.
+    """
+    out = []
+    i = 0
+    n = len(pattern)
+    in_class = False
+    while i < n:
+        ch = pattern[i]
+        if ch == '\\' and i + 1 < n:
+            out.append(ch)
+            out.append(pattern[i + 1])
+            i += 2
+            continue
+        if ch == '[' and not in_class:
+            in_class = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ']' and in_class:
+            in_class = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '.' and not in_class:
+            out.append('[^\\n\\r\\u2028\\u2029]')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def _js_regex_to_python(pattern: str, v_flag: bool = False, i_flag: bool = False, s_flag: bool = False, u_flag: bool = False) -> str:
     """Convert a JS regex pattern to Python regex."""
-    # JS control escapes: \cX -> chr(ord(X) & 31) when X is a letter
-    # If X is NOT a letter, \cX is treated literally as the two chars \c + X
-    def _ctrl_repl(m):
-        ch = m.group(1)
-        if ch.isalpha():
-            return '\\x%02x' % (ord(ch.upper()) & 0x1F)
-        # \c0 etc. not a letter - JS treats as literal backslash + 'c' + X
-        return '\\\\c' + ch
-    result = re.sub(r'\\c([A-Za-z0-9])', _ctrl_repl, pattern)
+    # JS control escapes: \cX -> chr(ord(X) & 31) when X is [A-Za-z]
+    # Annex B: \c followed by non-letter is treated literally.
+    # Must handle differently inside vs outside character classes.
+    def _process_ctrl_escapes(pat):
+        """Process \\c escapes context-aware (inside/outside char classes)."""
+        out = []
+        i = 0
+        in_class = False
+        while i < len(pat):
+            ch = pat[i]
+            if ch == '\\' and i + 1 < len(pat):
+                nxt = pat[i + 1]
+                if nxt == 'c':
+                    # \c escape
+                    if i + 2 < len(pat):
+                        ctrl_ch = pat[i + 2]
+                        if ctrl_ch in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz':
+                            # Valid control escape: \cA -> \x01
+                            out.append('\\x%02x' % (ord(ctrl_ch.upper()) & 0x1F))
+                            i += 3
+                            continue
+                        else:
+                            # Invalid control: Annex B
+                            if in_class:
+                                # Inside [...]: \c -> literal \ and c as separate chars
+                                # Don't consume the next char — it stays in the class
+                                out.append('\\\\c')
+                                i += 2
+                            else:
+                                # Outside [...]: \c + char -> literal \c + char
+                                out.append('\\\\c')
+                                out.append(re.escape(ctrl_ch))
+                                i += 3
+                            continue
+                    else:
+                        # \c at end of pattern
+                        out.append('\\\\c')
+                        i += 2
+                        continue
+                else:
+                    # Other escape — pass through
+                    out.append(ch)
+                    out.append(nxt)
+                    i += 2
+                    continue
+            if ch == '[' and not in_class:
+                in_class = True
+            elif ch == ']' and in_class:
+                in_class = False
+            out.append(ch)
+            i += 1
+        return ''.join(out)
+    result = _process_ctrl_escapes(pattern)
+    _unicode_mode = u_flag or v_flag
+
+    # --- Named group and backref processing FIRST (before \u{} → Python escapes) ---
+    # This ensures group names with \u{XXXX} escapes are resolved from the original syntax.
+    _seen_names: dict[str, int] = {}
+    _dup_name_map: dict[str, str] = {}  # py_name -> original js_name
+    _dup_groups: dict[str, list[str]] = {}  # original name -> list of all py_names
+    def _named_group_repl(m):
+        name = m.group(1)
+        # Resolve unicode escapes in group names: \u03C0 or \u{03C0} -> actual char
+        def _resolve_unicode_escapes(s):
+            s = re.sub(r'\\u\{([0-9A-Fa-f]+)\}', lambda m2: chr(int(m2.group(1), 16)), s)
+            s = re.sub(r'\\u([0-9A-Fa-f]{4})', lambda m2: chr(int(m2.group(1), 16)), s)
+            return s
+        name = _resolve_unicode_escapes(name)
+        py_name = name.replace('$', '_dollar_').replace('\u200C', '_zwnj_').replace('\u200D', '_zwj_')
+        _seen_names[py_name] = _seen_names.get(py_name, 0) + 1
+        count = _seen_names[py_name]
+        if count > 1:
+            deduped = '%s__dup_%d' % (py_name, count)
+            _dup_name_map[deduped] = py_name
+            _dup_groups.setdefault(py_name, [py_name]).append(deduped)
+            return '(?P<%s>' % deduped
+        else:
+            _dup_groups.setdefault(py_name, [py_name])
+            return '(?P<%s>' % py_name
+    result = re.sub(r'\(\?<(?![=!])([^>]+)>', _named_group_repl, result)
+    # JS backreference \k<name> — if name has duplicates, use conditional backref
+    def _backref_repl(m):
+        raw_name = m.group(1)
+        raw_name = re.sub(r'\\u\{([0-9A-Fa-f]+)\}', lambda m2: chr(int(m2.group(1), 16)), raw_name)
+        raw_name = re.sub(r'\\u([0-9A-Fa-f]{4})', lambda m2: chr(int(m2.group(1), 16)), raw_name)
+        name = raw_name.replace('$', '_dollar_').replace('\u200C', '_zwnj_').replace('\u200D', '_zwj_')
+        all_names = _dup_groups.get(name)
+        if all_names and len(all_names) > 1:
+            # Build alternation of conditional backrefs: try each variant
+            parts = ['(?P=%s)' % n for n in all_names]
+            return '(?:%s)' % '|'.join(parts)
+        if name in _seen_names:
+            return '(?P=%s)' % name
+        # Annex B: \k<name> without matching group → literal 'k<name>'
+        return 'k<%s>' % raw_name
+    result = re.sub(r'\\k<([^>]+)>', _backref_repl, result)
+
     # JS \u{XXXXX} code point escapes in regex patterns -> Python literal char or surrogate pair
     def _u_cp_repl(m):
         cp = int(m.group(1), 16)
+        if _unicode_mode:
+            # In u/v mode, convert to Python regex escape that preserves the code point
+            if cp <= 0xFF:
+                return '\\x%02x' % cp
+            if cp <= 0xFFFF:
+                return '\\u%04x' % cp
+            # Astral: embed literal code point character
+            return chr(cp)
         if cp > 0xFFFF:
             cp -= 0x10000
             return chr(0xD800 + (cp >> 10)) + chr(0xDC00 + (cp & 0x3FF))
         return '\\u%04x' % cp
     result = re.sub(r'\\u\{([0-9A-Fa-f]+)\}', _u_cp_repl, result)
-    # JS named groups: (?<name>...) -> Python (?P<name>...)
-    result = re.sub(r'\(\?<([^>]+)>', r'(?P<\1>', result)
-    # JS backreference \k<name>
-    result = re.sub(r'\\k<([^>]+)>', r'(?P=\1)', result)
+    # In u/v mode, merge adjacent \uHHHH\uLLLL surrogate pair escapes into a single code point
+    if _unicode_mode:
+        def _merge_surr_pair(m):
+            hi = int(m.group(1), 16)
+            lo = int(m.group(2), 16)
+            if 0xD800 <= hi <= 0xDBFF and 0xDC00 <= lo <= 0xDFFF:
+                cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                # Embed literal code point character in the regex
+                return chr(cp)
+            return m.group(0)  # not a valid pair, keep as-is
+        result = re.sub(
+            r'\\u([0-9A-Fa-f]{4})\\u([0-9A-Fa-f]{4})',
+            _merge_surr_pair,
+            result
+        )
+    # Annex B: fix incomplete hex/unicode escapes that Python regex doesn't support
+    def _fix_incomplete_hex(pat):
+        out = []
+        i = 0
+        while i < len(pat):
+            if pat[i] == '\\' and i + 1 < len(pat):
+                nxt = pat[i + 1]
+                if nxt == 'x':
+                    # Check for \xNN (2 hex digits)
+                    if i + 3 < len(pat) and pat[i+2] in '0123456789abcdefABCDEF' and pat[i+3] in '0123456789abcdefABCDEF':
+                        out.append(pat[i:i+4])
+                        i += 4
+                        continue
+                    # Incomplete \x — treat as literal 'x'
+                    out.append('x')
+                    i += 2
+                    continue
+                elif nxt == 'u':
+                    # Check for \uNNNN (4 hex digits)
+                    if i + 5 < len(pat) and all(c in '0123456789abcdefABCDEF' for c in pat[i+2:i+6]):
+                        out.append(pat[i:i+6])
+                        i += 6
+                        continue
+                    # Incomplete \u — treat as literal 'u'
+                    out.append('u')
+                    i += 2
+                    continue
+                else:
+                    out.append(pat[i:i+2])
+                    i += 2
+                    continue
+            out.append(pat[i])
+            i += 1
+        return ''.join(out)
+    result = _fix_incomplete_hex(result)
+    # Annex B: decimal escapes \N where N > number of capture groups 
+    # should be treated as octal escapes in non-unicode mode.
+    # Count capture groups in the pattern (after group name processing)
+    def _count_groups(pat):
+        n = 0
+        i = 0
+        while i < len(pat):
+            ch = pat[i]
+            if ch == '\\':
+                i += 2  # skip escape
+                continue
+            if ch == '[':
+                # skip character class
+                i += 1
+                while i < len(pat) and pat[i] != ']':
+                    if pat[i] == '\\':
+                        i += 1
+                    i += 1
+                i += 1
+                continue
+            if ch == '(' and i + 1 < len(pat) and pat[i+1] != '?':
+                n += 1
+            elif ch == '(' and pat[i+1:i+4] == '?P<':
+                n += 1
+            i += 1
+        return n
+    _num_groups = _count_groups(result)
+    def _fix_backref(m):
+        num_str = m.group(1)
+        num = int(num_str)
+        if num <= _num_groups:
+            return m.group(0)  # valid backref — keep
+        # Convert to octal escape: \N where N is 1-7 → octal
+        # Per Annex B, parse as string of octal digits, take longest valid prefix
+        # The digits 0-7 form an octal, 8-9 are literal
+        octal_str = ''
+        rest = num_str
+        for c in rest:
+            if c in '01234567' and int(octal_str + c, 8) <= 0o377:
+                octal_str += c
+            else:
+                break
+        if octal_str:
+            val = int(octal_str, 8)
+            remaining = num_str[len(octal_str):]
+            if remaining:
+                return '\\x%02x' % val + remaining
+            return '\\x%02x' % val
+        # Not octal — just literal digits
+        return num_str
+    result = re.sub(r'\\([1-9][0-9]*)', _fix_backref, result)
+    # Fix forward references: in JS, \N before group N matches empty string.
+    # Python regex fails to match forward refs, so wrap them in (?:...)? to make optional.
+    def _fix_forward_refs(pat):
+        # Find positions and ranges of each numbered and named group
+        group_positions = {}  # group_number -> first_char_index
+        named_group_positions = {}  # group_name -> first_char_index
+        group_ranges = {}  # group_number -> (start, end)
+        named_group_ranges = {}  # group_name -> (start, end)
+        g = 0
+        i = 0
+        paren_stack = []  # Stack of (group_number_or_None, start_index)
+        while i < len(pat):
+            ch = pat[i]
+            if ch == '\\':
+                i += 2
+                continue
+            if ch == '[':
+                i += 1
+                if i < len(pat) and pat[i] == '^':
+                    i += 1
+                if i < len(pat) and pat[i] == ']':
+                    i += 1
+                while i < len(pat) and pat[i] != ']':
+                    if pat[i] == '\\':
+                        i += 1
+                    i += 1
+                i += 1
+                continue
+            if ch == '(' and i + 1 < len(pat):
+                if pat[i + 1:i + 4] == '?P<':
+                    g += 1
+                    group_positions[g] = i
+                    # Extract name
+                    j = i + 4
+                    while j < len(pat) and pat[j] != '>':
+                        j += 1
+                    name = pat[i + 4:j]
+                    if name not in named_group_positions:
+                        named_group_positions[name] = i
+                    paren_stack.append((g, name, i))
+                elif pat[i + 1] != '?':
+                    g += 1
+                    group_positions[g] = i
+                    paren_stack.append((g, None, i))
+                else:
+                    paren_stack.append((None, None, i))
+            elif ch == ')':
+                if paren_stack:
+                    gnum, gname, start = paren_stack.pop()
+                    if gnum is not None:
+                        group_ranges[gnum] = (start, i)
+                    if gname is not None:
+                        if gname not in named_group_ranges:
+                            named_group_ranges[gname] = (start, i)
+            i += 1
+        # Now find backrefs and check if they're forward or self-references
+        out = []
+        i = 0
+        while i < len(pat):
+            # Numbered backref \N
+            if pat[i] == '\\' and i + 1 < len(pat) and '1' <= pat[i + 1] <= '9':
+                j = i + 1
+                while j < len(pat) and '0' <= pat[j] <= '9':
+                    j += 1
+                num = int(pat[i + 1:j])
+                gpos = group_positions.get(num)
+                grange = group_ranges.get(num)
+                is_forward = gpos is not None and i < gpos
+                is_self_ref = grange is not None and grange[0] < i < grange[1]
+                if is_forward:
+                    out.append('(?:' + pat[i:j] + ')?')
+                elif is_self_ref:
+                    # Self-reference inside own group: always matches empty
+                    pass  # emit nothing
+                else:
+                    out.append(pat[i:j])
+                i = j
+                continue
+            # Named backref (?P=name)
+            if pat[i:i + 4] == '(?P=' and ')' in pat[i + 4:]:
+                end = pat.index(')', i + 4)
+                name = pat[i + 4:end]
+                gpos = named_group_positions.get(name)
+                grange = named_group_ranges.get(name)
+                is_forward = gpos is not None and i < gpos
+                is_self_ref = grange is not None and grange[0] < i < grange[1]
+                if is_forward:
+                    out.append('(?:' + pat[i:end + 1] + ')?')
+                elif is_self_ref:
+                    # Self-reference inside own group: always matches empty
+                    pass  # emit nothing
+                else:
+                    out.append(pat[i:end + 1])
+                i = end + 1
+                continue
+            out.append(pat[i])
+            i += 1
+        return ''.join(out)
+    result = _fix_forward_refs(result)
     # Remove invalid \q escapes (not v-flag mode) — \q inside [] is just 'q'
     if not v_flag:
         result = re.sub(r'\\q', 'q', result)
+    # Annex B: convert remaining unknown identity escapes to literal characters
+    # After all special escapes (\c, \x, \u, \k<name>, \N backrefs) have been processed,
+    # any remaining \X where X is not a valid Python regex escape should become literal X.
+    _VALID_PY_REGEX_ALPHA_ESCAPES = frozenset('dDwWsSbBAZnrtfvpPxu')
+    def _fix_identity_escapes(pat):
+        out = []
+        i = 0
+        while i < len(pat):
+            if pat[i] == '\\' and i + 1 < len(pat):
+                nxt = pat[i + 1]
+                if nxt.isalpha() and nxt not in _VALID_PY_REGEX_ALPHA_ESCAPES:
+                    # Unknown alpha escape — convert to literal (properly escaped)
+                    out.append(re.escape(nxt))
+                    i += 2
+                    continue
+                out.append(pat[i:i+2])
+                i += 2
+                continue
+            out.append(pat[i])
+            i += 1
+        return ''.join(out)
+    result = _fix_identity_escapes(result)
     # In u+i mode (not v), QuickJS expands \P{prop} to also match letters (QuickJS quirk)
     if i_flag and not v_flag:
         result = _expand_negated_props_for_u_i(result)
@@ -4671,7 +10164,23 @@ def _js_regex_to_python(pattern: str, v_flag: bool = False, i_flag: bool = False
         #   [\q{s1|s2}--chars]     -> (?:strings not matched by chars)
         #   [\q{s1|s2}&&chars]     -> (?:strings matched by chars)
         result = _transform_v_flag_q_classes(result, i_flag=i_flag)
-    return result
+    # In JS, `.` without the `s` flag excludes \n, \r, \u2028, \u2029.
+    # Python `.` without DOTALL only excludes \n, so replace unescaped dots
+    # outside character classes with a proper exclusion.
+    if not s_flag:
+        result = _replace_dot_no_dotall(result)
+    # JS \w, \W, \d, \D are always ASCII-only; Python uses Unicode by default.
+    # JS \s, \S have a fixed set different from Python's.
+    # Replace these outside character classes with explicit character classes.
+    result = _replace_char_class_escapes(result)
+    # Build duplicate group name mapping for caller
+    dup_group_info = None
+    if _dup_name_map:
+        dup_group_info = {
+            'remap': dict(_dup_name_map),  # py_name -> original js_name
+            'groups': {k: list(v) for k, v in _dup_groups.items()},  # original -> all py_name
+        }
+    return result, dup_group_info
 
 
 

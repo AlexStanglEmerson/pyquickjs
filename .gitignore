@@ -221,3 +221,5 @@ Sandbox.py
 # Extra files used by Claude
 debug_*.py
 *.txt
+debug/
+js_test_results.xml

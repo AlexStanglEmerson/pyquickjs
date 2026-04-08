@@ -142,6 +142,17 @@ TOK_LAST_KEYWORD = Tok.AWAIT
 
 # ---- Character classification (matching libunicode.h) ----
 
+# Unicode derived property Other_ID_Start (characters with ID_Start but not covered
+# by general categories Lu, Ll, Lt, Lm, Lo, Nl)
+_OTHER_ID_START = frozenset({0x1885, 0x1886, 0x2118, 0x212E, 0x309B, 0x309C})
+
+# Unicode derived property Other_ID_Continue (characters with ID_Continue but not
+# covered by general categories or Other_ID_Start)
+_OTHER_ID_CONTINUE = frozenset({
+    0x00B7, 0x0387, 0x1369, 0x136A, 0x136B, 0x136C, 0x136D,
+    0x136E, 0x136F, 0x1370, 0x1371, 0x19DA,
+})
+
 def _is_id_start(c: int) -> bool:
     """Check if codepoint c can start an identifier (ES2023 ID_Start + $ + _)."""
     if c < 128:
@@ -149,6 +160,8 @@ def _is_id_start(c: int) -> bool:
                 or (0x41 <= c <= 0x5A)  # A-Z
                 or c == 0x5F  # _
                 or (0x61 <= c <= 0x7A))  # a-z
+    if c in _OTHER_ID_START:
+        return True
     # Unicode: use category check
     cat = unicodedata.category(chr(c))
     return cat in ('Lu', 'Ll', 'Lt', 'Lm', 'Lo', 'Nl')
@@ -163,6 +176,8 @@ def _is_id_continue(c: int) -> bool:
                 or c == 0x5F  # _
                 or (0x61 <= c <= 0x7A))  # a-z
     if c == 0x200C or c == 0x200D:  # ZWNJ, ZWJ
+        return True
+    if c in _OTHER_ID_START or c in _OTHER_ID_CONTINUE:
         return True
     cat = unicodedata.category(chr(c))
     return cat in ('Lu', 'Ll', 'Lt', 'Lm', 'Lo', 'Nl', 'Mn', 'Mc', 'Nd', 'Pc')
@@ -204,6 +219,9 @@ class TokenIdent:
 class TokenStr:
     string: str = ""
     sep: str = ""  # The separator character: ' " or `
+    raw: str = ""  # Raw text for template literals
+    has_escape: bool = False  # Whether the string contained escape sequences or line continuations
+    has_invalid_escape: bool = False  # Whether a template contained invalid escape sequences
 
 
 @dataclass
@@ -613,6 +631,7 @@ class JSParseState:
         self.pos should be past the opening quote.
         """
         buf: list[str] = []
+        has_escape = False
 
         while True:
             if self.at_end():
@@ -638,6 +657,7 @@ class JSParseState:
                 break
 
             if c == '\\':
+                has_escape = True
                 parsed = self._parse_escape(sep)
                 if parsed is not None:
                     buf.append(parsed)
@@ -655,11 +675,15 @@ class JSParseState:
         self.token.val = Tok.STRING
         self.token.str_val.string = ''.join(buf)
         self.token.str_val.sep = sep
+        self.token.str_val.has_escape = has_escape
 
     def _parse_template_part(self) -> None:
         """Parse a template literal part. self.pos is past the opening ` or }."""
         buf: list[str] = []
+        raw_buf: list[str] = []
         sep = ''
+        raw_start = self.pos
+        has_invalid_escape = False
 
         while True:
             if self.at_end():
@@ -679,9 +703,19 @@ class JSParseState:
                 break
 
             if c == '\\':
-                # In template raw mode, we keep the backslash
-                # For cooked strings, we parse the escape
-                parsed = self._parse_escape('`')
+                # Capture raw text: the backslash + the escape sequence chars
+                raw_pos_before = self.pos
+                try:
+                    parsed = self._parse_escape('`')
+                except JSSyntaxError:
+                    # Invalid escape in template — record but continue parsing
+                    has_invalid_escape = True
+                    raw_buf.append('\\')
+                    raw_buf.append(self.source[raw_pos_before:self.pos])
+                    continue
+                # Raw: backslash + the characters consumed by _parse_escape
+                raw_buf.append('\\')
+                raw_buf.append(self.source[raw_pos_before:self.pos])
                 if parsed is not None:
                     buf.append(parsed)
                 continue
@@ -691,6 +725,7 @@ class JSParseState:
                 if self.peek() == '\n':
                     self.advance()
                 buf.append('\n')
+                raw_buf.append('\n')
                 continue
 
             # Encode non-BMP chars as UTF-16 surrogate pairs (JS string semantics)
@@ -699,12 +734,16 @@ class JSParseState:
                 cp -= 0x10000
                 buf.append(chr(0xD800 + (cp >> 10)))
                 buf.append(chr(0xDC00 + (cp & 0x3FF)))
+                raw_buf.append(c)
             else:
                 buf.append(c)
+                raw_buf.append(c)
 
         self.token.val = Tok.TEMPLATE
         self.token.str_val.string = ''.join(buf)
+        self.token.str_val.raw = ''.join(raw_buf)
         self.token.str_val.sep = sep
+        self.token.str_val.has_invalid_escape = has_invalid_escape
 
     def _parse_escape(self, sep: str) -> str | None:
         """Parse an escape sequence after \\. Returns the character(s) or None
@@ -737,6 +776,7 @@ class JSParseState:
                     if self.cur_func.js_mode & JS_MODE_STRICT or sep == '`':
                         self._error("octal escape sequences are not allowed in strict mode")
                         return ''
+                    self.cur_func.has_legacy_octal_escape = True
                     return self._parse_legacy_octal(ord(c))
                 return '\0'
             case _ if '1' <= c <= '9':
@@ -746,6 +786,8 @@ class JSParseState:
                     else:
                         self._error("octal escape sequences are not allowed in strict mode")
                     return ''
+                # Track legacy octal/non-octal decimal for retroactive strict-mode checking
+                self.cur_func.has_legacy_octal_escape = True
                 if '1' <= c <= '7':
                     return self._parse_legacy_octal(ord(c))
                 return c
@@ -1058,6 +1100,7 @@ class JSParseState:
         is_bigint = False
         is_float = False
         has_legacy_octal = False
+        is_non_octal_decimal = False  # 08, 09, 0008, 012348 etc.
         allow_sep = True  # numeric separators allowed?
 
         c = self.peek()
@@ -1087,15 +1130,24 @@ class JSParseState:
                         # Not octal — fall back to decimal
                         radix = 10
                         has_legacy_octal = False
+                        is_non_octal_decimal = True
                         break
                     temp_pos += 1
             elif p1 and '8' <= p1 <= '9':
                 # Non-octal decimal starting with 0 (like 08, 09)
                 # Numeric separators not allowed (follows same legacy rules)
+                is_non_octal_decimal = True
                 self.advance()  # skip leading '0'
                 allow_sep = False
+            elif p1 == '_':
+                # 0_ is never valid: no grammar production allows
+                # NumericLiteralSeparator after a leading zero
+                self._error("numeric separator not allowed after leading zero")
+                return
             else:
-                self.advance()  # skip the '0'
+                # Bare '0' possibly followed by '.', 'e', 'E', 'n', or end
+                # Do NOT advance; let _scan_number_body consume the '0'
+                pass
         elif c != '.':
             pass  # digit 1-9, handled by _scan_digits
 
@@ -1106,7 +1158,7 @@ class JSParseState:
         if self.peek() == 'n':
             is_bigint = True
             self.advance()
-            if is_float or has_legacy_octal:
+            if is_float or has_legacy_octal or is_non_octal_decimal:
                 self._error("invalid number literal")
                 return
 
@@ -1179,6 +1231,9 @@ class JSParseState:
             # (like property access — but in number context it's always decimal)
             buf.append('.')
             self.advance()
+            # Numeric separator cannot be adjacent to '.'
+            if not self.at_end() and self.source[self.pos] == '_':
+                self._error("Numeric separator not allowed after decimal point")
             while not self.at_end():
                 c = self.source[self.pos]
                 if '0' <= c <= '9':
@@ -1203,9 +1258,21 @@ class JSParseState:
                 if not self.at_end() and self.source[self.pos] in ('+', '-'):
                     buf.append(self.source[self.pos])
                     self.advance()
-                while not self.at_end() and self.source[self.pos].isdigit():
-                    buf.append(self.source[self.pos])
-                    self.advance()
+                has_exp_digit = False
+                while not self.at_end():
+                    ec = self.source[self.pos]
+                    if ec.isdigit():
+                        buf.append(ec)
+                        self.advance()
+                        has_exp_digit = True
+                    elif ec == '_' and allow_sep and has_exp_digit:
+                        nc = self.peek(1)
+                        if nc and nc.isdigit():
+                            self.advance()  # skip separator
+                        else:
+                            break
+                    else:
+                        break
 
         result = ''.join(buf)
         if not result or result == '.':
@@ -1304,6 +1371,14 @@ class _StubFunctionDef:
         self.func_type = 0
         self.in_function_body = True
         self.parent: _StubFunctionDef | None = None
+        self.in_iteration: int = 0  # depth counter for iteration statements
+        self.in_switch: int = 0  # depth counter for switch statements
+        self.has_legacy_octal_escape: bool = False  # tracks \1-\9 in non-strict mode
+        self.label_set: dict[str, bool] = {}  # label name → is_iteration
+        self.super_call_allowed: bool = False  # True only in derived class constructors
+        self.super_prop_allowed: bool = False  # True in methods (super.x)
+        self.is_arrow: bool = False  # True for arrow function bodies
+        self.is_eval: bool = False  # True for direct eval code
 
 
 class JSSyntaxError(Exception):

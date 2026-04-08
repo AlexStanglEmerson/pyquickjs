@@ -15,7 +15,19 @@ from __future__ import annotations
 
 import gc
 import sys
-import tracemalloc
+from pathlib import Path
+
+# Ensure the project root is on sys.path so pyquickjs is importable
+# when this script is run as a subprocess.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+try:
+    import tracemalloc
+    _HAS_TRACEMALLOC = True
+except ImportError:
+    _HAS_TRACEMALLOC = False
 
 # Maximum peak Python-allocation allowed for a single test (megabytes).
 MEMORY_LIMIT_MB = 150
@@ -31,7 +43,8 @@ def main() -> None:
     if expected_error in (None, "", "None"):
         expected_error = None
 
-    tracemalloc.start()
+    if _HAS_TRACEMALLOC:
+        tracemalloc.start()
 
     from pathlib import Path
     from pyquickjs.runtime import JSRuntime
@@ -46,15 +59,16 @@ def main() -> None:
         ctx.eval(source, filepath)
 
         # ---- Check memory peak BEFORE deciding pass/fail ----
-        _current, peak = tracemalloc.get_traced_memory()
-        peak_mb = peak / 1024 / 1024
-        if peak_mb > MEMORY_LIMIT_MB:
-            print(
-                f"MemoryError: test allocated {peak_mb:.1f} MB peak "
-                f"(limit {MEMORY_LIMIT_MB} MB)",
-                file=sys.stderr,
-            )
-            sys.exit(3)
+        if _HAS_TRACEMALLOC:
+            _current, peak = tracemalloc.get_traced_memory()
+            peak_mb = peak / 1024 / 1024
+            if peak_mb > MEMORY_LIMIT_MB:
+                print(
+                    f"MemoryError: test allocated {peak_mb:.1f} MB peak "
+                    f"(limit {MEMORY_LIMIT_MB} MB)",
+                    file=sys.stderr,
+                )
+                sys.exit(3)
 
         if expected_error:
             print(
@@ -106,7 +120,8 @@ def main() -> None:
         # Encourage Python to release all JS objects before the process exits.
         del ctx, rt
         gc.collect()
-        tracemalloc.stop()
+        if _HAS_TRACEMALLOC:
+            tracemalloc.stop()
 
 
 if __name__ == "__main__":
